@@ -60,6 +60,19 @@ CREATE TABLE global_config (
 );
 -- Seed: INSERT INTO global_config VALUES ('sync_mode', 'all');
 
+CREATE TABLE contacts (
+  tg_user_id       TEXT PRIMARY KEY,       -- stored as TEXT, 64-bit
+  phone            TEXT,
+  username         TEXT,
+  first_name       TEXT,
+  last_name        TEXT,
+  is_mutual        INTEGER DEFAULT 0,      -- 1 if they have you saved too
+  is_bot           INTEGER DEFAULT 0,
+  updated_at       INTEGER DEFAULT (unixepoch())
+);
+
+CREATE INDEX idx_contacts_username ON contacts(username);
+
 CREATE TABLE backfill_state (
   tg_chat_id         TEXT PRIMARY KEY,
   chat_name          TEXT,
@@ -227,8 +240,8 @@ LIMIT ? OFFSET ?;
 
 ```
 GET /contacts
-  -- Distinct senders from messages table
-  Response: [{ sender_id, sender_username, sender_first_name, sender_last_name, message_count, last_seen }]
+  -- Joins contacts table with message counts from messages table
+  Response: [{ tg_user_id, phone, username, first_name, last_name, is_mutual, is_bot, message_count, last_seen }]
 
 GET /chats
   -- Distinct chats from messages table, joined with chat_config for sync status
