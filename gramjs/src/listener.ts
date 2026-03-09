@@ -4,6 +4,7 @@ import { StringSession } from 'telegram/sessions';
 import { NewMessage, NewMessageEvent, EditedMessage, EditedMessageEvent, DeletedMessage, DeletedMessageEvent } from 'telegram/events';
 import { Api } from 'telegram';
 import type { Message } from './types';
+import { requireEnv, resolveSenderId, resolveMediaType, resolveMessageType } from './utils';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -20,16 +21,8 @@ interface ChatOverride {
 }
 
 // ---------------------------------------------------------------------------
-// Environment — fail fast if any required var is missing
+// Environment
 // ---------------------------------------------------------------------------
-
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-  return value;
-}
 
 const GRAMJS_SESSION = requireEnv('GRAMJS_SESSION');
 const API_ID_STR = requireEnv('API_ID');
@@ -43,65 +36,14 @@ if (isNaN(API_ID)) {
 }
 
 // ---------------------------------------------------------------------------
-// Peer resolution helpers
+// Peer resolution
 // ---------------------------------------------------------------------------
 
 function resolvePeer(peerId: Api.TypePeer): { tg_chat_id: string; chat_type: string } {
-  if (peerId instanceof Api.PeerUser) {
-    return { tg_chat_id: String(peerId.userId), chat_type: 'user' };
-  } else if (peerId instanceof Api.PeerChat) {
-    return { tg_chat_id: String(peerId.chatId), chat_type: 'group' };
-  } else if (peerId instanceof Api.PeerChannel) {
-    // Could be supergroup or channel — use 'channel' as default
-    return { tg_chat_id: String(peerId.channelId), chat_type: 'channel' };
-  }
+  if (peerId instanceof Api.PeerUser) return { tg_chat_id: String(peerId.userId), chat_type: 'user' };
+  if (peerId instanceof Api.PeerChat) return { tg_chat_id: String(peerId.chatId), chat_type: 'group' };
+  if (peerId instanceof Api.PeerChannel) return { tg_chat_id: String(peerId.channelId), chat_type: 'channel' };
   throw new Error(`Unknown peer type: ${JSON.stringify(peerId)}`);
-}
-
-function resolveSenderId(fromId: Api.TypePeer | null | undefined): string | undefined {
-  if (!fromId) return undefined;
-  if (fromId instanceof Api.PeerUser) return String(fromId.userId);
-  if (fromId instanceof Api.PeerChat) return String(fromId.chatId);
-  if (fromId instanceof Api.PeerChannel) return String(fromId.channelId);
-  return undefined;
-}
-
-// ---------------------------------------------------------------------------
-// Media type resolution
-// ---------------------------------------------------------------------------
-
-function resolveMediaType(media: Api.TypeMessageMedia | null | undefined): string | undefined {
-  if (!media) return undefined;
-  if (media instanceof Api.MessageMediaPhoto) return 'photo';
-  if (media instanceof Api.MessageMediaDocument) {
-    const doc = media.document;
-    if (doc instanceof Api.Document) {
-      for (const attr of doc.attributes) {
-        if (attr instanceof Api.DocumentAttributeVideo) return 'video';
-        if (attr instanceof Api.DocumentAttributeAudio) {
-          return (attr as Api.DocumentAttributeAudio).voice ? 'voice' : 'audio';
-        }
-        if (attr instanceof Api.DocumentAttributeSticker) return 'sticker';
-        if (attr instanceof Api.DocumentAttributeAnimated) return 'gif';
-      }
-    }
-    return 'document';
-  }
-  if (media instanceof Api.MessageMediaGeo) return 'location';
-  if (media instanceof Api.MessageMediaContact) return 'contact';
-  if (media instanceof Api.MessageMediaPoll) return 'poll';
-  if (media instanceof Api.MessageMediaDice) return 'dice';
-  return 'other';
-}
-
-// ---------------------------------------------------------------------------
-// Message type resolution
-// ---------------------------------------------------------------------------
-
-function resolveMessageType(msg: Api.Message): string {
-  if (msg.media) return resolveMediaType(msg.media) ?? 'media';
-  if (msg.message) return 'text';
-  return 'service';
 }
 
 // ---------------------------------------------------------------------------
@@ -470,40 +412,7 @@ async function main(): Promise<void> {
   // 5. Sync contacts (non-fatal if it fails)
   await syncContacts(client);
 
-  // 6. Register NewMessage event handler
-  client.addEventHandler(async (event: NewMessageEvent) => {
-    const msg = mapMessage(event);
-    if (!msg) return;
-
-    // Upsert sender into contacts (basic info — won't overwrite phone/is_mutual)
-    if (msg.sender_id) {
-      void upsertSenderContact(msg);
-    }
-
-    if (!shouldSync(msg.tg_chat_id, syncConfig)) return;
-
-    buffer.push(msg);
-
-    if (buffer.length >= 100) {
-      if (flushTimer) {
-        clearTimeout(flushTimer);
-        flushTimer = null;
-      }
-      await flushBuffer();
-    } else {
-      if (flushTimer) clearTimeout(flushTimer);
-      flushTimer = setTimeout(() => {
-        void flushBuffer();
-      }, 2000);
-    }
-  }, new NewMessage({}));
-
-  console.log('[listener] NewMessage handler registered');
-
-  // EditedMessage: re-ingest with edit_date set; Worker ON CONFLICT preserves original_text
-  client.addEventHandler(async (event: EditedMessageEvent) => {
-    const msg = mapMessage(event as unknown as NewMessageEvent);
-    if (!msg) return;
+  async function enqueue(msg: Message): Promise<void> {
     if (!shouldSync(msg.tg_chat_id, syncConfig)) return;
     buffer.push(msg);
     if (buffer.length >= 100) {
@@ -513,7 +422,24 @@ async function main(): Promise<void> {
       if (flushTimer) clearTimeout(flushTimer);
       flushTimer = setTimeout(() => { void flushBuffer(); }, 2000);
     }
+  }
+
+  // 6. Register message event handlers
+  client.addEventHandler(async (event: NewMessageEvent) => {
+    const msg = mapMessage(event);
+    if (!msg) return;
+    if (msg.sender_id) void upsertSenderContact(msg);
+    await enqueue(msg);
+  }, new NewMessage({}));
+
+  // EditedMessage: re-ingest with edit_date set; Worker ON CONFLICT preserves original_text
+  client.addEventHandler(async (event: EditedMessageEvent) => {
+    const msg = mapMessage(event as unknown as NewMessageEvent);
+    if (!msg) return;
+    await enqueue(msg);
   }, new EditedMessage({}));
+
+  console.log('[listener] NewMessage + EditedMessage handlers registered');
 
   // DeletedMessage: mark as deleted in D1 — peer available for channels/supergroups only
   client.addEventHandler(async (event: DeletedMessageEvent) => {

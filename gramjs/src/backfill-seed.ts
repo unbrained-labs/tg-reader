@@ -1,6 +1,7 @@
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions';
 import { Api } from 'telegram';
+import { requireEnv, sleep } from './utils';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -23,16 +24,8 @@ interface DialogSeedEntry {
 }
 
 // ---------------------------------------------------------------------------
-// Environment — fail fast if any required var is missing
+// Environment
 // ---------------------------------------------------------------------------
-
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-  return value;
-}
 
 const GRAMJS_SESSION = requireEnv('GRAMJS_SESSION');
 const API_ID_STR = requireEnv('API_ID');
@@ -43,14 +36,6 @@ const WORKER_URL = requireEnv('WORKER_URL');
 const API_ID = parseInt(API_ID_STR, 10);
 if (isNaN(API_ID)) {
   throw new Error(`API_ID must be a valid integer, got: ${API_ID_STR}`);
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // ---------------------------------------------------------------------------
