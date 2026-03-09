@@ -3,10 +3,10 @@ FROM node:20-alpine
 WORKDIR /app
 
 # Copy manifests first for layer caching — npm ci runs before source copy
-COPY package.json package-lock.json* ./
+COPY package.json ./
 
 # Install all dependencies including devDeps (ts-node + typescript required at runtime)
-RUN npm ci
+RUN npm install
 
 COPY tsconfig.json ./
 COPY src/ ./src/
