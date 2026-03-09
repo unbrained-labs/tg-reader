@@ -182,7 +182,7 @@ POST /ingest
   Response: { inserted: N, skipped: N }
 ```
 
-Request validation: reject if `abs(now - messages[0].sent_at) > 300` as a basic replay guard.
+Request validation: check array length (1–100), reject with 400 otherwise. No timestamp-based replay guard — it would reject backfill messages with historical sent_at values.
 
 ### Search
 
@@ -297,12 +297,16 @@ One-time historical import using GramJS `getHistory()` per dialog.
 
 ## Auth
 
-| Token | Used for | Location |
-|-------|----------|----------|
-| `X-Ingest-Token` | POST /ingest | CF Worker secret + EC2 env (Secrets Manager) |
-| `X-Read-Token` (optional) | Search + config endpoints | Same, or omit if endpoints are private (Worker behind no public DNS) |
+Single token (`X-Ingest-Token`) for all endpoints — ingest, search, and config.
 
-Token rotation: update CF Worker secret → update EC2 env in Secrets Manager → restart GramJS process. No deployment required on the Worker.
+| Location | How |
+|----------|-----|
+| Cloudflare Worker | `wrangler secret put INGEST_TOKEN` |
+| GramJS on Fly.io | `fly secrets set INGEST_TOKEN=...` |
+
+Token rotation: update CF Worker secret → `fly secrets set INGEST_TOKEN=...` (triggers auto-restart). No redeployment needed on either side.
+
+**Note:** GramJS fetches sync config from Worker on startup (`GET /config`, `GET /chats/config`) — these requests must include the `X-Ingest-Token` header.
 
 ---
 
@@ -328,7 +332,7 @@ Token rotation: update CF Worker secret → update EC2 env in Secrets Manager �
 
 1. D1 schema (messages, chat_config, global_config, backfill_state, FTS5, indexes, triggers)
 2. Cloudflare Worker (ingest + search + config endpoints)
-3. GramJS listener on EC2 + PM2 + gap recovery on startup
+3. GramJS listener on Fly.io + gap recovery on startup
 4. Backfill script
 5. End-to-end test
 6. D1 → R2 backup cron
