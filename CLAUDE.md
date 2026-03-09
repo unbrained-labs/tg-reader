@@ -42,6 +42,27 @@ const client = new TelegramClient(session, apiId, apiHash, {
 - `INGEST_TOKEN` — same shared token
 - `WORKER_URL` — full URL of deployed Worker (no trailing slash)
 
+## Backfill anti-ban rules
+- Do NOT run backfill immediately after first login — let the session run live for 1-2 days first
+- Randomize sleep between pages: `Math.random() * 2500 + 1500` ms (1.5–4s) — fixed intervals look mechanical
+- Never run parallel getHistory calls — always serial, one dialog at a time
+- If FLOOD_WAIT exceeds 300s, stop the script and resume the next day
+- API_ID + API_HASH must be from your own app at my.telegram.org — never shared credentials
+- Set realistic device info on TelegramClient (see below)
+
+## TelegramClient init
+Always initialise with `floodSleepThreshold: 300` and realistic device info:
+
+```ts
+const client = new TelegramClient(session, apiId, apiHash, {
+  floodSleepThreshold: 300,
+  deviceModel: 'MacBook Pro',
+  systemVersion: 'macOS 14.0',
+  appVersion: '1.0.0',
+  langCode: 'en',
+});
+```
+
 ## Security
 - Never log message `text` content — log metadata only (chat_id, message_id, counts, errors)
 - R2 backup bucket must be private — never enable public access
