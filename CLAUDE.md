@@ -16,6 +16,15 @@
 - Worker runtime: Cloudflare Workers (not Node.js — no `process`, `fs`, etc.)
 - Node.js target for gramjs: 20 LTS
 
+## TelegramClient init
+Always initialise with `floodSleepThreshold: 300` — this makes the client auto-sleep on any FLOOD_WAIT error up to 5 minutes, across all API calls (backfill, gap recovery, entity resolution).
+
+```ts
+const client = new TelegramClient(session, apiId, apiHash, {
+  floodSleepThreshold: 300,
+});
+```
+
 ## Key constraints (read before writing any code)
 - `tg_chat_id` and `sender_id` are always `string` — Telegram IDs are 64-bit, never store as number
 - `sent_at` is always Unix epoch **seconds** (integer) — Telegram's native format. Never call `new Date()` on it for storage.
