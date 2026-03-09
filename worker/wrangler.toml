@@ -1,0 +1,15 @@
+name = "tg-reader"
+main = "src/index.ts"
+compatibility_date = "2025-03-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "tg-archive"
+database_id = "REPLACE_WITH_ACTUAL_D1_ID"
+
+[[r2_buckets]]
+binding = "BACKUP_BUCKET"
+bucket_name = "tg-reader-backup"
+
+[triggers]
+crons = ["0 3 * * *", "0 4 * * 0"]  # daily backup at 3am UTC, weekly storage check at 4am Sunday

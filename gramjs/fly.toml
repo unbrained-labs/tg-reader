@@ -1,0 +1,29 @@
+# Required secrets (set via `fly secrets set KEY=value`):
+#   GRAMJS_SESSION   - StringSession string from auth.ts
+#   API_ID           - Telegram app ID from my.telegram.org
+#   API_HASH         - Telegram app hash from my.telegram.org
+#   INGEST_TOKEN     - Shared token matching Cloudflare Worker INGEST_TOKEN
+#   WORKER_URL       - Full URL of deployed Worker (no trailing slash)
+
+app = "tg-reader-gramjs"
+primary_region = "ams"
+
+[build]
+
+[env]
+NODE_ENV = "production"
+
+[[mounts]]
+source = "tg_state"
+destination = "/data"
+
+[processes]
+app = "./node_modules/.bin/ts-node src/listener.ts"
+
+[[vm]]
+memory = "256mb"
+cpu_kind = "shared"
+cpus = 1
+
+[deploy]
+strategy = "immediate"

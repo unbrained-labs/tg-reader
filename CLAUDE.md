@@ -57,8 +57,8 @@ Always initialise with `floodSleepThreshold: 300` and realistic device info:
 const client = new TelegramClient(session, apiId, apiHash, {
   floodSleepThreshold: 300,
   deviceModel: 'MacBook Pro',
-  systemVersion: 'macOS 14.0',
-  appVersion: '1.0.0',
+  systemVersion: 'macOS 26.3',
+  appVersion: '12.4.2',
   langCode: 'en',
 });
 ```
