@@ -284,7 +284,7 @@ async function backfillDialog(
 async function warmEntityCache(client: TelegramClient): Promise<void> {
   console.log('[backfill] warming entity cache...');
   let count = 0;
-  for await (const _ of client.iterDialogs({ limit: 0 })) {
+  for await (const _ of client.iterDialogs({})) {
     count++;
   }
   console.log(`[backfill] entity cache warmed count=${count}`);

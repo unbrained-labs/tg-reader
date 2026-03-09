@@ -695,15 +695,27 @@ async function runBackup(env: Env): Promise<void> {
   const key = `backup-${date}.ndjson`;
 
   try {
-    const lines: string[] = [];
-    for await (const line of streamMessages(env.DB)) {
-      lines.push(line);
-    }
-    const body = lines.join('');
-    await env.BACKUP_BUCKET.put(key, body, {
+    const encoder = new TextEncoder();
+    let rowCount = 0;
+
+    const stream = new ReadableStream({
+      async start(controller) {
+        try {
+          for await (const line of streamMessages(env.DB)) {
+            controller.enqueue(encoder.encode(line));
+            rowCount++;
+          }
+          controller.close();
+        } catch (err) {
+          controller.error(err);
+        }
+      },
+    });
+
+    await env.BACKUP_BUCKET.put(key, stream, {
       httpMetadata: { contentType: 'application/x-ndjson' },
     });
-    console.log(`[backup] uploaded key=${key} rows=${lines.length}`);
+    console.log(`[backup] uploaded key=${key} rows=${rowCount}`);
   } catch (err) {
     console.error('[backup] failed', err);
   }

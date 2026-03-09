@@ -251,7 +251,7 @@ function mapMessage(event: NewMessageEvent): Message | null {
 async function syncContacts(client: TelegramClient): Promise<void> {
   console.log('[contacts] syncing contacts list...');
   try {
-    const result = await client.invoke(new Api.updates.GetContacts({ hash: BigInt(0) }));
+    const result = await client.invoke(new Api.contacts.GetContacts({ hash: BigInt(0) }));
 
     if (!(result instanceof Api.contacts.Contacts)) {
       console.log('[contacts] no contacts or not modified');
@@ -341,6 +341,32 @@ function savePts(pts: number): void {
   }
 }
 
+function buildGapMessage(raw: Api.Message): Message {
+  const { tg_chat_id, chat_type } = resolvePeer(raw.peerId);
+  return {
+    tg_message_id: raw.id,
+    tg_chat_id,
+    chat_type: chat_type as Message['chat_type'],
+    chat_name: undefined,
+    sender_id: resolveSenderId(raw.fromId),
+    sender_username: undefined,
+    sender_first_name: undefined,
+    sender_last_name: undefined,
+    direction: raw.out ? 'out' : 'in',
+    message_type: resolveMessageType(raw),
+    text: raw.message || undefined,
+    media_type: resolveMediaType(raw.media ?? undefined),
+    media_file_id: undefined,
+    reply_to_message_id: raw.replyTo?.replyToMsgId ?? undefined,
+    forwarded_from_id: raw.fwdFrom?.fromId ? resolveSenderId(raw.fwdFrom.fromId) : undefined,
+    forwarded_from_name: raw.fwdFrom?.fromName ?? undefined,
+    sent_at: raw.date,
+    edit_date: raw.editDate ?? undefined,
+    is_deleted: 0,
+    deleted_at: undefined,
+  };
+}
+
 async function runGapRecovery(client: TelegramClient): Promise<void> {
   const pts = loadPts();
   if (!pts) {
@@ -348,69 +374,50 @@ async function runGapRecovery(client: TelegramClient): Promise<void> {
     return;
   }
   console.log(`[gap-recovery] recovering from pts=${pts}`);
-  try {
-    const result = await client.invoke(
-      new Api.updates.GetDifference({
-        pts,
-        date: 0,
-        qts: 0,
-      }),
-    );
 
-    if (
-      result instanceof Api.updates.Difference ||
-      result instanceof Api.updates.DifferenceSlice
-    ) {
+  let currentPts = pts;
+  let totalMissed = 0;
+
+  try {
+    while (true) {
+      const result = await client.invoke(
+        new Api.updates.GetDifference({ pts: currentPts, date: 0, qts: 0 }),
+      );
+
+      if (result instanceof Api.updates.DifferenceTooLong) {
+        console.warn('[gap-recovery] DifferenceTooLong — pts too stale, resetting. Messages during gap are unrecoverable.');
+        await persistPts(client);
+        break;
+      }
+
+      if (result instanceof Api.updates.DifferenceEmpty) {
+        console.log('[gap-recovery] up to date (DifferenceEmpty)');
+        break;
+      }
+
+      // Both Difference and DifferenceSlice have newMessages
       const messages = result.newMessages;
-      console.log(`[gap-recovery] found ${messages.length} missed messages`);
+      totalMissed += messages.length;
 
       for (const raw of messages) {
         if (!(raw instanceof Api.Message)) continue;
-
-        const { tg_chat_id, chat_type } = resolvePeer(raw.peerId);
-
-        const msg: Message = {
-          tg_message_id: raw.id,
-          tg_chat_id,
-          chat_type: chat_type as Message['chat_type'],
-          chat_name: undefined,
-          sender_id: resolveSenderId(raw.fromId),
-          sender_username: undefined,
-          sender_first_name: undefined,
-          sender_last_name: undefined,
-          direction: raw.out ? 'out' : 'in',
-          message_type: resolveMessageType(raw),
-          text: raw.message || undefined,
-          media_type: resolveMediaType(raw.media ?? undefined),
-          media_file_id: undefined,
-          reply_to_message_id: raw.replyTo?.replyToMsgId ?? undefined,
-          forwarded_from_id: raw.fwdFrom?.fromId
-            ? resolveSenderId(raw.fwdFrom.fromId)
-            : undefined,
-          forwarded_from_name: raw.fwdFrom?.fromName ?? undefined,
-          sent_at: raw.date, // already Unix epoch seconds
-          edit_date: raw.editDate ?? undefined,
-          is_deleted: 0,
-          deleted_at: undefined,
-        };
-
-        buffer.push(msg);
+        buffer.push(buildGapMessage(raw));
         if (buffer.length >= 100) await flushBuffer();
       }
 
-      await flushBuffer();
-      console.log(`[gap-recovery] complete`);
-    } else if (result instanceof Api.updates.DifferenceTooLong) {
-      console.warn('[gap-recovery] DifferenceTooLong — pts too stale, resetting to current state. Messages during gap are unrecoverable.');
-      await persistPts(client);
-    } else {
-      console.log('[gap-recovery] up to date (DifferenceEmpty)');
+      if (result instanceof Api.updates.Difference) {
+        // Final page — done
+        await flushBuffer();
+        console.log(`[gap-recovery] complete total_missed=${totalMissed}`);
+        break;
+      }
+
+      // DifferenceSlice — more pages, advance pts and loop
+      currentPts = result.intermediateState.pts;
+      console.log(`[gap-recovery] slice batch=${messages.length} next_pts=${currentPts}`);
     }
   } catch (err) {
-    console.error(
-      '[gap-recovery] error:',
-      err instanceof Error ? err.message : String(err),
-    );
+    console.error('[gap-recovery] error:', err instanceof Error ? err.message : String(err));
   }
 }
 
