@@ -42,6 +42,11 @@ const client = new TelegramClient(session, apiId, apiHash, {
 - `INGEST_TOKEN` — same shared token
 - `WORKER_URL` — full URL of deployed Worker (no trailing slash)
 
+## Security
+- Never log message `text` content — log metadata only (chat_id, message_id, counts, errors)
+- R2 backup bucket must be private — never enable public access
+- `fly logs` is accessible to anyone with Fly account access — keep logs clean
+
 ## Local development
 - Worker: `cd worker && wrangler dev --local` (uses local D1)
 - GramJS: `cd gramjs && npx ts-node src/listener.ts` (requires .env file with above vars)
