@@ -140,6 +140,18 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
 const VALID_SYNC_MODES = ['all', 'blacklist', 'whitelist', 'none'] as const;
 const VALID_CHAT_SYNC_VALUES = ['include', 'exclude'] as const;
 
+// Parse epoch seconds or ISO date string → epoch seconds
+function parseDate(raw: string | null, fallback: number): number {
+  if (raw === null || raw === '') return fallback;
+  // ISO date/datetime string
+  if (raw.includes('-') || raw.includes('T')) {
+    const ms = Date.parse(raw);
+    return isNaN(ms) ? fallback : Math.floor(ms / 1000);
+  }
+  const n = parseInt(raw, 10);
+  return isNaN(n) ? fallback : n;
+}
+
 async function handleSearch(request: Request, env: Env, accountId: string): Promise<Response> {
   const url = new URL(request.url);
   const p = url.searchParams;
@@ -148,12 +160,10 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
   const q = p.get('q');
   const chatId = p.get('chat_id') ?? null;
   const senderUsername = p.get('sender_username') ?? null;
-  const rawFrom = p.get('from');
-  const rawTo = p.get('to');
-  const from = rawFrom !== null ? (parseInt(rawFrom, 10) || 0) : 0;
-  const to = rawTo !== null ? (parseInt(rawTo, 10) || 0) : Math.floor(Date.now() / 1000) + 86400;
+  const from = parseDate(p.get('from'), 0);
+  const to = parseDate(p.get('to'), Math.floor(Date.now() / 1000) + 86400);
   const limit = Math.min(Math.max(parseInt(p.get('limit') ?? '50', 10) || 50, 1), 200);
-  const offset = Math.max(parseInt(p.get('offset') ?? '0', 10) || 0, 0);
+  const beforeId = p.get('before_id') ? parseInt(p.get('before_id')!, 10) : null;
 
   try {
     let dataStmt: D1PreparedStatement;
@@ -170,8 +180,9 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
           AND (m.sender_username = ? OR ? IS NULL)
           AND m.sent_at >= ?
           AND m.sent_at <= ?
+          AND (m.id < ? OR ? IS NULL)
         ORDER BY m.sent_at DESC
-        LIMIT ? OFFSET ?
+        LIMIT ?
       `.trim();
       const COUNT_SQL = `
         SELECT COUNT(*) AS total
@@ -184,7 +195,7 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
           AND m.sent_at >= ?
           AND m.sent_at <= ?
       `.trim();
-      dataStmt = env.DB.prepare(SQL).bind(q, accountId, chatId, chatId, senderUsername, senderUsername, from, to, limit, offset);
+      dataStmt = env.DB.prepare(SQL).bind(q, accountId, chatId, chatId, senderUsername, senderUsername, from, to, beforeId, beforeId, limit);
       countStmt = env.DB.prepare(COUNT_SQL).bind(q, accountId, chatId, chatId, senderUsername, senderUsername, from, to);
     } else {
       const SQL = `
@@ -195,8 +206,9 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
           AND (sender_username = ? OR ? IS NULL)
           AND sent_at >= ?
           AND sent_at <= ?
+          AND (id < ? OR ? IS NULL)
         ORDER BY sent_at DESC
-        LIMIT ? OFFSET ?
+        LIMIT ?
       `.trim();
       const COUNT_SQL = `
         SELECT COUNT(*) AS total
@@ -207,13 +219,15 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
           AND sent_at >= ?
           AND sent_at <= ?
       `.trim();
-      dataStmt = env.DB.prepare(SQL).bind(accountId, chatId, chatId, senderUsername, senderUsername, from, to, limit, offset);
+      dataStmt = env.DB.prepare(SQL).bind(accountId, chatId, chatId, senderUsername, senderUsername, from, to, beforeId, beforeId, limit);
       countStmt = env.DB.prepare(COUNT_SQL).bind(accountId, chatId, chatId, senderUsername, senderUsername, from, to);
     }
 
     const [dataResult, countResult] = await env.DB.batch([dataStmt, countStmt]);
     const total = (countResult.results[0] as { total: number }).total;
-    return json({ results: dataResult.results, total, limit, offset });
+    const rows = dataResult.results as Array<{ id: number }>;
+    const next_before_id = rows.length === limit ? rows[rows.length - 1].id : null;
+    return json({ results: rows, total, limit, next_before_id });
   } catch (err) {
     if (q !== null && err instanceof Error && err.message.toLowerCase().includes('fts5')) {
       return json({ ok: false, error: 'Invalid search query' }, 400);
