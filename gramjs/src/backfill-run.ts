@@ -1,3 +1,4 @@
+import bigInt from 'big-integer';
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions';
 import { Api } from 'telegram';
@@ -111,7 +112,7 @@ async function backfillDialog(
           limit: 100,
           maxId: 0,
           minId: 0,
-          hash: BigInt(0),
+          hash: bigInt(0),
         }),
       );
 

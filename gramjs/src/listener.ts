@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import bigInt from 'big-integer';
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions';
 import { NewMessage, NewMessageEvent } from 'telegram/events';
@@ -197,7 +198,7 @@ function mapMessage(event: NewMessageEvent): Message | null {
 async function syncContacts(client: TelegramClient): Promise<void> {
   console.log('[contacts] syncing contacts list...');
   try {
-    const result = await client.invoke(new Api.contacts.GetContacts({ hash: 0 }));
+    const result = await client.invoke(new Api.contacts.GetContacts({ hash: bigInt(0) }));
 
     if (!(result instanceof Api.contacts.Contacts)) {
       console.log('[contacts] no contacts or not modified');

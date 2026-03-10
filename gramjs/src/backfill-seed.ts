@@ -1,3 +1,4 @@
+import bigInt from 'big-integer';
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions';
 import { Api } from 'telegram';
@@ -88,7 +89,7 @@ function resolveChatName(
   chat_type: string,
   result: Api.messages.Dialogs | Api.messages.DialogsSlice,
 ): string | null {
-  const id = BigInt(tg_chat_id);
+  const id = bigInt(tg_chat_id);
   if (chat_type === 'user') {
     const user = result.users.find(
       u => u instanceof Api.User && u.id === id,
@@ -113,13 +114,13 @@ function resolveChatName(
 
 function dlgToInputPeer(peer: Api.TypePeer): Api.TypeInputPeer {
   if (peer instanceof Api.PeerUser) {
-    return new Api.InputPeerUser({ userId: peer.userId, accessHash: BigInt(0) });
+    return new Api.InputPeerUser({ userId: peer.userId, accessHash: bigInt(0) });
   }
   if (peer instanceof Api.PeerChat) {
     return new Api.InputPeerChat({ chatId: peer.chatId });
   }
   if (peer instanceof Api.PeerChannel) {
-    return new Api.InputPeerChannel({ channelId: peer.channelId, accessHash: BigInt(0) });
+    return new Api.InputPeerChannel({ channelId: peer.channelId, accessHash: bigInt(0) });
   }
   return new Api.InputPeerEmpty();
 }
@@ -149,7 +150,7 @@ async function enumerateDialogs(
         offsetId,
         offsetPeer,
         limit,
-        hash: BigInt(0),
+        hash: bigInt(0),
       }),
     );
 
