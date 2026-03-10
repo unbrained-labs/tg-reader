@@ -89,17 +89,16 @@ function resolveChatName(
   chat_type: string,
   result: Api.messages.Dialogs | Api.messages.DialogsSlice,
 ): string | null {
-  const id = bigInt(tg_chat_id);
   if (chat_type === 'user') {
     const user = result.users.find(
-      u => u instanceof Api.User && u.id === id,
+      u => u instanceof Api.User && u.id.toString() === tg_chat_id,
     ) as Api.User | undefined;
     if (user) {
       return [user.firstName, user.lastName].filter(Boolean).join(' ') || user.username || null;
     }
   } else {
     const chat = result.chats.find(
-      c => 'id' in c && (c as { id: bigint }).id === id,
+      c => 'id' in c && (c as unknown as { id: { toString(): string } }).id.toString() === tg_chat_id,
     ) as (Api.Chat | Api.Channel) | undefined;
     if (chat && 'title' in chat) {
       return (chat as { title: string }).title || null;

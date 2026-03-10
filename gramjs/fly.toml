@@ -18,7 +18,7 @@ source = "tg_state"
 destination = "/data"
 
 [processes]
-app = "./node_modules/.bin/ts-node src/listener.ts"
+app = "node dist/listener.js"
 
 [[vm]]
 memory = "256mb"
