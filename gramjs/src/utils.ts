@@ -55,11 +55,13 @@ export function resolveMediaType(media: Api.TypeMessageMedia | null | undefined)
   if (media instanceof Api.MessageMediaContact) return 'contact';
   if (media instanceof Api.MessageMediaPoll) return 'poll';
   if (media instanceof Api.MessageMediaDice) return 'dice';
+  if (media instanceof Api.MessageMediaWebPage) return undefined; // link preview — not real media
   return 'other';
 }
 
 export function resolveMessageType(msg: Api.Message): string {
-  if (msg.media) return resolveMediaType(msg.media) ?? 'media';
-  if (msg.message) return 'text';
+  const mediaType = resolveMediaType(msg.media ?? undefined);
+  if (mediaType) return mediaType;   // real media (photo, video, voice, etc.)
+  if (msg.message) return 'text';    // text, or text + link preview
   return 'service';
 }
