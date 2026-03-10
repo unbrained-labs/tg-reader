@@ -328,7 +328,7 @@ async function runGapRecovery(client: TelegramClient): Promise<void> {
   try {
     while (true) {
       const result = await client.invoke(
-        new Api.updates.GetDifference({ pts: currentPts, date: 0, qts: 0 }),
+        new Api.updates.GetDifference({ pts: currentPts, date: Math.floor(Date.now() / 1000), qts: 0 }),
       );
 
       if (result instanceof Api.updates.DifferenceTooLong) {
