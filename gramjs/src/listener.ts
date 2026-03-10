@@ -1,7 +1,9 @@
 import * as fs from 'fs';
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions';
-import { NewMessage, NewMessageEvent, EditedMessage, EditedMessageEvent, DeletedMessage, DeletedMessageEvent } from 'telegram/events';
+import { NewMessage, NewMessageEvent } from 'telegram/events';
+import { EditedMessage, EditedMessageEvent } from 'telegram/events/EditedMessage';
+import { DeletedMessage, DeletedMessageEvent } from 'telegram/events/DeletedMessage';
 import { Api } from 'telegram';
 import type { Message } from './types';
 import { requireEnv, resolveSenderId, resolveMediaType, resolveMessageType } from './utils';
@@ -195,7 +197,7 @@ function mapMessage(event: NewMessageEvent): Message | null {
 async function syncContacts(client: TelegramClient): Promise<void> {
   console.log('[contacts] syncing contacts list...');
   try {
-    const result = await client.invoke(new Api.contacts.GetContacts({ hash: BigInt(0) }));
+    const result = await client.invoke(new Api.contacts.GetContacts({ hash: 0 }));
 
     if (!(result instanceof Api.contacts.Contacts)) {
       console.log('[contacts] no contacts or not modified');
@@ -455,7 +457,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    const messages = event.deletedIds.map(id => ({ tg_chat_id, tg_message_id: id }));
+    const messages = event.deletedIds.map((id: number) => ({ tg_chat_id, tg_message_id: id }));
     try {
       await fetch(`${WORKER_URL}/deleted`, {
         method: 'POST',

@@ -5,7 +5,7 @@
 #   INGEST_TOKEN     - Shared token matching Cloudflare Worker INGEST_TOKEN
 #   WORKER_URL       - Full URL of deployed Worker (no trailing slash)
 
-app = "tg-reader-gramjs"
+app = "tg-reader"
 primary_region = "ams"
 
 [build]

@@ -1,6 +1,11 @@
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions';
-import * as input from 'input';
+import * as readline from 'readline';
+
+function prompt(question: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise(resolve => rl.question(question, ans => { rl.close(); resolve(ans); }));
+}
 
 async function main(): Promise<void> {
   const apiIdStr = process.env.API_ID;
@@ -29,9 +34,9 @@ async function main(): Promise<void> {
   });
 
   await client.start({
-    phoneNumber: async () => input.text('Phone number (+countrycode): '),
-    password: async () => input.text('2FA password (or leave empty): '),
-    phoneCode: async () => input.text('Verification code: '),
+    phoneNumber: async () => prompt('Phone number (+countrycode): '),
+    password: async () => prompt('2FA password (or leave empty): '),
+    phoneCode: async () => prompt('Verification code: '),
     onError: (err: Error) => {
       console.error('Auth error:', err.message);
       throw err;
