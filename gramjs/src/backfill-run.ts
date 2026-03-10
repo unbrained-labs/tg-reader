@@ -13,6 +13,7 @@ const API_ID_STR = requireEnv('API_ID');
 const API_HASH = requireEnv('API_HASH');
 const INGEST_TOKEN = requireEnv('INGEST_TOKEN');
 const WORKER_URL = requireEnv('WORKER_URL');
+const ACCOUNT_ID = process.env['ACCOUNT_ID'] ?? 'primary';
 
 const API_ID = parseInt(API_ID_STR, 10);
 if (isNaN(API_ID)) {
@@ -47,7 +48,7 @@ async function postProgress(body: {
   try {
     await fetch(`${WORKER_URL}/backfill/progress`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN },
+      headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
       body: JSON.stringify(body),
     });
   } catch (err) {
@@ -175,7 +176,7 @@ async function backfillDialog(
     try {
       const res = await fetch(`${WORKER_URL}/ingest`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN },
+        headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
         body: JSON.stringify({ messages: batch }),
       });
       if (!res.ok) {
@@ -235,7 +236,7 @@ async function runBackfill(client: TelegramClient): Promise<void> {
   await warmEntityCache(client);
 
   const pendingRes = await fetch(`${WORKER_URL}/backfill/pending`, {
-    headers: { 'X-Ingest-Token': INGEST_TOKEN },
+    headers: { 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
   });
 
   if (!pendingRes.ok) {

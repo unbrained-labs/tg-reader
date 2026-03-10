@@ -27,7 +27,7 @@ function authenticate(request: Request, env: Env): Response | null {
 // Route handlers
 // ---------------------------------------------------------------------------
 
-async function handleIngest(request: Request, env: Env): Promise<Response> {
+async function handleIngest(request: Request, env: Env, accountId: string): Promise<Response> {
   // Parse body
   let body: unknown;
   try {
@@ -62,18 +62,18 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  console.log(`[POST /ingest] received count=${messages.length}`);
+  console.log(`[POST /ingest] account=${accountId} count=${messages.length}`);
 
   // Build one prepared statement per message
   const SQL = `
     INSERT INTO messages (
-      tg_message_id, tg_chat_id, chat_name, chat_type,
+      account_id, tg_message_id, tg_chat_id, chat_name, chat_type,
       sender_id, sender_username, sender_first_name, sender_last_name,
       direction, message_type, text, media_type, media_file_id,
       reply_to_message_id, forwarded_from_id, forwarded_from_name,
       sent_at, edit_date, is_deleted, deleted_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(tg_chat_id, tg_message_id) DO UPDATE SET
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(account_id, tg_chat_id, tg_message_id) DO UPDATE SET
       text = excluded.text,
       edit_date = excluded.edit_date,
       is_deleted = excluded.is_deleted,
@@ -89,6 +89,7 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
 
   const stmts = (messages as Message[]).map((msg) =>
     env.DB.prepare(SQL).bind(
+      accountId,
       msg.tg_message_id,
       msg.tg_chat_id,
       msg.chat_name ?? null,
@@ -139,10 +140,10 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
 const VALID_SYNC_MODES = ['all', 'blacklist', 'whitelist', 'none'] as const;
 const VALID_CHAT_SYNC_VALUES = ['include', 'exclude'] as const;
 
-async function handleSearch(request: Request, env: Env): Promise<Response> {
+async function handleSearch(request: Request, env: Env, accountId: string): Promise<Response> {
   const url = new URL(request.url);
   const p = url.searchParams;
-  console.log(`[GET /search] params=${[...p.keys()].join(',')}`);
+  console.log(`[GET /search] account=${accountId} params=${[...p.keys()].join(',')}`);
 
   const q = p.get('q');
   const chatId = p.get('chat_id') ?? null;
@@ -164,6 +165,7 @@ async function handleSearch(request: Request, env: Env): Promise<Response> {
         FROM messages m
         JOIN messages_fts ON messages_fts.rowid = m.id
         WHERE messages_fts MATCH ?
+          AND m.account_id = ?
           AND (m.tg_chat_id = ? OR ? IS NULL)
           AND (m.sender_username = ? OR ? IS NULL)
           AND m.sent_at >= ?
@@ -176,18 +178,20 @@ async function handleSearch(request: Request, env: Env): Promise<Response> {
         FROM messages m
         JOIN messages_fts ON messages_fts.rowid = m.id
         WHERE messages_fts MATCH ?
+          AND m.account_id = ?
           AND (m.tg_chat_id = ? OR ? IS NULL)
           AND (m.sender_username = ? OR ? IS NULL)
           AND m.sent_at >= ?
           AND m.sent_at <= ?
       `.trim();
-      dataStmt = env.DB.prepare(SQL).bind(q, chatId, chatId, senderUsername, senderUsername, from, to, limit, offset);
-      countStmt = env.DB.prepare(COUNT_SQL).bind(q, chatId, chatId, senderUsername, senderUsername, from, to);
+      dataStmt = env.DB.prepare(SQL).bind(q, accountId, chatId, chatId, senderUsername, senderUsername, from, to, limit, offset);
+      countStmt = env.DB.prepare(COUNT_SQL).bind(q, accountId, chatId, chatId, senderUsername, senderUsername, from, to);
     } else {
       const SQL = `
         SELECT *
         FROM messages
-        WHERE (tg_chat_id = ? OR ? IS NULL)
+        WHERE account_id = ?
+          AND (tg_chat_id = ? OR ? IS NULL)
           AND (sender_username = ? OR ? IS NULL)
           AND sent_at >= ?
           AND sent_at <= ?
@@ -197,13 +201,14 @@ async function handleSearch(request: Request, env: Env): Promise<Response> {
       const COUNT_SQL = `
         SELECT COUNT(*) AS total
         FROM messages
-        WHERE (tg_chat_id = ? OR ? IS NULL)
+        WHERE account_id = ?
+          AND (tg_chat_id = ? OR ? IS NULL)
           AND (sender_username = ? OR ? IS NULL)
           AND sent_at >= ?
           AND sent_at <= ?
       `.trim();
-      dataStmt = env.DB.prepare(SQL).bind(chatId, chatId, senderUsername, senderUsername, from, to, limit, offset);
-      countStmt = env.DB.prepare(COUNT_SQL).bind(chatId, chatId, senderUsername, senderUsername, from, to);
+      dataStmt = env.DB.prepare(SQL).bind(accountId, chatId, chatId, senderUsername, senderUsername, from, to, limit, offset);
+      countStmt = env.DB.prepare(COUNT_SQL).bind(accountId, chatId, chatId, senderUsername, senderUsername, from, to);
     }
 
     const [dataResult, countResult] = await env.DB.batch([dataStmt, countStmt]);
@@ -232,7 +237,7 @@ interface ContactPayload {
   is_bot?: number;       // 1 or 0
 }
 
-async function handlePostContacts(request: Request, env: Env): Promise<Response> {
+async function handlePostContacts(request: Request, env: Env, accountId: string): Promise<Response> {
   let body: unknown;
   try {
     body = await request.json();
@@ -254,12 +259,12 @@ async function handlePostContacts(request: Request, env: Env): Promise<Response>
     return json({ ok: false, error: 'contacts array must have 1–500 items' }, 400);
   }
 
-  console.log(`[POST /contacts] received count=${contacts.length}`);
+  console.log(`[POST /contacts] account=${accountId} count=${contacts.length}`);
 
   const SQL = `
-    INSERT INTO contacts (tg_user_id, phone, username, first_name, last_name, is_mutual, is_bot, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())
-    ON CONFLICT(tg_user_id) DO UPDATE SET
+    INSERT INTO contacts (account_id, tg_user_id, phone, username, first_name, last_name, is_mutual, is_bot, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+    ON CONFLICT(account_id, tg_user_id) DO UPDATE SET
       phone       = COALESCE(excluded.phone, contacts.phone),
       username    = COALESCE(excluded.username, contacts.username),
       first_name  = COALESCE(excluded.first_name, contacts.first_name),
@@ -271,6 +276,7 @@ async function handlePostContacts(request: Request, env: Env): Promise<Response>
 
   const stmts = (contacts as ContactPayload[]).map((c) =>
     env.DB.prepare(SQL).bind(
+      accountId,
       c.tg_user_id,
       c.phone ?? null,
       c.username ?? null,
@@ -300,7 +306,7 @@ async function handlePostContacts(request: Request, env: Env): Promise<Response>
   return json({ upserted });
 }
 
-async function handleGetContacts(_request: Request, env: Env): Promise<Response> {
+async function handleGetContacts(_request: Request, env: Env, accountId: string): Promise<Response> {
   const SQL = `
     SELECT
       c.tg_user_id,
@@ -313,25 +319,26 @@ async function handleGetContacts(_request: Request, env: Env): Promise<Response>
       COUNT(m.id) AS message_count,
       MAX(m.sent_at) AS last_seen
     FROM contacts c
-    LEFT JOIN messages m ON m.sender_id = c.tg_user_id
+    LEFT JOIN messages m ON m.account_id = c.account_id AND m.sender_id = c.tg_user_id
+    WHERE c.account_id = ?
     GROUP BY c.tg_user_id
     ORDER BY last_seen DESC NULLS LAST
   `.trim();
 
   let results: unknown[];
   try {
-    const outcome = await env.DB.prepare(SQL).all();
+    const outcome = await env.DB.prepare(SQL).bind(accountId).all();
     results = outcome.results;
   } catch (err) {
     console.error('[GET /contacts] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  console.log(`[GET /contacts] count=${results.length}`);
+  console.log(`[GET /contacts] account=${accountId} count=${results.length}`);
   return json(results);
 }
 
-async function handleChats(_request: Request, env: Env): Promise<Response> {
+async function handleChats(_request: Request, env: Env, accountId: string): Promise<Response> {
   const SQL = `
     SELECT
       m.tg_chat_id,
@@ -341,21 +348,22 @@ async function handleChats(_request: Request, env: Env): Promise<Response> {
       MAX(m.sent_at) AS last_message_at,
       COALESCE(cc.sync, 'default') AS sync_status
     FROM messages m
-    LEFT JOIN chat_config cc ON cc.tg_chat_id = m.tg_chat_id
+    LEFT JOIN chat_config cc ON cc.account_id = m.account_id AND cc.tg_chat_id = m.tg_chat_id
+    WHERE m.account_id = ?
     GROUP BY m.tg_chat_id
     ORDER BY last_message_at DESC
   `.trim();
 
   let results: unknown[];
   try {
-    const outcome = await env.DB.prepare(SQL).all();
+    const outcome = await env.DB.prepare(SQL).bind(accountId).all();
     results = outcome.results;
   } catch (err) {
     console.error('[GET /chats] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  console.log(`[GET /chats] count=${results.length}`);
+  console.log(`[GET /chats] account=${accountId} count=${results.length}`);
   return json(results);
 }
 
@@ -387,9 +395,11 @@ async function handlePostConfig(request: Request, env: Env): Promise<Response> {
   }
 }
 
-async function handleGetChatsConfig(_request: Request, env: Env): Promise<Response> {
+async function handleGetChatsConfig(_request: Request, env: Env, accountId: string): Promise<Response> {
   try {
-    const { results } = await env.DB.prepare(`SELECT tg_chat_id, chat_name, sync, updated_at FROM chat_config ORDER BY updated_at DESC`).all();
+    const { results } = await env.DB.prepare(
+      `SELECT tg_chat_id, chat_name, sync, updated_at FROM chat_config WHERE account_id = ? ORDER BY updated_at DESC`
+    ).bind(accountId).all();
     return json(results);
   } catch (err) {
     console.error('[GET /chats/config] DB error', err);
@@ -397,7 +407,7 @@ async function handleGetChatsConfig(_request: Request, env: Env): Promise<Respon
   }
 }
 
-async function handlePostChatsConfig(request: Request, env: Env): Promise<Response> {
+async function handlePostChatsConfig(request: Request, env: Env, accountId: string): Promise<Response> {
   let body: unknown;
   try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
 
@@ -411,9 +421,9 @@ async function handlePostChatsConfig(request: Request, env: Env): Promise<Respon
 
   try {
     await env.DB.prepare(`
-      INSERT INTO chat_config (tg_chat_id, chat_name, sync, updated_at) VALUES (?, ?, ?, unixepoch())
-      ON CONFLICT(tg_chat_id) DO UPDATE SET chat_name = excluded.chat_name, sync = excluded.sync, updated_at = unixepoch()
-    `.trim()).bind(b.tg_chat_id, b.chat_name ?? null, b.sync).run();
+      INSERT INTO chat_config (account_id, tg_chat_id, chat_name, sync, updated_at) VALUES (?, ?, ?, ?, unixepoch())
+      ON CONFLICT(account_id, tg_chat_id) DO UPDATE SET chat_name = excluded.chat_name, sync = excluded.sync, updated_at = unixepoch()
+    `.trim()).bind(accountId, b.tg_chat_id, b.chat_name ?? null, b.sync).run();
     return json({ ok: true });
   } catch (err) {
     console.error('[POST /chats/config] DB error', err);
@@ -421,9 +431,9 @@ async function handlePostChatsConfig(request: Request, env: Env): Promise<Respon
   }
 }
 
-async function handleDeleteChatsConfig(tgChatId: string, env: Env): Promise<Response> {
+async function handleDeleteChatsConfig(tgChatId: string, env: Env, accountId: string): Promise<Response> {
   try {
-    await env.DB.prepare(`DELETE FROM chat_config WHERE tg_chat_id = ?`).bind(tgChatId).run();
+    await env.DB.prepare(`DELETE FROM chat_config WHERE account_id = ? AND tg_chat_id = ?`).bind(accountId, tgChatId).run();
     return json({ ok: true });
   } catch (err) {
     console.error('[DELETE /chats/config] DB error', err);
@@ -441,7 +451,7 @@ interface BackfillSeedDialog {
   total_messages: number | null;
 }
 
-async function handleDeleted(request: Request, env: Env): Promise<Response> {
+async function handleDeleted(request: Request, env: Env, accountId: string): Promise<Response> {
   let body: unknown;
   try {
     body = await request.json();
@@ -459,11 +469,11 @@ async function handleDeleted(request: Request, env: Env): Promise<Response> {
     return json({ ok: false, error: 'messages array must have 1–500 items' }, 400);
   }
 
-  console.log(`[POST /deleted] count=${messages.length}`);
+  console.log(`[POST /deleted] account=${accountId} count=${messages.length}`);
 
-  const SQL = `UPDATE messages SET is_deleted = 1, deleted_at = unixepoch() WHERE tg_chat_id = ? AND tg_message_id = ?`;
+  const SQL = `UPDATE messages SET is_deleted = 1, deleted_at = unixepoch() WHERE account_id = ? AND tg_chat_id = ? AND tg_message_id = ?`;
   const stmts = messages.map((m) =>
-    env.DB.prepare(SQL).bind(m.tg_chat_id, m.tg_message_id),
+    env.DB.prepare(SQL).bind(accountId, m.tg_chat_id, m.tg_message_id),
   );
 
   let results: D1Result[];
@@ -479,7 +489,7 @@ async function handleDeleted(request: Request, env: Env): Promise<Response> {
   return json({ marked });
 }
 
-async function handleBackfillSeed(request: Request, env: Env): Promise<Response> {
+async function handleBackfillSeed(request: Request, env: Env, accountId: string): Promise<Response> {
   let body: unknown;
   try {
     body = await request.json();
@@ -497,12 +507,12 @@ async function handleBackfillSeed(request: Request, env: Env): Promise<Response>
     return json({ ok: false, error: 'dialogs array must have 1–500 items' }, 400);
   }
 
-  console.log(`[POST /backfill/seed] count=${dialogs.length}`);
+  console.log(`[POST /backfill/seed] account=${accountId} count=${dialogs.length}`);
 
-  const SQL = `INSERT OR IGNORE INTO backfill_state (tg_chat_id, chat_name, total_messages, status) VALUES (?, ?, ?, 'pending')`;
+  const SQL = `INSERT OR IGNORE INTO backfill_state (account_id, tg_chat_id, chat_name, total_messages, status) VALUES (?, ?, ?, ?, 'pending')`;
 
   const stmts = dialogs.map((d) =>
-    env.DB.prepare(SQL).bind(d.tg_chat_id, d.chat_name ?? null, d.total_messages ?? null),
+    env.DB.prepare(SQL).bind(accountId, d.tg_chat_id, d.chat_name ?? null, d.total_messages ?? null),
   );
 
   let results: D1Result[];
@@ -524,17 +534,17 @@ async function handleBackfillSeed(request: Request, env: Env): Promise<Response>
   return json({ seeded });
 }
 
-async function handleBackfillPending(_request: Request, env: Env): Promise<Response> {
+async function handleBackfillPending(_request: Request, env: Env, accountId: string): Promise<Response> {
   const SQL = `
     SELECT tg_chat_id, chat_name, total_messages, fetched_messages, oldest_message_id, status
     FROM backfill_state
-    WHERE status IN ('pending', 'in_progress')
+    WHERE account_id = ? AND status IN ('pending', 'in_progress')
     ORDER BY tg_chat_id
   `.trim();
 
   try {
-    const { results } = await env.DB.prepare(SQL).all();
-    console.log(`[GET /backfill/pending] count=${results.length}`);
+    const { results } = await env.DB.prepare(SQL).bind(accountId).all();
+    console.log(`[GET /backfill/pending] account=${accountId} count=${results.length}`);
     return json(results);
   } catch (err) {
     console.error('[GET /backfill/pending] DB error', err);
@@ -542,7 +552,7 @@ async function handleBackfillPending(_request: Request, env: Env): Promise<Respo
   }
 }
 
-async function handleBackfillProgress(request: Request, env: Env): Promise<Response> {
+async function handleBackfillProgress(request: Request, env: Env, accountId: string): Promise<Response> {
   let body: unknown;
   try {
     body = await request.json();
@@ -574,12 +584,13 @@ async function handleBackfillProgress(request: Request, env: Env): Promise<Respo
     return json({ ok: false, error: 'nothing to update' }, 400);
   }
 
+  binds.push(accountId);
   binds.push(b.tg_chat_id as string);
 
-  console.log(`[POST /backfill/progress] sets=${sets.length}`);
+  console.log(`[POST /backfill/progress] account=${accountId} sets=${sets.length}`);
 
   try {
-    await env.DB.prepare(`UPDATE backfill_state SET ${sets.join(', ')} WHERE tg_chat_id = ?`).bind(...binds).run();
+    await env.DB.prepare(`UPDATE backfill_state SET ${sets.join(', ')} WHERE account_id = ? AND tg_chat_id = ?`).bind(...binds).run();
     return json({ ok: true });
   } catch (err) {
     console.error('[POST /backfill/progress] DB error', err);
@@ -591,29 +602,29 @@ async function handleBackfillProgress(request: Request, env: Env): Promise<Respo
 // Router
 // ---------------------------------------------------------------------------
 
-async function route(request: Request, env: Env): Promise<Response> {
+async function route(request: Request, env: Env, accountId: string): Promise<Response> {
   const url = new URL(request.url);
   const { pathname } = url;
   const method = request.method;
 
   if (method === 'POST' && pathname === '/ingest') {
-    return handleIngest(request, env);
+    return handleIngest(request, env, accountId);
   }
 
   if (method === 'GET' && pathname === '/search') {
-    return handleSearch(request, env);
+    return handleSearch(request, env, accountId);
   }
 
   if (method === 'GET' && pathname === '/contacts') {
-    return handleGetContacts(request, env);
+    return handleGetContacts(request, env, accountId);
   }
 
   if (method === 'POST' && pathname === '/contacts') {
-    return handlePostContacts(request, env);
+    return handlePostContacts(request, env, accountId);
   }
 
   if (method === 'GET' && pathname === '/chats') {
-    return handleChats(request, env);
+    return handleChats(request, env, accountId);
   }
 
   if (method === 'GET' && pathname === '/config') {
@@ -625,34 +636,34 @@ async function route(request: Request, env: Env): Promise<Response> {
   }
 
   if (method === 'GET' && pathname === '/chats/config') {
-    return handleGetChatsConfig(request, env);
+    return handleGetChatsConfig(request, env, accountId);
   }
 
   if (method === 'POST' && pathname === '/chats/config') {
-    return handlePostChatsConfig(request, env);
+    return handlePostChatsConfig(request, env, accountId);
   }
 
   // DELETE /chats/config/:tg_chat_id
   const deleteMatch = pathname.match(/^\/chats\/config\/(.+)$/);
   if (method === 'DELETE' && deleteMatch) {
     const tgChatId = decodeURIComponent(deleteMatch[1]);
-    return handleDeleteChatsConfig(tgChatId, env);
+    return handleDeleteChatsConfig(tgChatId, env, accountId);
   }
 
   if (method === 'POST' && pathname === '/deleted') {
-    return handleDeleted(request, env);
+    return handleDeleted(request, env, accountId);
   }
 
   if (method === 'POST' && pathname === '/backfill/seed') {
-    return handleBackfillSeed(request, env);
+    return handleBackfillSeed(request, env, accountId);
   }
 
   if (method === 'GET' && pathname === '/backfill/pending') {
-    return handleBackfillPending(request, env);
+    return handleBackfillPending(request, env, accountId);
   }
 
   if (method === 'POST' && pathname === '/backfill/progress') {
-    return handleBackfillProgress(request, env);
+    return handleBackfillProgress(request, env, accountId);
   }
 
   return json({ ok: false, error: 'Not Found' }, 404);
@@ -666,7 +677,8 @@ async function fetch(request: Request, env: Env): Promise<Response> {
   const authError = authenticate(request, env);
   if (authError) return authError;
 
-  return route(request, env);
+  const accountId = request.headers.get('X-Account-ID') ?? 'primary';
+  return route(request, env, accountId);
 }
 
 // ---------------------------------------------------------------------------
@@ -751,7 +763,7 @@ async function scheduled(
   env: Env,
   _ctx: ExecutionContext,
 ): Promise<void> {
-  if (event.cron === '0 4 * * 0') {
+  if (event.cron === '0 4 1 * *') {
     await runStorageCheck(env);
   } else {
     await runBackup(env);

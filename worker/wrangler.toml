@@ -5,11 +5,11 @@ compatibility_date = "2025-03-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "tg-archive"
-database_id = "REPLACE_WITH_ACTUAL_D1_ID"
+database_id = "430ffb40-988f-4929-bde2-8b2be617de3d"
 
 [[r2_buckets]]
 binding = "BACKUP_BUCKET"
 bucket_name = "tg-reader-backup"
 
 [triggers]
-crons = ["0 3 * * *", "0 4 * * 0"]  # daily backup at 3am UTC, weekly storage check at 4am Sunday
+crons = ["0 3 * * *", "0 4 1 * *"]  # daily backup at 3am UTC, monthly storage check at 4am on 1st

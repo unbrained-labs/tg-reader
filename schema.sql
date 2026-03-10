@@ -9,6 +9,7 @@
 
 CREATE TABLE messages (
   id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id           TEXT NOT NULL DEFAULT 'primary',  -- which TG account captured this
   tg_message_id        INTEGER NOT NULL,
   tg_chat_id           TEXT NOT NULL,         -- stored as TEXT, Telegram IDs are 64-bit
   chat_name            TEXT,
@@ -31,14 +32,16 @@ CREATE TABLE messages (
   is_deleted           INTEGER DEFAULT 0,     -- 1 if observed as deleted
   deleted_at           INTEGER,               -- Unix epoch seconds, NULL if not deleted
   indexed_at           INTEGER DEFAULT (unixepoch()),
-  UNIQUE(tg_chat_id, tg_message_id)
+  UNIQUE(account_id, tg_chat_id, tg_message_id)
 );
 
 CREATE TABLE chat_config (
-  tg_chat_id   TEXT PRIMARY KEY,
+  account_id   TEXT NOT NULL DEFAULT 'primary',
+  tg_chat_id   TEXT NOT NULL,
   chat_name    TEXT,
   sync         TEXT CHECK(sync IN ('include', 'exclude')) DEFAULT 'include',
-  updated_at   INTEGER DEFAULT (unixepoch())
+  updated_at   INTEGER DEFAULT (unixepoch()),
+  PRIMARY KEY (account_id, tg_chat_id)
 );
 
 CREATE TABLE global_config (
@@ -47,18 +50,21 @@ CREATE TABLE global_config (
 );
 
 CREATE TABLE contacts (
-  tg_user_id       TEXT PRIMARY KEY,       -- stored as TEXT, 64-bit
-  phone            TEXT,
-  username         TEXT,
-  first_name       TEXT,
-  last_name        TEXT,
-  is_mutual        INTEGER DEFAULT 0,      -- 1 if they have you saved too
-  is_bot           INTEGER DEFAULT 0,
-  updated_at       INTEGER DEFAULT (unixepoch())
+  account_id   TEXT NOT NULL DEFAULT 'primary',
+  tg_user_id   TEXT NOT NULL,               -- stored as TEXT, 64-bit
+  phone        TEXT,
+  username     TEXT,
+  first_name   TEXT,
+  last_name    TEXT,
+  is_mutual    INTEGER DEFAULT 0,           -- 1 if they have you saved too
+  is_bot       INTEGER DEFAULT 0,
+  updated_at   INTEGER DEFAULT (unixepoch()),
+  PRIMARY KEY (account_id, tg_user_id)
 );
 
 CREATE TABLE backfill_state (
-  tg_chat_id         TEXT PRIMARY KEY,
+  account_id         TEXT NOT NULL DEFAULT 'primary',
+  tg_chat_id         TEXT NOT NULL,
   chat_name          TEXT,
   total_messages     INTEGER,
   fetched_messages   INTEGER DEFAULT 0,
@@ -66,7 +72,8 @@ CREATE TABLE backfill_state (
   status             TEXT CHECK(status IN ('pending', 'in_progress', 'complete', 'failed')) DEFAULT 'pending',
   last_error         TEXT,
   started_at         INTEGER,
-  completed_at       INTEGER
+  completed_at       INTEGER,
+  PRIMARY KEY (account_id, tg_chat_id)
 );
 
 -- ---------------------------------------------------------------------------
@@ -74,13 +81,13 @@ CREATE TABLE backfill_state (
 -- ---------------------------------------------------------------------------
 
 -- Composite: covers chat timeline queries (most common pattern)
-CREATE INDEX idx_chat_time ON messages(tg_chat_id, sent_at DESC);
+CREATE INDEX idx_chat_time ON messages(account_id, tg_chat_id, sent_at DESC);
 
 -- Individual: for cross-chat time queries and sender lookups
-CREATE INDEX idx_sent_at   ON messages(sent_at);
-CREATE INDEX idx_sender_id ON messages(sender_id);
+CREATE INDEX idx_sent_at   ON messages(account_id, sent_at);
+CREATE INDEX idx_sender_id ON messages(account_id, sender_id);
 
-CREATE INDEX idx_contacts_username ON contacts(username);
+CREATE INDEX idx_contacts_username ON contacts(account_id, username);
 
 -- ---------------------------------------------------------------------------
 -- FTS5 virtual table

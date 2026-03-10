@@ -29,6 +29,7 @@ const API_ID_STR = requireEnv('API_ID');
 const API_HASH = requireEnv('API_HASH');
 const INGEST_TOKEN = requireEnv('INGEST_TOKEN');
 const WORKER_URL = requireEnv('WORKER_URL');
+const ACCOUNT_ID = process.env['ACCOUNT_ID'] ?? 'primary';
 
 const API_ID = parseInt(API_ID_STR, 10);
 if (isNaN(API_ID)) {
@@ -53,7 +54,7 @@ function resolvePeer(peerId: Api.TypePeer): { tg_chat_id: string; chat_type: str
 let syncConfig: SyncConfig = { sync_mode: 'all', chatOverrides: [] };
 
 async function fetchSyncConfig(): Promise<SyncConfig> {
-  const headers = { 'X-Ingest-Token': INGEST_TOKEN };
+  const headers = { 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID };
   const [globalRes, chatsRes] = await Promise.all([
     fetch(`${WORKER_URL}/config`, { headers }),
     fetch(`${WORKER_URL}/chats/config`, { headers }),
@@ -104,6 +105,7 @@ async function flushBuffer(): Promise<void> {
       headers: {
         'Content-Type': 'application/json',
         'X-Ingest-Token': INGEST_TOKEN,
+        'X-Account-ID': ACCOUNT_ID,
       },
       body: JSON.stringify({ messages: batch }),
     });
@@ -223,7 +225,7 @@ async function syncContacts(client: TelegramClient): Promise<void> {
       const batch = contacts.slice(i, i + 100);
       const res = await fetch(`${WORKER_URL}/contacts`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN },
+        headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
         body: JSON.stringify({ contacts: batch }),
       });
       if (res.ok) {
@@ -245,7 +247,7 @@ async function upsertSenderContact(msg: Message): Promise<void> {
   try {
     await fetch(`${WORKER_URL}/contacts`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN },
+      headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
       body: JSON.stringify({
         contacts: [{
           tg_user_id: msg.sender_id,
@@ -457,7 +459,7 @@ async function main(): Promise<void> {
     try {
       await fetch(`${WORKER_URL}/deleted`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN },
+        headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
         body: JSON.stringify({ messages }),
       });
     } catch (err) {

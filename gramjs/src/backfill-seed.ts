@@ -32,6 +32,7 @@ const API_ID_STR = requireEnv('API_ID');
 const API_HASH = requireEnv('API_HASH');
 const INGEST_TOKEN = requireEnv('INGEST_TOKEN');
 const WORKER_URL = requireEnv('WORKER_URL');
+const ACCOUNT_ID = process.env['ACCOUNT_ID'] ?? 'primary';
 
 const API_ID = parseInt(API_ID_STR, 10);
 if (isNaN(API_ID)) {
@@ -43,7 +44,7 @@ if (isNaN(API_ID)) {
 // ---------------------------------------------------------------------------
 
 async function fetchSyncConfig(): Promise<SyncConfig> {
-  const headers = { 'X-Ingest-Token': INGEST_TOKEN };
+  const headers = { 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID };
   const [globalRes, chatsRes] = await Promise.all([
     fetch(`${WORKER_URL}/config`, { headers }),
     fetch(`${WORKER_URL}/chats/config`, { headers }),
@@ -253,6 +254,7 @@ async function seedWorker(dialogs: DialogSeedEntry[]): Promise<void> {
         headers: {
           'Content-Type': 'application/json',
           'X-Ingest-Token': INGEST_TOKEN,
+          'X-Account-ID': ACCOUNT_ID,
         },
         body: JSON.stringify({ dialogs: batch }),
       });
