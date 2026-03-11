@@ -1,0 +1,21 @@
+name: Deploy GramJS Listeners
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'gramjs/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        app: [tg-reader, tg-reader-main]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --app ${{ matrix.app }} --remote-only
+        working-directory: gramjs
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
