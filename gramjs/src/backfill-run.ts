@@ -39,7 +39,7 @@ interface PendingDialog {
 // Worker API helpers
 // ---------------------------------------------------------------------------
 
-async function postProgress(body: {
+async function postProgress(accountId: string, body: {
   tg_chat_id: string;
   status?: string;
   oldest_message_id?: number;
@@ -47,14 +47,35 @@ async function postProgress(body: {
   last_error?: string;
 }): Promise<void> {
   try {
-    await fetch(`${WORKER_URL}/backfill/progress`, {
+    const res = await fetch(`${WORKER_URL}/backfill/progress`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
+      headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': accountId },
       body: JSON.stringify(body),
     });
+    // Bug 3 fix: check res.ok — a 5xx means checkpoint was NOT saved; log clearly but don't throw
+    if (!res.ok) {
+      console.warn(`[backfill] postProgress HTTP ${res.status} — checkpoint may not have been saved for chat=${body.tg_chat_id}`);
+    }
   } catch (err) {
     console.error('[backfill] progress update failed:', err instanceof Error ? err.message : String(err));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Peer helpers
+// ---------------------------------------------------------------------------
+
+function dlgToInputPeer(peer: Api.TypePeer): Api.TypeInputPeer {
+  if (peer instanceof Api.PeerUser) {
+    return new Api.InputPeerUser({ userId: peer.userId, accessHash: bigInt(0) });
+  }
+  if (peer instanceof Api.PeerChat) {
+    return new Api.InputPeerChat({ chatId: peer.chatId });
+  }
+  if (peer instanceof Api.PeerChannel) {
+    return new Api.InputPeerChannel({ channelId: peer.channelId, accessHash: bigInt(0) });
+  }
+  return new Api.InputPeerEmpty();
 }
 
 // ---------------------------------------------------------------------------
@@ -81,11 +102,12 @@ async function backfillDialog(
   dialog: PendingDialog,
   index: number,
   total: number,
+  accountId: string,
 ): Promise<void> {
   const { tg_chat_id } = dialog;
   console.log(`[backfill] dialog ${index + 1}/${total} fetched=${dialog.fetched_messages} total=${dialog.total_messages ?? 'unknown'}`);
 
-  await postProgress({ tg_chat_id, status: 'in_progress' });
+  await postProgress(accountId, { tg_chat_id, status: 'in_progress' });
 
   let offsetId = dialog.oldest_message_id ?? 0;
   let fetched = dialog.fetched_messages ?? 0;
@@ -95,7 +117,7 @@ async function backfillDialog(
     inputPeer = await getInputPeer(client, tg_chat_id);
   } catch (err) {
     console.error(`[backfill] cannot resolve peer for dialog ${index + 1}:`, err instanceof Error ? err.message : String(err));
-    await postProgress({ tg_chat_id, status: 'failed', last_error: String(err) });
+    await postProgress(accountId, { tg_chat_id, status: 'failed', last_error: String(err) });
     return;
   }
 
@@ -126,7 +148,7 @@ async function backfillDialog(
         )
       ) {
         // NotModified or other unexpected variant — treat as complete
-        await postProgress({ tg_chat_id, status: 'complete', fetched_messages: fetched });
+        await postProgress(accountId, { tg_chat_id, status: 'complete', fetched_messages: fetched });
         console.log(`[backfill] dialog ${index + 1}/${total} complete (unexpected result type) fetched=${fetched}`);
         break;
       }
@@ -137,20 +159,32 @@ async function backfillDialog(
       // filtered count < 100, one deleted/service message in a full page would
       // incorrectly signal end-of-history.
       rawCount = result.messages.length;
-      lastRawId = rawCount > 0 ? result.messages[rawCount - 1].id : 0;
+      // Bug 2 fix: skip MessageEmpty entries (id=0) when computing the cursor.
+      // A MessageEmpty at the tail would set offsetId=0, restarting history from
+      // the beginning and causing an infinite loop.
+      const lastValidMsg = [...result.messages].reverse().find(m => m.id > 0);
+      lastRawId = lastValidMsg ? lastValidMsg.id : 0;
       messages = result.messages.filter(
         (m): m is Api.Message => m instanceof Api.Message,
       );
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       console.error(`[backfill] getHistory error for dialog ${index + 1}:`, errMsg);
-      await postProgress({ tg_chat_id, status: 'failed', last_error: errMsg });
+      await postProgress(accountId, { tg_chat_id, status: 'failed', last_error: errMsg });
       return;
     }
 
     if (rawCount === 0) {
-      await postProgress({ tg_chat_id, status: 'complete', fetched_messages: fetched });
+      await postProgress(accountId, { tg_chat_id, status: 'complete', fetched_messages: fetched });
       console.log(`[backfill] dialog ${index + 1}/${total} complete (empty page) fetched=${fetched}`);
+      break;
+    }
+
+    // Bug 2 fix cont'd: if every message in the page was a MessageEmpty (all id=0),
+    // lastRawId will be 0 — treat as end-of-history to avoid an infinite loop.
+    if (lastRawId === 0) {
+      await postProgress(accountId, { tg_chat_id, status: 'complete', fetched_messages: fetched });
+      console.log(`[backfill] dialog ${index + 1}/${total} complete (all MessageEmpty page) fetched=${fetched}`);
       break;
     }
 
@@ -183,22 +217,33 @@ async function backfillDialog(
     }));
 
     // POST batch to /ingest — duplicates are safely handled by ON CONFLICT in D1
+    // Bug 1 fix: on non-2xx OR network error, mark dialog failed and return without
+    // advancing the cursor. The operator can re-run to retry from the last checkpoint.
+    let ingestOk = false;
     try {
       const res = await fetch(`${WORKER_URL}/ingest`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
+        headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': accountId },
         body: JSON.stringify({ messages: batch }),
       });
       if (!res.ok) {
-        console.error(`[backfill] ingest HTTP ${res.status} for dialog ${index + 1} page offsetId=${offsetId}`);
-      } else {
-        const { inserted, skipped } = (await res.json()) as { inserted: number; skipped: number };
-        console.log(`[backfill] dialog ${index + 1}/${total} page inserted=${inserted} skipped=${skipped} offsetId=${offsetId}`);
+        console.error(`[backfill] ingest HTTP ${res.status} for dialog ${index + 1} page offsetId=${offsetId} — stopping to prevent data loss`);
+        await postProgress(accountId, { tg_chat_id, status: 'failed', last_error: `ingest HTTP ${res.status}` });
+        return;
       }
+      ingestOk = true;
+      const { inserted, skipped } = (await res.json()) as { inserted: number; skipped: number };
+      console.log(`[backfill] dialog ${index + 1}/${total} page inserted=${inserted} skipped=${skipped} offsetId=${offsetId}`);
     } catch (err) {
-      // Network error — log and continue. ON CONFLICT handles any duplicates on retry.
-      console.error('[backfill] ingest fetch error:', err instanceof Error ? err.message : String(err));
+      // Network error — do NOT advance cursor; stop and let operator retry
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error('[backfill] ingest fetch error:', errMsg, '— stopping to prevent data loss');
+      await postProgress(accountId, { tg_chat_id, status: 'failed', last_error: `ingest network error: ${errMsg}` });
+      return;
     }
+
+    // Only advance the cursor if ingest succeeded
+    if (!ingestOk) return;
 
     fetched += messages.length;
     // Advance using the raw last item ID — pages past MessageService/MessageEmpty entries
@@ -206,13 +251,13 @@ async function backfillDialog(
 
     // A raw page smaller than the limit means we've reached the beginning of history
     if (rawCount < 100) {
-      await postProgress({ tg_chat_id, oldest_message_id: offsetId, fetched_messages: fetched, status: 'complete' });
+      await postProgress(accountId, { tg_chat_id, oldest_message_id: offsetId, fetched_messages: fetched, status: 'complete' });
       console.log(`[backfill] dialog ${index + 1}/${total} complete fetched=${fetched}`);
       break;
     }
 
     // Persist resumable progress after each full page
-    await postProgress({ tg_chat_id, oldest_message_id: offsetId, fetched_messages: fetched });
+    await postProgress(accountId, { tg_chat_id, oldest_message_id: offsetId, fetched_messages: fetched });
 
     // Anti-ban sleep: 1.5–4s randomized between pages (CLAUDE.md requirement)
     const sleepMs = Math.random() * 2500 + 1500;
@@ -225,15 +270,63 @@ async function backfillDialog(
 // ---------------------------------------------------------------------------
 
 // GramJS needs to have seen a channel/group entity before getInputEntity()
-// will resolve it. We warm the cache by iterating all dialogs once at startup.
-// This is a read-only API call with no anti-ban risk.
+// will resolve it. We warm the cache by paginating GetDialogs at startup.
+// Bug 4 fix: replaced iterDialogs (no sleep between internal pages) with a
+// manual GetDialogs loop that applies anti-ban sleep between every page.
 async function warmEntityCache(client: TelegramClient): Promise<void> {
   console.log('[backfill] warming entity cache...');
   let count = 0;
-  for await (const _ of client.iterDialogs({})) {
-    count++;
+  let offsetDate = 0;
+  let offsetId = 0;
+  let offsetPeer: Api.TypeInputPeer = new Api.InputPeerEmpty();
+  const limit = 100;
+  let page = 0;
+
+  while (true) {
+    page++;
+    const result = await client.invoke(
+      new Api.messages.GetDialogs({
+        offsetDate,
+        offsetId,
+        offsetPeer,
+        limit,
+        hash: bigInt(0),
+      }),
+    );
+
+    if (
+      !(result instanceof Api.messages.Dialogs || result instanceof Api.messages.DialogsSlice)
+    ) {
+      break;
+    }
+
+    const dlgs = result.dialogs;
+    count += dlgs.length;
+
+    // Full Dialogs (non-slice) or short page — we're done
+    if (result instanceof Api.messages.Dialogs || dlgs.length < limit) {
+      break;
+    }
+
+    // Advance offset using the last dialog's top message date/id/peer
+    const lastDlg = dlgs[dlgs.length - 1];
+    if (lastDlg instanceof Api.Dialog) {
+      const lastMsg = result.messages.find((m: Api.TypeMessage) => m.id === lastDlg.topMessage);
+      if (lastMsg && 'date' in lastMsg) {
+        offsetDate = (lastMsg as { date: number }).date;
+        offsetId = lastMsg.id;
+        offsetPeer = dlgToInputPeer(lastDlg.peer);
+      } else {
+        console.warn(`[backfill] warmEntityCache page=${page} topMessage not found, stopping early`);
+        break;
+      }
+    }
+
+    // Anti-ban: randomized sleep between pages (CLAUDE.md requirement: 1.5–4s)
+    await sleep(Math.random() * 2500 + 1500);
   }
-  console.log(`[backfill] entity cache warmed count=${count}`);
+
+  console.log(`[backfill] entity cache warmed pages=${page} count=${count}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -246,12 +339,14 @@ export { runBackfill };
 // Main backfill orchestration
 // ---------------------------------------------------------------------------
 
-async function runBackfill(client: TelegramClient): Promise<void> {
+async function runBackfill(client: TelegramClient, accountId?: string): Promise<void> {
+  const effectiveAccountId = accountId ?? ACCOUNT_ID;
+
   // Warm entity cache so getInputEntity resolves channels/supergroups correctly
   await warmEntityCache(client);
 
   const pendingRes = await fetch(`${WORKER_URL}/backfill/pending`, {
-    headers: { 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
+    headers: { 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': effectiveAccountId },
   });
 
   if (!pendingRes.ok) {
@@ -268,7 +363,11 @@ async function runBackfill(client: TelegramClient): Promise<void> {
 
   // Process dialogs serially — never parallel (anti-ban rule from CLAUDE.md)
   for (let i = 0; i < pending.length; i++) {
-    await backfillDialog(client, pending[i], i, pending.length);
+    await backfillDialog(client, pending[i], i, pending.length, effectiveAccountId);
+    // Anti-ban: sleep between dialogs (1.5–4s randomized)
+    if (i < pending.length - 1) {
+      await sleep(Math.random() * 2500 + 1500);
+    }
   }
 
   console.log(`[backfill] all ${pending.length} dialogs processed`);
@@ -300,7 +399,9 @@ async function main(): Promise<void> {
   }
   console.log('[backfill] connected to Telegram');
 
-  // Derive account ID from the authenticated user if not set via env
+  // Derive account ID from the authenticated user if not set via env.
+  // Bug 6 fix: ACCOUNT_ID must be set BEFORE calling runBackfill so the module-level
+  // variable is populated when runBackfill falls back to it. Pass it explicitly too.
   if (!ACCOUNT_ID) {
     const me = await client.getMe();
     if (!(me instanceof Api.User)) throw new Error('getMe() returned UserEmpty — session is invalid');
@@ -309,7 +410,7 @@ async function main(): Promise<void> {
   console.log(`[backfill] account_id=${ACCOUNT_ID}`);
 
   try {
-    await runBackfill(client);
+    await runBackfill(client, ACCOUNT_ID);
   } finally {
     await client.disconnect();
   }

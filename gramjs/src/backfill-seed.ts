@@ -44,23 +44,13 @@ if (isNaN(API_ID)) {
 // Sync config
 // ---------------------------------------------------------------------------
 
-async function fetchSyncConfig(): Promise<SyncConfig> {
-  const headers = { 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID };
-  const [globalRes, chatsRes] = await Promise.all([
-    fetch(`${WORKER_URL}/config`, { headers }),
-    fetch(`${WORKER_URL}/chats/config`, { headers }),
-  ]);
+// Note: fetchSyncConfig (dead function, never called) was removed.
+// runSeed calls fetchSyncConfigWith(accountId) below.
 
-  if (!globalRes.ok) {
-    throw new Error(`GET /config failed: HTTP ${globalRes.status}`);
-  }
-  if (!chatsRes.ok) {
-    throw new Error(`GET /chats/config failed: HTTP ${chatsRes.status}`);
-  }
-
-  const { sync_mode } = (await globalRes.json()) as { sync_mode: SyncConfig['sync_mode'] };
-  const chatOverrides = (await chatsRes.json()) as ChatOverride[];
-  return { sync_mode, chatOverrides };
+function normalizeChatId(id: string): string {
+  if (id.startsWith('-100')) return id.slice(4); // supergroup/channel Bot API prefix
+  if (id.startsWith('-')) return id.slice(1);    // plain negative basic group ID
+  return id;
 }
 
 function shouldSync(tgChatId: string, config: SyncConfig): boolean {
@@ -188,7 +178,10 @@ async function enumerateDialogs(
         chat_type = 'group';
       } else if (peer instanceof Api.PeerChannel) {
         tg_chat_id = String(peer.channelId);
-        chat_type = 'channel';
+        const channelEntity = result.chats.find(
+          (c): c is Api.Channel => c instanceof Api.Channel && String(c.id) === tg_chat_id,
+        );
+        chat_type = channelEntity?.megagroup ? 'supergroup' : 'channel';
       } else {
         continue;
       }
@@ -217,15 +210,20 @@ async function enumerateDialogs(
       break;
     }
 
-    // Update offset for next page using the last dialog's top message
+    // Update offset for next page using the last dialog's top message.
+    // Telegram does not guarantee topMessage is in result.messages — if missing,
+    // stop early rather than risk looping on the same page or skipping dialogs.
     const lastDlg = dlgs[dlgs.length - 1];
     if (lastDlg instanceof Api.Dialog) {
       const lastMsg = result.messages.find(m => m.id === lastDlg.topMessage);
       if (lastMsg && 'date' in lastMsg) {
         offsetDate = (lastMsg as { date: number }).date;
         offsetId = lastMsg.id;
+        offsetPeer = dlgToInputPeer(lastDlg.peer);
+      } else {
+        console.warn(`[seed] page=${page} topMessage not in result.messages, stopping early`);
+        break;
       }
-      offsetPeer = dlgToInputPeer(lastDlg.peer);
     }
 
     // Anti-ban: randomized sleep between pages (1.5–4s per CLAUDE.md)
@@ -307,7 +305,8 @@ async function fetchSyncConfigWith(accountId: string): Promise<SyncConfig> {
   if (!globalRes.ok) throw new Error(`GET /config failed: HTTP ${globalRes.status}`);
   if (!chatsRes.ok) throw new Error(`GET /chats/config failed: HTTP ${chatsRes.status}`);
   const { sync_mode } = (await globalRes.json()) as { sync_mode: SyncConfig['sync_mode'] };
-  const chatOverrides = (await chatsRes.json()) as ChatOverride[];
+  const rawOverrides = (await chatsRes.json()) as ChatOverride[];
+  const chatOverrides = rawOverrides.map(o => ({ ...o, tg_chat_id: normalizeChatId(o.tg_chat_id) }));
   return { sync_mode, chatOverrides };
 }
 

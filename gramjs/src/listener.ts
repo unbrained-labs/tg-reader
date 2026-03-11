@@ -71,8 +71,18 @@ async function fetchSyncConfig(): Promise<SyncConfig> {
   }
 
   const { sync_mode } = (await globalRes.json()) as { sync_mode: SyncConfig['sync_mode'] };
-  const chatOverrides = (await chatsRes.json()) as ChatOverride[];
+  const rawOverrides = (await chatsRes.json()) as ChatOverride[];
+  const chatOverrides = rawOverrides.map(o => ({ ...o, tg_chat_id: normalizeChatId(o.tg_chat_id) }));
   return { sync_mode, chatOverrides };
+}
+
+// GramJS returns bare numeric IDs from MTProto (e.g. "1234567890").
+// User-configured overrides may use the Bot API -100 prefix (e.g. "-1001234567890").
+// Normalize to bare ID so comparisons are always consistent.
+function normalizeChatId(id: string): string {
+  if (id.startsWith('-100')) return id.slice(4); // supergroup/channel Bot API prefix
+  if (id.startsWith('-')) return id.slice(1);    // plain negative basic group ID
+  return id;
 }
 
 function shouldSync(tgChatId: string, config: SyncConfig): boolean {
@@ -115,16 +125,16 @@ async function flushBuffer(): Promise<void> {
       body: JSON.stringify({ messages: batch }),
     });
     if (!res.ok) {
-      console.error(`[ingest] HTTP ${res.status} for batch of ${batch.length} — will retry`);
-      return; // leave messages in buffer for retry
+      console.error(`[ingest] HTTP ${res.status} for batch of ${batch.length} — re-queuing`);
+      buffer.unshift(...batch); // put back at front so they're retried next flush
+    } else {
+      buffer.splice(0, batch.length);
+      const { inserted, skipped } = (await res.json()) as { inserted: number; skipped: number };
+      console.log(`[ingest] inserted=${inserted} skipped=${skipped} batch=${batch.length}`);
     }
-    // Confirmed delivery — now remove from buffer
-    buffer.splice(0, batch.length);
-    const { inserted, skipped } = (await res.json()) as { inserted: number; skipped: number };
-    console.log(`[ingest] inserted=${inserted} skipped=${skipped} batch=${batch.length}`);
   } catch (err) {
-    console.error(`[ingest] fetch error — will retry:`, err instanceof Error ? err.message : String(err));
-    // Leave messages in buffer for next flush attempt
+    console.error(`[ingest] fetch error:`, err instanceof Error ? err.message : String(err), '— re-queuing');
+    buffer.unshift(...batch); // put back at front so they're retried next flush
   }
 }
 
@@ -132,12 +142,13 @@ async function flushBuffer(): Promise<void> {
 // Message mapping
 // ---------------------------------------------------------------------------
 
-function mapMessage(event: NewMessageEvent): Message | null {
-  const msg = event.message;
-  if (!(msg instanceof Api.Message)) return null; // skip MessageService etc.
-
-  const { tg_chat_id, chat_type } = resolvePeer(msg.peerId);
-  const sender_id = resolveSenderId(msg.fromId);
+function mapMessage(raw: Api.Message): Message {
+  const { tg_chat_id, chat_type: rawChatType } = resolvePeer(raw.peerId);
+  // Supergroups are PeerChannel with megagroup=true — distinguish from broadcast channels
+  const chat_type = (rawChatType === 'channel' && raw.chat instanceof Api.Channel && raw.chat.megagroup)
+    ? 'supergroup'
+    : rawChatType;
+  const sender_id = resolveSenderId(raw.fromId);
 
   // Resolve chat name and sender details from event entities (populated by GramJS)
   let chat_name: string | undefined;
@@ -145,7 +156,7 @@ function mapMessage(event: NewMessageEvent): Message | null {
   let sender_first_name: string | undefined;
   let sender_last_name: string | undefined;
 
-  const chatEntity = msg.chat;
+  const chatEntity = raw.chat;
   if (chatEntity) {
     if ('title' in chatEntity) {
       chat_name = (chatEntity as { title?: string }).title ?? undefined;
@@ -160,7 +171,7 @@ function mapMessage(event: NewMessageEvent): Message | null {
   }
 
   // Sender entity (more specific than chat for direct messages)
-  const senderEntity = msg.sender;
+  const senderEntity = raw.sender;
   if (senderEntity && 'username' in senderEntity) {
     const s = senderEntity as { username?: string; firstName?: string; lastName?: string };
     sender_username = s.username ?? undefined;
@@ -168,12 +179,8 @@ function mapMessage(event: NewMessageEvent): Message | null {
     sender_last_name = s.lastName ?? undefined;
   }
 
-  const forwarded_from_id = msg.fwdFrom?.fromId
-    ? resolveSenderId(msg.fwdFrom.fromId)
-    : undefined;
-
   return {
-    tg_message_id: msg.id,
+    tg_message_id: raw.id,
     tg_chat_id,
     chat_name,
     chat_type: chat_type as Message['chat_type'],
@@ -181,16 +188,16 @@ function mapMessage(event: NewMessageEvent): Message | null {
     sender_username,
     sender_first_name,
     sender_last_name,
-    direction: msg.out ? 'out' : 'in',
-    message_type: resolveMessageType(msg),
-    text: msg.message || undefined,
-    media_type: resolveMediaType(msg.media ?? undefined),
+    direction: raw.out ? 'out' : 'in',
+    message_type: resolveMessageType(raw),
+    text: raw.message || undefined,
+    media_type: resolveMediaType(raw.media ?? undefined),
     media_file_id: undefined,
-    reply_to_message_id: msg.replyTo?.replyToMsgId ?? undefined,
-    forwarded_from_id,
-    forwarded_from_name: msg.fwdFrom?.fromName ?? undefined,
-    sent_at: msg.date, // already Unix epoch seconds — DO NOT call new Date()
-    edit_date: msg.editDate ?? undefined,
+    reply_to_message_id: raw.replyTo?.replyToMsgId ?? undefined,
+    forwarded_from_id: raw.fwdFrom?.fromId ? resolveSenderId(raw.fwdFrom.fromId) : undefined,
+    forwarded_from_name: raw.fwdFrom?.fromName ?? undefined,
+    sent_at: raw.date, // already Unix epoch seconds — DO NOT call new Date()
+    edit_date: raw.editDate ?? undefined,
     is_deleted: 0,
     deleted_at: undefined,
   };
@@ -278,25 +285,29 @@ async function upsertSenderContact(msg: Message): Promise<void> {
 
 const STATE_FILE = '/data/state.json';
 
-function loadPts(): number | null {
+async function loadPts(): Promise<number | null> {
   try {
-    const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8')) as { pts?: number };
+    const data = JSON.parse(await fs.promises.readFile(STATE_FILE, 'utf-8')) as { pts?: number };
     return data.pts ?? null;
   } catch {
     return null;
   }
 }
 
-function savePts(pts: number): void {
+async function savePts(pts: number): Promise<void> {
   try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ pts }), 'utf-8');
+    await fs.promises.writeFile(STATE_FILE, JSON.stringify({ pts }), 'utf-8');
   } catch (err) {
     console.error('[pts] failed to save pts:', err instanceof Error ? err.message : String(err));
   }
 }
 
-function buildGapMessage(raw: Api.Message): Message {
-  const { tg_chat_id, chat_type } = resolvePeer(raw.peerId);
+function buildGapMessage(raw: Api.Message, chats: Api.TypeChat[]): Message {
+  const { tg_chat_id, chat_type: rawChatType } = resolvePeer(raw.peerId);
+  const chatEntity = raw.peerId instanceof Api.PeerChannel
+    ? chats.find((c): c is Api.Channel => c instanceof Api.Channel && String(c.id) === tg_chat_id)
+    : undefined;
+  const chat_type = (rawChatType === 'channel' && chatEntity?.megagroup) ? 'supergroup' : rawChatType;
   return {
     tg_message_id: raw.id,
     tg_chat_id,
@@ -322,7 +333,7 @@ function buildGapMessage(raw: Api.Message): Message {
 }
 
 async function runGapRecovery(client: TelegramClient): Promise<void> {
-  const pts = loadPts();
+  const pts = await loadPts();
   if (!pts) {
     console.log('[gap-recovery] no saved pts, skipping');
     return;
@@ -359,7 +370,9 @@ async function runGapRecovery(client: TelegramClient): Promise<void> {
 
       for (const raw of messages) {
         if (!(raw instanceof Api.Message)) continue;
-        buffer.push(buildGapMessage(raw));
+        const gapMsg = buildGapMessage(raw, result.chats);
+        if (!shouldSync(gapMsg.tg_chat_id, syncConfig)) continue;
+        buffer.push(gapMsg);
         if (buffer.length >= 100) await flushBuffer();
       }
 
@@ -375,10 +388,11 @@ async function runGapRecovery(client: TelegramClient): Promise<void> {
       if (newPts === currentPts) {
         // pts didn't advance — Telegram API anomaly, break to avoid infinite loop
         console.error('[gap-recovery] pts stalled, aborting to prevent infinite loop');
-        await persistPts(client);
+        await savePts(currentPts);
         break;
       }
       currentPts = newPts;
+      await savePts(currentPts); // persist so a crash mid-recovery doesn't restart from the beginning
       console.log(`[gap-recovery] slice batch=${messages.length} next_pts=${currentPts}`);
     }
     if (iterations >= MAX_ITERATIONS) {
@@ -392,7 +406,7 @@ async function runGapRecovery(client: TelegramClient): Promise<void> {
 async function persistPts(client: TelegramClient): Promise<void> {
   try {
     const state = await client.invoke(new Api.updates.GetState());
-    savePts(state.pts);
+    await savePts(state.pts);
   } catch {
     // ignore — pts will be persisted on next tick
   }
@@ -460,17 +474,18 @@ async function main(): Promise<void> {
 
   // 6. Register message event handlers
   client.addEventHandler(async (event: NewMessageEvent) => {
-    const msg = mapMessage(event);
-    if (!msg) return;
+    const raw = event.message;
+    if (!(raw instanceof Api.Message)) return;
+    const msg = mapMessage(raw);
     if (msg.sender_id) void upsertSenderContact(msg);
     await enqueue(msg);
   }, new NewMessage({}));
 
   // EditedMessage: re-ingest with edit_date set; Worker ON CONFLICT preserves original_text
   client.addEventHandler(async (event: EditedMessageEvent) => {
-    const msg = mapMessage(event as unknown as NewMessageEvent);
-    if (!msg) return;
-    await enqueue(msg);
+    const raw = event.message;
+    if (!(raw instanceof Api.Message)) return;
+    await enqueue(mapMessage(raw));
   }, new EditedMessage({}));
 
   console.log('[listener] NewMessage + EditedMessage handlers registered');
@@ -500,12 +515,12 @@ async function main(): Promise<void> {
   }, new DeletedMessage({}));
 
   // Persist pts every minute so gap recovery stays fresh
-  setInterval(() => {
+  const ptsInterval = setInterval(() => {
     void persistPts(client);
   }, 60_000);
 
   // Refresh sync config every 5 minutes
-  setInterval(() => {
+  const configInterval = setInterval(() => {
     fetchSyncConfig()
       .then(cfg => {
         syncConfig = cfg;
@@ -523,17 +538,17 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => {
     console.log('[listener] SIGTERM received, flushing buffer and exiting');
     if (flushTimer) clearTimeout(flushTimer);
-    // Force-exit after 25s if flush hangs (Fly's hard kill deadline is ~30s)
-    const forceExit = setTimeout(() => {
-      console.error('[listener] graceful shutdown timeout — force exiting');
-      process.exit(1);
-    }, 25_000);
-    flushBuffer()
-      .catch(err => console.error('[listener] flush error during shutdown:', err instanceof Error ? err.message : String(err)))
-      .finally(() => {
-        clearTimeout(forceExit);
-        process.exit(0);
-      });
+    clearInterval(ptsInterval);
+    clearInterval(configInterval);
+    // Drain entire buffer (flushBuffer only takes 100 at a time), with a 4s deadline
+    const drainAndExit = async () => {
+      const deadline = new Promise<void>(resolve => setTimeout(resolve, 4000));
+      const drain = async () => { while (buffer.length > 0) await flushBuffer(); };
+      await Promise.race([drain(), deadline]);
+      await client.disconnect().catch(() => {});
+      process.exit(0);
+    };
+    void drainAndExit();
   });
 
   // 7. Keep process alive indefinitely
