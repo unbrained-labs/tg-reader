@@ -7,15 +7,22 @@ on:
       - 'gramjs/**'
 
 jobs:
-  deploy:
+  deploy-madhoneycub:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        app: [tg-reader, tg-reader-main]
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - run: flyctl deploy --app ${{ matrix.app }} --remote-only
+      - run: flyctl deploy --app tg-reader --remote-only
         working-directory: gramjs
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  deploy-main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --app tg-reader-main --remote-only
+        working-directory: gramjs
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_MAIN }}
