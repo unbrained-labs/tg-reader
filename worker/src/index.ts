@@ -618,6 +618,250 @@ async function handleBackfillProgress(request: Request, env: Env, accountId: str
 }
 
 // ---------------------------------------------------------------------------
+// MCP (Model Context Protocol) — Streamable HTTP transport, spec 2024-11-05
+// ---------------------------------------------------------------------------
+
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Ingest-Token, X-Account-ID',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+};
+
+function mcpJson(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...CORS_HEADERS },
+  });
+}
+
+function mcpError(id: unknown, code: number, message: string): object {
+  return { jsonrpc: '2.0', id, error: { code, message } };
+}
+
+const MCP_TOOL_DEFINITIONS = [
+  {
+    name: 'search',
+    description: 'Full-text search across all archived Telegram messages',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search terms' },
+        chat_id: { type: 'string', description: 'Filter to a specific chat' },
+        from: { type: 'string', description: 'Start date (ISO 8601 e.g. 2024-10-01 or epoch seconds)' },
+        to: { type: 'string', description: 'End date (ISO 8601 or epoch seconds)' },
+        limit: { type: 'number', description: 'Max results, default 20, max 50' },
+        before_id: { type: 'number', description: 'Pagination cursor (id from previous next_before_id)' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'chats',
+    description: 'List all Telegram chats with message counts and last activity',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'history',
+    description: 'Get messages from a specific chat in chronological order',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string', description: 'Chat ID from the chats tool' },
+        limit: { type: 'number', description: 'Number of messages, default 20' },
+        before_id: { type: 'number', description: 'Pagination cursor' },
+      },
+      required: ['chat_id'],
+    },
+  },
+  {
+    name: 'contacts',
+    description: 'List Telegram contacts with message counts',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        search: { type: 'string', description: 'Filter by name or username' },
+      },
+    },
+  },
+  {
+    name: 'recent',
+    description: 'Get the most recent messages across all chats',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Number of messages, default 20, max 50' },
+      },
+    },
+  },
+];
+
+async function dispatchMcpTool(
+  name: string,
+  args: Record<string, unknown>,
+  env: Env,
+  accountId: string,
+): Promise<unknown> {
+  const baseUrl = 'https://internal';
+
+  if (name === 'search') {
+    const params = new URLSearchParams();
+    if (typeof args.query === 'string') params.set('q', args.query);
+    if (typeof args.chat_id === 'string') params.set('chat_id', args.chat_id);
+    if (args.from !== undefined) params.set('from', String(args.from));
+    if (args.to !== undefined) params.set('to', String(args.to));
+    const limit = Math.min(typeof args.limit === 'number' ? args.limit : 20, 50);
+    params.set('limit', String(limit));
+    if (typeof args.before_id === 'number') params.set('before_id', String(args.before_id));
+    const req = new Request(`${baseUrl}/search?${params.toString()}`);
+    const res = await handleSearch(req, env, accountId);
+    return await res.json();
+  }
+
+  if (name === 'chats') {
+    const req = new Request(`${baseUrl}/chats`);
+    const res = await handleChats(req, env, accountId);
+    return await res.json();
+  }
+
+  if (name === 'history') {
+    if (typeof args.chat_id !== 'string') throw new Error('chat_id is required');
+    const params = new URLSearchParams();
+    params.set('chat_id', args.chat_id);
+    const limit = Math.min(typeof args.limit === 'number' ? args.limit : 20, 50);
+    params.set('limit', String(limit));
+    if (typeof args.before_id === 'number') params.set('before_id', String(args.before_id));
+    const req = new Request(`${baseUrl}/search?${params.toString()}`);
+    const res = await handleSearch(req, env, accountId);
+    const data = await res.json() as { results?: unknown[]; total?: number; limit?: number; next_before_id?: number | null };
+    // Return chronological order (reverse the DESC-sorted results)
+    if (Array.isArray(data.results)) {
+      data.results = [...data.results].reverse();
+    }
+    return data;
+  }
+
+  if (name === 'contacts') {
+    const req = new Request(`${baseUrl}/contacts`);
+    const res = await handleGetContacts(req, env, accountId);
+    const data = await res.json() as Array<Record<string, unknown>>;
+    if (typeof args.search === 'string' && args.search.trim() !== '') {
+      const term = args.search.toLowerCase();
+      return data.filter((c) => {
+        const name = String(c.first_name ?? '') + ' ' + String(c.last_name ?? '');
+        const username = String(c.username ?? '');
+        return name.toLowerCase().includes(term) || username.toLowerCase().includes(term);
+      });
+    }
+    return data;
+  }
+
+  if (name === 'recent') {
+    const params = new URLSearchParams();
+    const limit = Math.min(typeof args.limit === 'number' ? args.limit : 20, 50);
+    params.set('limit', String(limit));
+    const req = new Request(`${baseUrl}/search?${params.toString()}`);
+    const res = await handleSearch(req, env, accountId);
+    return await res.json();
+  }
+
+  throw new Error(`Unknown tool: ${name}`);
+}
+
+async function handleMcpMessage(
+  msg: Record<string, unknown>,
+  env: Env,
+  accountId: string,
+): Promise<object> {
+  const { jsonrpc, id, method, params } = msg as {
+    jsonrpc: string;
+    id: unknown;
+    method: string;
+    params?: Record<string, unknown>;
+  };
+
+  if (jsonrpc !== '2.0' || typeof method !== 'string') {
+    return mcpError(id ?? null, -32600, 'Invalid Request');
+  }
+
+  if (method === 'initialize') {
+    return {
+      jsonrpc: '2.0',
+      id,
+      result: {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'tg-reader', version: '1.0.0' },
+      },
+    };
+  }
+
+  if (method === 'notifications/initialized') {
+    return { jsonrpc: '2.0', id, result: null };
+  }
+
+  if (method === 'tools/list') {
+    return {
+      jsonrpc: '2.0',
+      id,
+      result: { tools: MCP_TOOL_DEFINITIONS },
+    };
+  }
+
+  if (method === 'tools/call') {
+    const toolName = (params as Record<string, unknown>)?.name;
+    const toolArgs = ((params as Record<string, unknown>)?.arguments ?? {}) as Record<string, unknown>;
+
+    if (typeof toolName !== 'string') {
+      return mcpError(id, -32602, 'Invalid params: name is required');
+    }
+
+    try {
+      const data = await dispatchMcpTool(toolName, toolArgs, env, accountId);
+      return {
+        jsonrpc: '2.0',
+        id,
+        result: {
+          content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
+        },
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Tool execution failed';
+      return mcpError(id, -32603, message);
+    }
+  }
+
+  return mcpError(id ?? null, -32601, 'Method not found');
+}
+
+async function handleMcp(request: Request, env: Env, accountId: string): Promise<Response> {
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return mcpJson(mcpError(null, -32700, 'Parse error'), 400);
+  }
+
+  // Batch array
+  if (Array.isArray(body)) {
+    if (body.length === 0) {
+      return mcpJson(mcpError(null, -32600, 'Invalid Request: empty batch'), 400);
+    }
+    const responses = await Promise.all(
+      body.map((msg) => handleMcpMessage(msg as Record<string, unknown>, env, accountId)),
+    );
+    return mcpJson(responses);
+  }
+
+  // Single message
+  if (typeof body === 'object' && body !== null) {
+    const response = await handleMcpMessage(body as Record<string, unknown>, env, accountId);
+    return mcpJson(response);
+  }
+
+  return mcpJson(mcpError(null, -32600, 'Invalid Request'), 400);
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -685,6 +929,10 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
     return handleBackfillProgress(request, env, accountId);
   }
 
+  if (method === 'POST' && pathname === '/mcp') {
+    return handleMcp(request, env, accountId);
+  }
+
   return json({ ok: false, error: 'Not Found' }, 404);
 }
 
@@ -693,6 +941,11 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
 // ---------------------------------------------------------------------------
 
 async function fetch(request: Request, env: Env): Promise<Response> {
+  // OPTIONS preflight must bypass auth — claude.ai makes cross-origin requests
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
   const authError = authenticate(request, env);
   if (authError) return authError;
 
