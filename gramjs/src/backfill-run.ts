@@ -274,7 +274,16 @@ async function main(): Promise<void> {
     langCode: 'en',
   });
 
-  await client.connect();
+  try {
+    await client.connect();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('AUTH_KEY_DUPLICATED')) {
+      console.error('[backfill] AUTH_KEY_DUPLICATED — another session is active. Scale down Fly first:\n  fly scale count 0 --yes -a tg-reader\n  fly scale count 0 --yes -a tg-reader-main');
+      process.exit(1);
+    }
+    throw err;
+  }
   console.log('[backfill] connected to Telegram');
 
   // Derive account ID from the authenticated user if not set via env
