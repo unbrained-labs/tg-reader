@@ -65,7 +65,7 @@ async function main(): Promise<void> {
   console.log('[backfill] step 2/2 — fetching history...');
   await client.connect();
   try {
-    await runBackfill(client);
+    await runBackfill(client, ACCOUNT_ID);
   } finally {
     await client.disconnect();
   }
