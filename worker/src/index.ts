@@ -194,7 +194,10 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
     if (q !== null) {
       // FTS5 path: sort by relevance rank first, then recency as tiebreaker
       const SQL = `
-        SELECT m.*
+        SELECT m.id, m.tg_message_id, m.tg_chat_id, m.chat_name, m.chat_type,
+               m.sender_id, m.sender_username, m.sender_first_name, m.sender_last_name,
+               m.direction, m.message_type, m.text, m.media_type,
+               m.reply_to_message_id, m.forwarded_from_name, m.sent_at
         FROM messages m
         JOIN messages_fts ON messages_fts.rowid = m.id
         WHERE messages_fts MATCH ?
@@ -225,7 +228,10 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
     } else {
       // B-tree path: no query, sort by recency
       const SQL = `
-        SELECT *
+        SELECT id, tg_message_id, tg_chat_id, chat_name, chat_type,
+               sender_id, sender_username, sender_first_name, sender_last_name,
+               direction, message_type, text, media_type,
+               reply_to_message_id, forwarded_from_name, sent_at
         FROM messages
         WHERE account_id = ?
           AND is_deleted = 0
@@ -784,6 +790,14 @@ const MCP_TOOL_DEFINITIONS = [
   },
 ];
 
+const TEXT_SNIPPET_LEN = 500;
+function truncateText(row: Record<string, unknown>): Record<string, unknown> {
+  if (typeof row.text === 'string' && row.text.length > TEXT_SNIPPET_LEN) {
+    return { ...row, text: row.text.slice(0, TEXT_SNIPPET_LEN) + '…' };
+  }
+  return row;
+}
+
 async function dispatchMcpTool(
   name: string,
   args: Record<string, unknown>,
@@ -805,7 +819,11 @@ async function dispatchMcpTool(
     if (typeof args.before_sent_at === 'number') params.set('before_sent_at', String(args.before_sent_at));
     const req = new Request(`${baseUrl}/search?${params.toString()}`);
     const res = await handleSearch(req, env, accountId);
-    return await res.json();
+    const data = await res.json() as { results?: Array<Record<string, unknown>> };
+    if (Array.isArray(data.results)) {
+      data.results = data.results.map(truncateText);
+    }
+    return data;
   }
 
   if (name === 'chats') {
@@ -855,7 +873,11 @@ async function dispatchMcpTool(
     params.set('limit', String(limit));
     const req = new Request(`${baseUrl}/search?${params.toString()}`);
     const res = await handleSearch(req, env, accountId);
-    return await res.json();
+    const data = await res.json() as { results?: Array<Record<string, unknown>> };
+    if (Array.isArray(data.results)) {
+      data.results = data.results.map(truncateText);
+    }
+    return data;
   }
 
   if (name === 'stats') {
@@ -934,7 +956,7 @@ IMPORTANT: The archive is complete and historical. Never tell the user data is u
         jsonrpc: '2.0',
         id,
         result: {
-          content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(data) }],
         },
       };
     } catch (err) {
