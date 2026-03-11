@@ -19,6 +19,24 @@ The connector works on claude.ai web and mobile. Auth is via URL query params �
 
 ---
 
+## Using it
+
+Once connected, just talk to Claude normally. No commands, no syntax — Claude knows how to query the archive.
+
+**Example prompts:**
+
+- *"What did I talk about with John last week?"*
+- *"Find all messages mentioning the invoice from March"*
+- *"Did anyone send me a deadline this month?"*
+- *"What's the latest from the project Alpha group?"*
+- *"Search for messages about the contract from Q3 2024"*
+- *"Who sent me something about flights?"*
+- *"Show me my conversation with @username from last Tuesday"*
+
+Claude will automatically use date ranges, search by keyword, look up contacts, and paginate through results. You don't need to tell it which tool to use.
+
+---
+
 ## Available tools
 
 ### `search` — primary tool

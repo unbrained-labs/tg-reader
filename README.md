@@ -78,6 +78,18 @@ Control what gets captured via `POST /config`:
 
 Per-chat overrides via `POST /chats/config`.
 
+## AI / MCP
+
+Connect Claude (or any MCP-compatible agent) directly to your archive:
+
+```
+https://<worker>/mcp?token=<ingest-token>&account_id=<account-id>
+```
+
+Add as a custom connector in **claude.ai → Settings → Connectors**. Once connected, Claude can search your full message history, browse conversations, and look up contacts — just by asking.
+
+See [docs/agents.md](docs/agents.md) for setup and usage examples.
+
 ## Search API
 
 ```
@@ -97,6 +109,7 @@ All timestamps are Unix epoch seconds. Full-text search powered by FTS5.
 │   └── src/
 │       ├── auth.ts          one-time auth → prints StringSession
 │       ├── listener.ts      live message capture
+│       ├── backfill.ts      unified backfill entry point (seed + run)
 │       ├── backfill-seed.ts enumerate dialogs → backfill_state
 │       └── backfill-run.ts  paginated getHistory() → /ingest
 ├── schema.sql     D1 schema (single source of truth)
@@ -106,7 +119,7 @@ All timestamps are Unix epoch seconds. Full-text search powered by FTS5.
 
 ## Setup
 
-See [SPEC.md](./SPEC.md) for full setup instructions and [CLAUDE.md](./CLAUDE.md) for development conventions.
+See [docs/](docs/) for full documentation. [CLAUDE.md](./CLAUDE.md) covers development conventions.
 
 **Quick start order:**
 1. Create D1 database + apply `schema.sql`
