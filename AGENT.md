@@ -8,9 +8,7 @@ This is a complete personal Telegram message archive. Every message sent and rec
 
 - **100,000+ messages** across all chats (DMs, groups, channels)
 - **History going back to 2020**
-- **Two accounts** — each has its own isolated dataset:
-  - `7926042351` — @madhoneycub (secondary account)
-  - `1189180020` — main account
+- **Multiple accounts supported** — each has its own isolated dataset, identified by `account_id`
 - Messages include: text, media type, sender, direction (sent/received), timestamps, reply context, forwarded-from info
 - Contacts table with names, usernames, phone numbers
 
@@ -21,7 +19,7 @@ This is a complete personal Telegram message archive. Every message sent and rec
 The archive is exposed as an MCP server. Connect via:
 
 ```
-POST https://tg-reader.ddohne.workers.dev/mcp?token=<token>&account_id=<id>
+POST https://<your-worker>.workers.dev/mcp?token=<token>&account_id=<id>
 ```
 
 ### Tools
