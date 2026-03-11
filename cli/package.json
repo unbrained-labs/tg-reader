@@ -1,0 +1,18 @@
+{
+  "name": "tg-archive-cli",
+  "version": "1.0.0",
+  "description": "CLI for the Telegram Personal Archive",
+  "bin": {
+    "tg": "./dist/tg.js"
+  },
+  "scripts": {
+    "build": "esbuild tg.ts --bundle --platform=node --outfile=dist/tg.js --banner:js='#!/usr/bin/env node' && chmod +x dist/tg.js",
+    "dev": "ts-node tg.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "esbuild": "^0.21.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}

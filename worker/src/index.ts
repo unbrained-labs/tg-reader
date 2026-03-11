@@ -157,7 +157,12 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
   const p = url.searchParams;
   console.log(`[GET /search] account=${accountId} params=${[...p.keys()].join(',')}`);
 
-  const q = p.get('q');
+  const qRaw = p.get('q');
+  // Sanitize FTS5 query: quote each token individually to prevent operator injection
+  // while preserving multi-word AND semantics ("hello" "world" = hello AND world).
+  const q = qRaw !== null
+    ? qRaw.trim().split(/\s+/).filter(Boolean).map(t => '"' + t.replace(/"/g, '""') + '"*').join(' ') || null
+    : null;
   const chatId = p.get('chat_id') ?? null;
   const senderUsername = p.get('sender_username') ?? null;
   const from = parseDate(p.get('from'), 0);

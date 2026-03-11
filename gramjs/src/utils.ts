@@ -63,5 +63,6 @@ export function resolveMessageType(msg: Api.Message): string {
   const mediaType = resolveMediaType(msg.media ?? undefined);
   if (mediaType) return mediaType;   // real media (photo, video, voice, etc.)
   if (msg.message) return 'text';    // text, or text + link preview
+  if (msg.media instanceof Api.MessageMediaWebPage) return 'text'; // link preview, no text
   return 'service';
 }

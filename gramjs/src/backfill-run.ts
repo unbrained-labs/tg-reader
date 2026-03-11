@@ -14,7 +14,7 @@ const API_ID_STR = requireEnv('API_ID');
 const API_HASH = requireEnv('API_HASH');
 const INGEST_TOKEN = requireEnv('INGEST_TOKEN');
 const WORKER_URL = requireEnv('WORKER_URL');
-const ACCOUNT_ID = process.env['ACCOUNT_ID'] ?? 'primary';
+let ACCOUNT_ID = process.env['ACCOUNT_ID'] ?? '';
 
 const API_ID = parseInt(API_ID_STR, 10);
 if (isNaN(API_ID)) {
@@ -193,7 +193,7 @@ async function backfillDialog(
 
     fetched += messages.length;
     // Next page starts from the smallest (oldest) message id in this batch
-    offsetId = Math.min(...messages.map(m => m.id));
+    offsetId = messages[messages.length - 1].id;
 
     // A page smaller than the limit means we've reached the beginning of history
     if (messages.length < 100) {
@@ -276,6 +276,14 @@ async function main(): Promise<void> {
 
   await client.connect();
   console.log('[backfill] connected to Telegram');
+
+  // Derive account ID from the authenticated user if not set via env
+  if (!ACCOUNT_ID) {
+    const me = await client.getMe();
+    if (!(me instanceof Api.User)) throw new Error('getMe() returned UserEmpty — session is invalid');
+    ACCOUNT_ID = String(me.id);
+  }
+  console.log(`[backfill] account_id=${ACCOUNT_ID}`);
 
   try {
     await runBackfill(client);

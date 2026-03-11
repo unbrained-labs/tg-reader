@@ -32,7 +32,7 @@ const API_ID_STR = requireEnv('API_ID');
 const API_HASH = requireEnv('API_HASH');
 const INGEST_TOKEN = requireEnv('INGEST_TOKEN');
 const WORKER_URL = requireEnv('WORKER_URL');
-const ACCOUNT_ID = process.env['ACCOUNT_ID'] ?? 'primary';
+let ACCOUNT_ID = process.env['ACCOUNT_ID'] ?? '';
 
 const API_ID = parseInt(API_ID_STR, 10);
 if (isNaN(API_ID)) {
@@ -98,6 +98,7 @@ function shouldSync(tgChatId: string, config: SyncConfig): boolean {
 
 let buffer: Message[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
+const seenSenderIds = new Set<string>(); // dedup upsertSenderContact within session
 
 async function flushBuffer(): Promise<void> {
   if (buffer.length === 0) return;
@@ -247,6 +248,8 @@ async function syncContacts(client: TelegramClient): Promise<void> {
 
 async function upsertSenderContact(msg: Message): Promise<void> {
   if (!msg.sender_id) return;
+  if (seenSenderIds.has(msg.sender_id)) return;
+  seenSenderIds.add(msg.sender_id);
   try {
     await fetch(`${WORKER_URL}/contacts`, {
       method: 'POST',
@@ -397,6 +400,14 @@ async function main(): Promise<void> {
   // 2. Connect (session already exists — do not use client.start())
   await client.connect();
   console.log('[listener] connected to Telegram');
+
+  // 2b. Derive account ID from the authenticated user if not set via env
+  if (!ACCOUNT_ID) {
+    const me = await client.getMe();
+    if (!(me instanceof Api.User)) throw new Error('getMe() returned UserEmpty — session is invalid');
+    ACCOUNT_ID = String(me.id);
+  }
+  console.log(`[listener] account_id=${ACCOUNT_ID}`);
 
   // 3. Fetch sync config from Worker
   try {

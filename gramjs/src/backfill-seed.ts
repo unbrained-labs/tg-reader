@@ -33,7 +33,7 @@ const API_ID_STR = requireEnv('API_ID');
 const API_HASH = requireEnv('API_HASH');
 const INGEST_TOKEN = requireEnv('INGEST_TOKEN');
 const WORKER_URL = requireEnv('WORKER_URL');
-const ACCOUNT_ID = process.env['ACCOUNT_ID'] ?? 'primary';
+let ACCOUNT_ID = process.env['ACCOUNT_ID'] ?? '';
 
 const API_ID = parseInt(API_ID_STR, 10);
 if (isNaN(API_ID)) {
@@ -299,6 +299,14 @@ async function main(): Promise<void> {
   // 2. Connect (session already exists — do not use client.start())
   await client.connect();
   console.log('[seed] connected to Telegram');
+
+  // 2b. Derive account ID from the authenticated user if not set via env
+  if (!ACCOUNT_ID) {
+    const me = await client.getMe();
+    if (!(me instanceof Api.User)) throw new Error('getMe() returned UserEmpty — session is invalid');
+    ACCOUNT_ID = String(me.id);
+  }
+  console.log(`[seed] account_id=${ACCOUNT_ID}`);
 
   // 3. Fetch sync config from Worker
   let syncConfig: SyncConfig;
