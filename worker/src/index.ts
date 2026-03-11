@@ -792,6 +792,16 @@ async function handleMcpMessage(
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
         serverInfo: { name: 'tg-reader', version: '1.0.0' },
+        instructions: `You have access to a complete Telegram message archive with 100,000+ messages going back to 2020.
+
+TOOL SELECTION GUIDE:
+- "search" is your primary tool. Use it for ANY question about past conversations, specific content, people, amounts, topics, or events. Always use from/to date params when a time period is mentioned.
+- "chats" lists all chats with IDs. Use it to discover which chat a conversation happened in, or to get a chat_id before calling history.
+- "history" reads a specific chat thread. Use it only when the user wants to browse a conversation — not for finding content. For finding content within a chat, use search with chat_id filter.
+- "contacts" finds people by name/username. Use it to resolve who someone is before searching their messages.
+- "recent" shows latest messages. Use it only for "what's new" queries — never for historical lookups.
+
+IMPORTANT: The archive is complete and historical. Do not tell the user data is unavailable or that only recent messages are synced — search with appropriate date ranges instead. If a first search returns nothing, try broader terms or a wider date range before giving up.`,
       },
     };
   }
