@@ -486,20 +486,6 @@ async function main(): Promise<void> {
     void persistPts(client);
   }, 60_000);
 
-  // Watchdog: reconnect if dropped, exit if reconnect fails (Fly restarts + gap recovery takes over)
-  const watchdogInterval = setInterval(async () => {
-    if (client.disconnected) {
-      console.warn('[listener] disconnected, attempting reconnect...');
-      try {
-        await client.connect();
-        console.log('[listener] reconnected');
-      } catch (err) {
-        console.error('[listener] reconnect failed, exiting for restart:', err instanceof Error ? err.message : String(err));
-        process.exit(1);
-      }
-    }
-  }, 30_000);
-
   // Refresh sync config every 5 minutes
   setInterval(() => {
     fetchSyncConfig()
@@ -518,7 +504,6 @@ async function main(): Promise<void> {
   // 6. Graceful shutdown on SIGTERM (Fly sends this before killing the container)
   process.on('SIGTERM', () => {
     console.log('[listener] SIGTERM received, flushing buffer and exiting');
-    clearInterval(watchdogInterval);
     if (flushTimer) clearTimeout(flushTimer);
     flushBuffer().finally(() => process.exit(0));
   });
