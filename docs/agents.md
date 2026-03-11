@@ -15,7 +15,7 @@ https://<worker>/mcp?token=<ingest-token>&account_id=<account-id>
 
 3. Leave OAuth fields empty. Click **Add**.
 
-The connector works on claude.ai web and mobile.
+The connector works on claude.ai web and mobile. Auth is via URL query params — the claude.ai connector dialog does not support custom headers.
 
 ---
 
@@ -101,3 +101,9 @@ Returns the most recent messages across all chats. Use only for "what's new" que
 ## Multiple accounts
 
 Each account has its own connector URL with a different `account_id`. Data is fully isolated between accounts — a query on one account never returns data from another.
+
+---
+
+## Claude Code / API access
+
+For programmatic use outside claude.ai, the MCP endpoint is `POST /mcp` with standard JSON-RPC 2.0 payloads. Auth is via `X-Ingest-Token` header (or `?token=` query param) and `X-Account-ID` header (or `?account_id=` query param).

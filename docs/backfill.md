@@ -17,8 +17,6 @@ Backfill imports your complete message history into the archive. It's a one-time
 
 ## Running backfill
 
-Backfill is a two-step process managed by a single command:
-
 ### Step 1 — Scale down the listener
 
 ```bash
@@ -39,7 +37,9 @@ Or on Fly (if session is stored there):
 fly machine run . --app <your-fly-app> --entrypoint "node" -- dist/backfill.js
 ```
 
-This runs seed (enumerate dialogs) then history fetch in sequence automatically.
+`backfill.ts` runs both steps automatically in sequence:
+1. **Seed** — enumerates all dialogs and registers them in D1
+2. **Run** — fetches message history for each dialog
 
 ### Step 3 — Restart the listener
 
@@ -49,7 +49,7 @@ fly scale count 1 --yes -a <your-fly-app>
 
 ## Resuming after interruption
 
-If backfill is interrupted (crash, flood wait, manual stop), just re-run `backfill-run` — it reads the `backfill_state` table and skips already-completed dialogs. No data is duplicated.
+If backfill is interrupted (crash, flood wait, manual stop), just re-run `backfill.ts` — it reads the `backfill_state` table and skips already-completed dialogs. No data is duplicated. Seeding is also safe to re-run — existing dialogs are not overwritten.
 
 ## Checking progress
 
@@ -66,5 +66,4 @@ wrangler d1 execute tg-archive --remote \
 ## Notes
 
 - Backfill only needs to run once — the live listener captures everything going forward
-- The two scripts are separate to allow resuming from the run step without re-seeding
-- `backfill-seed.ts` is safe to re-run — it uses `INSERT OR IGNORE` so existing dialogs are not overwritten
+- Scale the listener back up immediately after backfill completes
