@@ -240,7 +240,7 @@ async function enumerateDialogs(
 // Seed Worker
 // ---------------------------------------------------------------------------
 
-async function seedWorker(dialogs: DialogSeedEntry[]): Promise<void> {
+async function seedWorker(dialogs: DialogSeedEntry[], accountId: string): Promise<void> {
   let seededTotal = 0;
   const batchSize = 100;
 
@@ -254,7 +254,7 @@ async function seedWorker(dialogs: DialogSeedEntry[]): Promise<void> {
         headers: {
           'Content-Type': 'application/json',
           'X-Ingest-Token': INGEST_TOKEN,
-          'X-Account-ID': ACCOUNT_ID,
+          'X-Account-ID': accountId,
         },
         body: JSON.stringify({ dialogs: batch }),
       });
@@ -282,11 +282,40 @@ async function seedWorker(dialogs: DialogSeedEntry[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// Exported orchestration (used by backfill.ts)
+// ---------------------------------------------------------------------------
+
+export async function runSeed(client: TelegramClient, accountId: string): Promise<void> {
+  const syncConfig = await fetchSyncConfigWith(accountId);
+  console.log(`[seed] sync_mode=${syncConfig.sync_mode} overrides=${syncConfig.chatOverrides.length}`);
+
+  const dialogs = await enumerateDialogs(client, syncConfig);
+  console.log(`[seed] enumerated dialogs=${dialogs.length}`);
+
+  await client.disconnect();
+  console.log('[seed] disconnected from Telegram');
+
+  await seedWorker(dialogs, accountId);
+}
+
+async function fetchSyncConfigWith(accountId: string): Promise<SyncConfig> {
+  const headers = { 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': accountId };
+  const [globalRes, chatsRes] = await Promise.all([
+    fetch(`${WORKER_URL}/config`, { headers }),
+    fetch(`${WORKER_URL}/chats/config`, { headers }),
+  ]);
+  if (!globalRes.ok) throw new Error(`GET /config failed: HTTP ${globalRes.status}`);
+  if (!chatsRes.ok) throw new Error(`GET /chats/config failed: HTTP ${chatsRes.status}`);
+  const { sync_mode } = (await globalRes.json()) as { sync_mode: SyncConfig['sync_mode'] };
+  const chatOverrides = (await chatsRes.json()) as ChatOverride[];
+  return { sync_mode, chatOverrides };
+}
+
+// ---------------------------------------------------------------------------
+// Main (standalone use)
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  // 1. Initialise client with existing StringSession
   const session = new StringSession(GRAMJS_SESSION);
   const client = new TelegramClient(session, API_ID, API_HASH, {
     floodSleepThreshold: 300,
@@ -296,11 +325,18 @@ async function main(): Promise<void> {
     langCode: 'en',
   });
 
-  // 2. Connect (session already exists — do not use client.start())
-  await client.connect();
+  try {
+    await client.connect();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('AUTH_KEY_DUPLICATED')) {
+      console.error('[seed] AUTH_KEY_DUPLICATED — scale down the Fly listener first:\n  fly scale count 0 --yes -a <app>');
+      process.exit(1);
+    }
+    throw err;
+  }
   console.log('[seed] connected to Telegram');
 
-  // 2b. Derive account ID from the authenticated user if not set via env
   if (!ACCOUNT_ID) {
     const me = await client.getMe();
     if (!(me instanceof Api.User)) throw new Error('getMe() returned UserEmpty — session is invalid');
@@ -308,43 +344,7 @@ async function main(): Promise<void> {
   }
   console.log(`[seed] account_id=${ACCOUNT_ID}`);
 
-  // 3. Fetch sync config from Worker
-  let syncConfig: SyncConfig;
-  try {
-    syncConfig = await fetchSyncConfig();
-    console.log(
-      `[seed] sync_mode=${syncConfig.sync_mode} overrides=${syncConfig.chatOverrides.length}`,
-    );
-  } catch (err) {
-    console.error(
-      '[seed] failed to fetch sync config:',
-      err instanceof Error ? err.message : String(err),
-    );
-    await client.disconnect();
-    process.exit(1);
-  }
-
-  // 4. Enumerate all dialogs, applying sync filter
-  let dialogs: DialogSeedEntry[];
-  try {
-    dialogs = await enumerateDialogs(client, syncConfig);
-    console.log(`[seed] enumerated dialogs=${dialogs.length}`);
-  } catch (err) {
-    console.error(
-      '[seed] failed to enumerate dialogs:',
-      err instanceof Error ? err.message : String(err),
-    );
-    await client.disconnect();
-    process.exit(1);
-  }
-
-  // 5. Disconnect from Telegram before hitting the Worker
-  await client.disconnect();
-  console.log('[seed] disconnected from Telegram');
-
-  // 6. POST dialogs to Worker /backfill/seed in batches of 100
-  await seedWorker(dialogs);
-
+  await runSeed(client, ACCOUNT_ID);
   process.exit(0);
 }
 

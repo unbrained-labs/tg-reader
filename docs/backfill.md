@@ -25,22 +25,21 @@ Backfill is a two-step process managed by a single command:
 fly scale count 0 --yes -a <your-fly-app>
 ```
 
-### Step 2 — Run backfill (seed + run, automatically)
+### Step 2 — Run backfill
 
 ```bash
 # From the gramjs directory, with .env loaded:
 set -a && source .env && set +a
-npx ts-node src/backfill-seed.ts   # enumerate all dialogs (~1-2 min)
-npx ts-node src/backfill-run.ts    # fetch history (several hours)
+npx ts-node src/backfill.ts
 ```
 
 Or on Fly (if session is stored there):
 
 ```bash
-fly machine run . --app <your-fly-app> --entrypoint "node" -- dist/backfill-seed.js
-# wait for it to complete, then:
-fly machine run . --app <your-fly-app> --entrypoint "node" -- dist/backfill-run.js
+fly machine run . --app <your-fly-app> --entrypoint "node" -- dist/backfill.js
 ```
+
+This runs seed (enumerate dialogs) then history fetch in sequence automatically.
 
 ### Step 3 — Restart the listener
 
