@@ -16,7 +16,8 @@ function json(data: unknown, status = 200): Response {
 // ---------------------------------------------------------------------------
 
 function authenticate(request: Request, env: Env): Response | null {
-  const token = request.headers.get('X-Ingest-Token');
+  const url = new URL(request.url);
+  const token = request.headers.get('X-Ingest-Token') ?? url.searchParams.get('token');
   if (!token || token !== env.INGEST_TOKEN) {
     return json({ ok: false, error: 'Unauthorized' }, 401);
   }
@@ -949,7 +950,8 @@ async function fetch(request: Request, env: Env): Promise<Response> {
   const authError = authenticate(request, env);
   if (authError) return authError;
 
-  const accountId = request.headers.get('X-Account-ID') ?? 'primary';
+  const url = new URL(request.url);
+  const accountId = request.headers.get('X-Account-ID') ?? url.searchParams.get('account_id') ?? 'primary';
   return route(request, env, accountId);
 }
 
@@ -1047,3 +1049,4 @@ async function scheduled(
 // ---------------------------------------------------------------------------
 
 export default { fetch, scheduled };
+// ci-test-1773228669
