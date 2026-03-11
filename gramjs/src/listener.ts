@@ -102,7 +102,8 @@ const seenSenderIds = new Set<string>(); // dedup upsertSenderContact within ses
 
 async function flushBuffer(): Promise<void> {
   if (buffer.length === 0) return;
-  const batch = buffer.splice(0, 100);
+  // Use slice (not splice) — only remove from buffer after confirmed delivery
+  const batch = buffer.slice(0, 100);
   try {
     const res = await fetch(`${WORKER_URL}/ingest`, {
       method: 'POST',
@@ -114,13 +115,16 @@ async function flushBuffer(): Promise<void> {
       body: JSON.stringify({ messages: batch }),
     });
     if (!res.ok) {
-      console.error(`[ingest] HTTP ${res.status} for batch of ${batch.length}`);
-    } else {
-      const { inserted, skipped } = (await res.json()) as { inserted: number; skipped: number };
-      console.log(`[ingest] inserted=${inserted} skipped=${skipped} batch=${batch.length}`);
+      console.error(`[ingest] HTTP ${res.status} for batch of ${batch.length} — will retry`);
+      return; // leave messages in buffer for retry
     }
+    // Confirmed delivery — now remove from buffer
+    buffer.splice(0, batch.length);
+    const { inserted, skipped } = (await res.json()) as { inserted: number; skipped: number };
+    console.log(`[ingest] inserted=${inserted} skipped=${skipped} batch=${batch.length}`);
   } catch (err) {
-    console.error(`[ingest] fetch error:`, err instanceof Error ? err.message : String(err));
+    console.error(`[ingest] fetch error — will retry:`, err instanceof Error ? err.message : String(err));
+    // Leave messages in buffer for next flush attempt
   }
 }
 
@@ -327,9 +331,13 @@ async function runGapRecovery(client: TelegramClient): Promise<void> {
 
   let currentPts = pts;
   let totalMissed = 0;
+  // Safety cap: 1000 iterations covers ~5 days of typical update volume
+  const MAX_ITERATIONS = 1000;
+  let iterations = 0;
 
   try {
-    while (true) {
+    while (iterations < MAX_ITERATIONS) {
+      iterations++;
       const result = await client.invoke(
         new Api.updates.GetDifference({ pts: currentPts, date: Math.floor(Date.now() / 1000), qts: 0 }),
       );
@@ -363,8 +371,18 @@ async function runGapRecovery(client: TelegramClient): Promise<void> {
       }
 
       // DifferenceSlice — more pages, advance pts and loop
-      currentPts = result.intermediateState.pts;
+      const newPts = result.intermediateState.pts;
+      if (newPts === currentPts) {
+        // pts didn't advance — Telegram API anomaly, break to avoid infinite loop
+        console.error('[gap-recovery] pts stalled, aborting to prevent infinite loop');
+        await persistPts(client);
+        break;
+      }
+      currentPts = newPts;
       console.log(`[gap-recovery] slice batch=${messages.length} next_pts=${currentPts}`);
+    }
+    if (iterations >= MAX_ITERATIONS) {
+      console.error(`[gap-recovery] hit iteration cap (${MAX_ITERATIONS}), gap recovery incomplete`);
     }
   } catch (err) {
     console.error('[gap-recovery] error:', err instanceof Error ? err.message : String(err));
@@ -505,7 +523,17 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => {
     console.log('[listener] SIGTERM received, flushing buffer and exiting');
     if (flushTimer) clearTimeout(flushTimer);
-    flushBuffer().finally(() => process.exit(0));
+    // Force-exit after 25s if flush hangs (Fly's hard kill deadline is ~30s)
+    const forceExit = setTimeout(() => {
+      console.error('[listener] graceful shutdown timeout — force exiting');
+      process.exit(1);
+    }, 25_000);
+    flushBuffer()
+      .catch(err => console.error('[listener] flush error during shutdown:', err instanceof Error ? err.message : String(err)))
+      .finally(() => {
+        clearTimeout(forceExit);
+        process.exit(0);
+      });
   });
 
   // 7. Keep process alive indefinitely

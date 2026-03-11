@@ -87,6 +87,14 @@ CREATE INDEX idx_chat_time ON messages(account_id, tg_chat_id, sent_at DESC);
 CREATE INDEX idx_sent_at   ON messages(account_id, sent_at);
 CREATE INDEX idx_sender_id ON messages(account_id, sender_id);
 
+-- Covers /chats GROUP BY aggregation and keyset pagination ORDER BY (sent_at, id)
+CREATE INDEX idx_account_chat    ON messages(account_id, tg_chat_id);
+CREATE INDEX idx_account_sent_id ON messages(account_id, sent_at DESC, id DESC);
+
+-- Covers thread reconstruction queries (reply chains)
+CREATE INDEX idx_reply_to ON messages(account_id, tg_chat_id, reply_to_message_id)
+  WHERE reply_to_message_id IS NOT NULL;
+
 CREATE INDEX idx_contacts_username ON contacts(account_id, username);
 
 -- ---------------------------------------------------------------------------

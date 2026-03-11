@@ -169,25 +169,43 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
   const from = parseDate(p.get('from'), 0);
   const to = parseDate(p.get('to'), Math.floor(Date.now() / 1000) + 86400);
   const limit = Math.min(Math.max(parseInt(p.get('limit') ?? '50', 10) || 50, 1), 200);
+  // Keyset pagination: (sent_at, id) pair for stable ordering regardless of insert order
+  const beforeSentAt = p.get('before_sent_at') ? parseInt(p.get('before_sent_at')!, 10) : null;
   const beforeId = p.get('before_id') ? parseInt(p.get('before_id')!, 10) : null;
+
+  // Build keyset WHERE clause — handles both first-page (no cursor) and subsequent pages
+  // Compound cursor: (sent_at < X) OR (sent_at = X AND id < Y)
+  const keysetClause = beforeSentAt !== null && beforeId !== null
+    ? `AND (m.sent_at < ? OR (m.sent_at = ? AND m.id < ?))`
+    : ``;
+  const keysetBinds = beforeSentAt !== null && beforeId !== null
+    ? [beforeSentAt, beforeSentAt, beforeId]
+    : [];
+
+  // Plain messages table version (no FTS5)
+  const plainKeysetClause = beforeSentAt !== null && beforeId !== null
+    ? `AND (sent_at < ? OR (sent_at = ? AND id < ?))`
+    : ``;
 
   try {
     let dataStmt: D1PreparedStatement;
     let countStmt: D1PreparedStatement;
 
     if (q !== null) {
+      // FTS5 path: sort by relevance rank first, then recency as tiebreaker
       const SQL = `
         SELECT m.*
         FROM messages m
         JOIN messages_fts ON messages_fts.rowid = m.id
         WHERE messages_fts MATCH ?
           AND m.account_id = ?
+          AND m.is_deleted = 0
           AND (m.tg_chat_id = ? OR ? IS NULL)
           AND (m.sender_username = ? OR ? IS NULL)
           AND m.sent_at >= ?
           AND m.sent_at <= ?
-          AND (m.id < ? OR ? IS NULL)
-        ORDER BY m.sent_at DESC
+          ${keysetClause}
+        ORDER BY messages_fts.rank, m.sent_at DESC, m.id DESC
         LIMIT ?
       `.trim();
       const COUNT_SQL = `
@@ -196,47 +214,58 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
         JOIN messages_fts ON messages_fts.rowid = m.id
         WHERE messages_fts MATCH ?
           AND m.account_id = ?
+          AND m.is_deleted = 0
           AND (m.tg_chat_id = ? OR ? IS NULL)
           AND (m.sender_username = ? OR ? IS NULL)
           AND m.sent_at >= ?
           AND m.sent_at <= ?
       `.trim();
-      dataStmt = env.DB.prepare(SQL).bind(q, accountId, chatId, chatId, senderUsername, senderUsername, from, to, beforeId, beforeId, limit);
+      dataStmt = env.DB.prepare(SQL).bind(q, accountId, chatId, chatId, senderUsername, senderUsername, from, to, ...keysetBinds, limit);
       countStmt = env.DB.prepare(COUNT_SQL).bind(q, accountId, chatId, chatId, senderUsername, senderUsername, from, to);
     } else {
+      // B-tree path: no query, sort by recency
       const SQL = `
         SELECT *
         FROM messages
         WHERE account_id = ?
+          AND is_deleted = 0
           AND (tg_chat_id = ? OR ? IS NULL)
           AND (sender_username = ? OR ? IS NULL)
           AND sent_at >= ?
           AND sent_at <= ?
-          AND (id < ? OR ? IS NULL)
-        ORDER BY sent_at DESC
+          ${plainKeysetClause}
+        ORDER BY sent_at DESC, id DESC
         LIMIT ?
       `.trim();
       const COUNT_SQL = `
         SELECT COUNT(*) AS total
         FROM messages
         WHERE account_id = ?
+          AND is_deleted = 0
           AND (tg_chat_id = ? OR ? IS NULL)
           AND (sender_username = ? OR ? IS NULL)
           AND sent_at >= ?
           AND sent_at <= ?
       `.trim();
-      dataStmt = env.DB.prepare(SQL).bind(accountId, chatId, chatId, senderUsername, senderUsername, from, to, beforeId, beforeId, limit);
+      dataStmt = env.DB.prepare(SQL).bind(accountId, chatId, chatId, senderUsername, senderUsername, from, to, ...keysetBinds, limit);
       countStmt = env.DB.prepare(COUNT_SQL).bind(accountId, chatId, chatId, senderUsername, senderUsername, from, to);
     }
 
     const [dataResult, countResult] = await env.DB.batch([dataStmt, countStmt]);
     const total = (countResult.results[0] as { total: number }).total;
-    const rows = dataResult.results as Array<{ id: number }>;
-    const next_before_id = rows.length === limit ? rows[rows.length - 1].id : null;
-    return json({ results: rows, total, limit, next_before_id });
+    const rows = dataResult.results as Array<{ id: number; sent_at: number }>;
+    const lastRow = rows.length === limit ? rows[rows.length - 1] : null;
+    return json({
+      results: rows,
+      total,
+      limit,
+      // Compound cursor — pass both to next request as before_sent_at + before_id
+      next_before_id: lastRow?.id ?? null,
+      next_before_sent_at: lastRow?.sent_at ?? null,
+    });
   } catch (err) {
     if (q !== null && err instanceof Error && err.message.toLowerCase().includes('fts5')) {
-      return json({ ok: false, error: 'Invalid search query' }, 400);
+      return json({ ok: false, error: 'Invalid search query — check for unmatched quotes or special characters' }, 400);
     }
     console.error('[GET /search] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
@@ -358,7 +387,10 @@ async function handleGetContacts(_request: Request, env: Env, accountId: string)
   return json(results);
 }
 
-async function handleChats(_request: Request, env: Env, accountId: string): Promise<Response> {
+async function handleChats(request: Request, env: Env, accountId: string): Promise<Response> {
+  const url = new URL(request.url);
+  const nameFilter = url.searchParams.get('name') ?? null;
+
   const SQL = `
     SELECT
       m.tg_chat_id,
@@ -370,13 +402,16 @@ async function handleChats(_request: Request, env: Env, accountId: string): Prom
     FROM messages m
     LEFT JOIN chat_config cc ON cc.account_id = m.account_id AND cc.tg_chat_id = m.tg_chat_id
     WHERE m.account_id = ?
+      AND (m.chat_name LIKE ? OR ? IS NULL)
     GROUP BY m.tg_chat_id
     ORDER BY last_message_at DESC
   `.trim();
 
+  const namePattern = nameFilter !== null ? `%${nameFilter}%` : null;
+
   let results: unknown[];
   try {
-    const outcome = await env.DB.prepare(SQL).bind(accountId).all();
+    const outcome = await env.DB.prepare(SQL).bind(accountId, namePattern, namePattern).all();
     results = outcome.results;
   } catch (err) {
     console.error('[GET /chats] DB error', err);
@@ -385,6 +420,46 @@ async function handleChats(_request: Request, env: Env, accountId: string): Prom
 
   console.log(`[GET /chats] account=${accountId} count=${results.length}`);
   return json(results);
+}
+
+async function handleStats(_request: Request, env: Env, accountId: string): Promise<Response> {
+  const SQL = `
+    SELECT
+      COUNT(*) AS total_messages,
+      COUNT(DISTINCT tg_chat_id) AS total_chats,
+      MIN(sent_at) AS earliest_message_at,
+      MAX(sent_at) AS latest_message_at,
+      SUM(CASE WHEN is_deleted = 1 THEN 1 ELSE 0 END) AS deleted_count,
+      SUM(CASE WHEN edit_date IS NOT NULL THEN 1 ELSE 0 END) AS edited_count,
+      SUM(CASE WHEN direction = 'out' THEN 1 ELSE 0 END) AS sent_count,
+      SUM(CASE WHEN direction = 'in' THEN 1 ELSE 0 END) AS received_count
+    FROM messages
+    WHERE account_id = ?
+  `.trim();
+
+  const CONTACT_SQL = `SELECT COUNT(*) AS total_contacts FROM contacts WHERE account_id = ?`;
+
+  try {
+    const [msgResult, contactResult] = await env.DB.batch([
+      env.DB.prepare(SQL).bind(accountId),
+      env.DB.prepare(CONTACT_SQL).bind(accountId),
+    ]);
+    const stats = msgResult.results[0] as {
+      total_messages: number;
+      total_chats: number;
+      earliest_message_at: number | null;
+      latest_message_at: number | null;
+      deleted_count: number;
+      edited_count: number;
+      sent_count: number;
+      received_count: number;
+    };
+    const contacts = contactResult.results[0] as { total_contacts: number };
+    return json({ ...stats, total_contacts: contacts.total_contacts });
+  } catch (err) {
+    console.error('[GET /stats] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
 }
 
 async function handleGetConfig(_request: Request, env: Env): Promise<Response> {
@@ -642,57 +717,70 @@ function mcpError(id: unknown, code: number, message: string): object {
 const MCP_TOOL_DEFINITIONS = [
   {
     name: 'search',
-    description: 'Full-text search across the complete Telegram message archive (100k+ messages going back to 2020). Use this for ANY question about past conversations, finding specific messages, amounts, names, or topics. Supports date ranges — always use from/to when the user mentions a time period. Paginate using next_before_id from the previous response. Prefer this over history when looking for specific content.',
+    description: 'Full-text search across the complete Telegram message archive (100k+ messages going back to 2020). Results are ranked by relevance then recency. Use this for ANY question about past conversations, finding specific messages, amounts, names, or topics. Always use from/to when the user mentions a time period. For sender-specific searches, use sender_username. Paginate with next_before_id + next_before_sent_at from the previous response.',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Search terms — use keywords likely to appear in the message text. Multiple words are ANDed together.' },
-        chat_id: { type: 'string', description: 'Filter to a specific chat ID (from the chats tool). Leave empty to search all chats.' },
-        from: { type: 'string', description: 'Start date filter (ISO 8601 e.g. 2024-01-01 or Unix epoch seconds). Use when the user specifies a time period.' },
-        to: { type: 'string', description: 'End date filter (ISO 8601 or Unix epoch seconds).' },
-        limit: { type: 'number', description: 'Max results per page, default 20, max 50.' },
-        before_id: { type: 'number', description: 'Pagination cursor — pass next_before_id from the previous response to get the next page.' },
+        query: { type: 'string', description: 'Search keywords. Multiple words are ANDed — all must appear in the message. Use words likely to appear verbatim in the text.' },
+        chat_id: { type: 'string', description: 'Optional. Filter to one chat (get IDs from the chats tool). Leave empty to search all chats.' },
+        sender_username: { type: 'string', description: 'Optional. Filter to messages from a specific sender by username (without @). Use contacts tool to look up usernames.' },
+        from: { type: 'string', description: 'Optional. Start of date range. ISO 8601 (e.g. "2024-01-01") or Unix epoch seconds. Include when the user mentions a time period.' },
+        to: { type: 'string', description: 'Optional. End of date range. ISO 8601 or Unix epoch seconds. Defaults to tomorrow.' },
+        limit: { type: 'number', description: 'Results per page (1–50, default 20).' },
+        before_id: { type: 'number', description: 'Pagination: pass next_before_id from the previous response. Must be paired with before_sent_at.' },
+        before_sent_at: { type: 'number', description: 'Pagination: pass next_before_sent_at from the previous response. Must be paired with before_id.' },
       },
       required: ['query'],
     },
   },
   {
     name: 'chats',
-    description: 'List all Telegram chats (groups, channels, DMs) with message counts and last activity timestamp. Use this first to discover chat IDs before calling history, or to find which chat a conversation happened in.',
-    inputSchema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'history',
-    description: 'Get messages from a specific chat in chronological order. Use this to read a conversation thread once you know the chat ID (from the chats tool). Paginate using before_id. For finding specific content within a chat, prefer search with a chat_id filter.',
+    description: 'List all Telegram chats (groups, channels, DMs) with message counts and last activity. Use to discover chat IDs before calling history, or to find which chat a conversation happened in. Optionally filter by chat name.',
     inputSchema: {
       type: 'object',
       properties: {
-        chat_id: { type: 'string', description: 'Chat ID — get this from the chats tool.' },
-        limit: { type: 'number', description: 'Number of messages to return, default 20.' },
-        before_id: { type: 'number', description: 'Pagination cursor — pass the smallest message id from the previous response to go further back.' },
+        name: { type: 'string', description: 'Optional. Filter chats by name (case-insensitive partial match). Example: "DevOps" matches "DevOps Team" and "devops-general".' },
+      },
+    },
+  },
+  {
+    name: 'history',
+    description: 'Get messages from one chat in chronological order (oldest first). Use after chats gives you a chat_id. For finding specific content within a chat, prefer search with chat_id filter instead. Paginate by passing the smallest id from the previous page as before_id + its sent_at as before_sent_at.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string', description: 'Chat ID (string, may be negative for groups/channels). Get from the chats tool.' },
+        limit: { type: 'number', description: 'Messages per page (default 20, max 50).' },
+        before_id: { type: 'number', description: 'Pagination: row id of the oldest message from the previous page. Paired with before_sent_at.' },
+        before_sent_at: { type: 'number', description: 'Pagination: sent_at (Unix seconds) of the oldest message from the previous page. Paired with before_id.' },
       },
       required: ['chat_id'],
     },
   },
   {
     name: 'contacts',
-    description: 'List Telegram contacts with their username, name, and message count. Use this to find a person\'s chat ID or confirm their username before searching for their messages.',
+    description: 'List Telegram contacts with username, name, and message count. Use to find someone\'s username before searching their messages, or to see who you talk to most. Note: contacts are people saved in your phone — group members without saved contact may not appear here.',
     inputSchema: {
       type: 'object',
       properties: {
-        search: { type: 'string', description: 'Filter by name or username (partial match).' },
+        search: { type: 'string', description: 'Optional. Filter by name or username (case-insensitive partial match).' },
       },
     },
   },
   {
     name: 'recent',
-    description: 'Get the most recent messages across all chats, sorted by time. Use this only for "what\'s new" or "latest activity" queries — for anything historical use search instead.',
+    description: 'Get the most recent messages across all chats, sorted newest-first. Use only for "what\'s new" or "latest activity" queries. For any historical lookup, use search instead.',
     inputSchema: {
       type: 'object',
       properties: {
-        limit: { type: 'number', description: 'Number of messages, default 20, max 50.' },
+        limit: { type: 'number', description: 'Number of messages (default 20, max 50).' },
       },
     },
+  },
+  {
+    name: 'stats',
+    description: 'Get archive statistics: total message count, date range, number of chats and contacts, sent vs received breakdown. Use this first when the user asks about the archive, or to discover what date range is available before searching.',
+    inputSchema: { type: 'object', properties: {} },
   },
 ];
 
@@ -708,18 +796,22 @@ async function dispatchMcpTool(
     const params = new URLSearchParams();
     if (typeof args.query === 'string') params.set('q', args.query);
     if (typeof args.chat_id === 'string') params.set('chat_id', args.chat_id);
+    if (typeof args.sender_username === 'string') params.set('sender_username', args.sender_username);
     if (args.from !== undefined) params.set('from', String(args.from));
     if (args.to !== undefined) params.set('to', String(args.to));
     const limit = Math.min(typeof args.limit === 'number' ? args.limit : 20, 50);
     params.set('limit', String(limit));
     if (typeof args.before_id === 'number') params.set('before_id', String(args.before_id));
+    if (typeof args.before_sent_at === 'number') params.set('before_sent_at', String(args.before_sent_at));
     const req = new Request(`${baseUrl}/search?${params.toString()}`);
     const res = await handleSearch(req, env, accountId);
     return await res.json();
   }
 
   if (name === 'chats') {
-    const req = new Request(`${baseUrl}/chats`);
+    const params = new URLSearchParams();
+    if (typeof args.name === 'string') params.set('name', args.name);
+    const req = new Request(`${baseUrl}/chats?${params.toString()}`);
     const res = await handleChats(req, env, accountId);
     return await res.json();
   }
@@ -731,9 +823,10 @@ async function dispatchMcpTool(
     const limit = Math.min(typeof args.limit === 'number' ? args.limit : 20, 50);
     params.set('limit', String(limit));
     if (typeof args.before_id === 'number') params.set('before_id', String(args.before_id));
+    if (typeof args.before_sent_at === 'number') params.set('before_sent_at', String(args.before_sent_at));
     const req = new Request(`${baseUrl}/search?${params.toString()}`);
     const res = await handleSearch(req, env, accountId);
-    const data = await res.json() as { results?: unknown[]; total?: number; limit?: number; next_before_id?: number | null };
+    const data = await res.json() as { results?: unknown[]; total?: number; limit?: number; next_before_id?: number | null; next_before_sent_at?: number | null };
     // Return chronological order (reverse the DESC-sorted results)
     if (Array.isArray(data.results)) {
       data.results = [...data.results].reverse();
@@ -765,6 +858,12 @@ async function dispatchMcpTool(
     return await res.json();
   }
 
+  if (name === 'stats') {
+    const req = new Request(`${baseUrl}/stats`);
+    const res = await handleStats(req, env, accountId);
+    return await res.json();
+  }
+
   throw new Error(`Unknown tool: ${name}`);
 }
 
@@ -792,16 +891,19 @@ async function handleMcpMessage(
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
         serverInfo: { name: 'tg-reader', version: '1.0.0' },
-        instructions: `You have access to a complete Telegram message archive with 100,000+ messages going back to 2020.
+        instructions: `You have access to a complete Telegram message archive. Use the "stats" tool first if you need to know the date range or message count.
 
 TOOL SELECTION GUIDE:
-- "search" is your primary tool. Use it for ANY question about past conversations, specific content, people, amounts, topics, or events. Always use from/to date params when a time period is mentioned.
-- "chats" lists all chats with IDs. Use it to discover which chat a conversation happened in, or to get a chat_id before calling history.
-- "history" reads a specific chat thread. Use it only when the user wants to browse a conversation — not for finding content. For finding content within a chat, use search with chat_id filter.
-- "contacts" finds people by name/username. Use it to resolve who someone is before searching their messages.
-- "recent" shows latest messages. Use it only for "what's new" queries — never for historical lookups.
+- "search" — primary tool. Use for ANY question about past conversations, specific content, people, amounts, topics, or events. Results ranked by relevance then recency. Always set from/to when user mentions a time period. Use sender_username to filter by person.
+- "stats" — archive overview: total messages, date range, chats, contacts. Use when user asks about the archive size, or before searching to confirm data exists.
+- "chats" — lists all chats with message counts. Filter by name param. Use to get chat_id before calling history, or to find which chat something happened in.
+- "history" — reads one chat chronologically. Use only for browsing a thread. For finding content, use search with chat_id filter.
+- "contacts" — find people by name/username. Use to look up sender_username before filtering search.
+- "recent" — latest messages across all chats. Use only for "what's new" queries.
 
-IMPORTANT: The archive is complete and historical. Do not tell the user data is unavailable or that only recent messages are synced — search with appropriate date ranges instead. If a first search returns nothing, try broader terms or a wider date range before giving up.`,
+PAGINATION: search and history return next_before_id + next_before_sent_at. Pass both to the next call to get the next page.
+
+IMPORTANT: The archive is complete and historical. Never tell the user data is unavailable — search with broader terms or a wider date range. If a search returns nothing, try synonyms or remove filters before giving up.`,
       },
     };
   }
@@ -887,6 +989,10 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
 
   if (method === 'GET' && pathname === '/search') {
     return handleSearch(request, env, accountId);
+  }
+
+  if (method === 'GET' && pathname === '/stats') {
+    return handleStats(request, env, accountId);
   }
 
   if (method === 'GET' && pathname === '/contacts') {
