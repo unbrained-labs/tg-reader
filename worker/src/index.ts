@@ -642,55 +642,55 @@ function mcpError(id: unknown, code: number, message: string): object {
 const MCP_TOOL_DEFINITIONS = [
   {
     name: 'search',
-    description: 'Full-text search across all archived Telegram messages',
+    description: 'Full-text search across the complete Telegram message archive (100k+ messages going back to 2020). Use this for ANY question about past conversations, finding specific messages, amounts, names, or topics. Supports date ranges — always use from/to when the user mentions a time period. Paginate using next_before_id from the previous response. Prefer this over history when looking for specific content.',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Search terms' },
-        chat_id: { type: 'string', description: 'Filter to a specific chat' },
-        from: { type: 'string', description: 'Start date (ISO 8601 e.g. 2024-10-01 or epoch seconds)' },
-        to: { type: 'string', description: 'End date (ISO 8601 or epoch seconds)' },
-        limit: { type: 'number', description: 'Max results, default 20, max 50' },
-        before_id: { type: 'number', description: 'Pagination cursor (id from previous next_before_id)' },
+        query: { type: 'string', description: 'Search terms — use keywords likely to appear in the message text. Multiple words are ANDed together.' },
+        chat_id: { type: 'string', description: 'Filter to a specific chat ID (from the chats tool). Leave empty to search all chats.' },
+        from: { type: 'string', description: 'Start date filter (ISO 8601 e.g. 2024-01-01 or Unix epoch seconds). Use when the user specifies a time period.' },
+        to: { type: 'string', description: 'End date filter (ISO 8601 or Unix epoch seconds).' },
+        limit: { type: 'number', description: 'Max results per page, default 20, max 50.' },
+        before_id: { type: 'number', description: 'Pagination cursor — pass next_before_id from the previous response to get the next page.' },
       },
       required: ['query'],
     },
   },
   {
     name: 'chats',
-    description: 'List all Telegram chats with message counts and last activity',
+    description: 'List all Telegram chats (groups, channels, DMs) with message counts and last activity timestamp. Use this first to discover chat IDs before calling history, or to find which chat a conversation happened in.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'history',
-    description: 'Get messages from a specific chat in chronological order',
+    description: 'Get messages from a specific chat in chronological order. Use this to read a conversation thread once you know the chat ID (from the chats tool). Paginate using before_id. For finding specific content within a chat, prefer search with a chat_id filter.',
     inputSchema: {
       type: 'object',
       properties: {
-        chat_id: { type: 'string', description: 'Chat ID from the chats tool' },
-        limit: { type: 'number', description: 'Number of messages, default 20' },
-        before_id: { type: 'number', description: 'Pagination cursor' },
+        chat_id: { type: 'string', description: 'Chat ID — get this from the chats tool.' },
+        limit: { type: 'number', description: 'Number of messages to return, default 20.' },
+        before_id: { type: 'number', description: 'Pagination cursor — pass the smallest message id from the previous response to go further back.' },
       },
       required: ['chat_id'],
     },
   },
   {
     name: 'contacts',
-    description: 'List Telegram contacts with message counts',
+    description: 'List Telegram contacts with their username, name, and message count. Use this to find a person\'s chat ID or confirm their username before searching for their messages.',
     inputSchema: {
       type: 'object',
       properties: {
-        search: { type: 'string', description: 'Filter by name or username' },
+        search: { type: 'string', description: 'Filter by name or username (partial match).' },
       },
     },
   },
   {
     name: 'recent',
-    description: 'Get the most recent messages across all chats',
+    description: 'Get the most recent messages across all chats, sorted by time. Use this only for "what\'s new" or "latest activity" queries — for anything historical use search instead.',
     inputSchema: {
       type: 'object',
       properties: {
-        limit: { type: 'number', description: 'Number of messages, default 20, max 50' },
+        limit: { type: 'number', description: 'Number of messages, default 20, max 50.' },
       },
     },
   },
