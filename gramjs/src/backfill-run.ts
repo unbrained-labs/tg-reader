@@ -101,6 +101,8 @@ async function backfillDialog(
 
   while (true) {
     let messages: Api.Message[];
+    let rawCount: number;
+    let lastRawId: number;
 
     try {
       const result = await client.invoke(
@@ -129,6 +131,13 @@ async function backfillDialog(
         break;
       }
 
+      // rawCount drives pagination — must use this, not filtered count.
+      // MessageService and MessageEmpty (deleted placeholders) are included in
+      // result.messages but stripped by the filter below. If we checked
+      // filtered count < 100, one deleted/service message in a full page would
+      // incorrectly signal end-of-history.
+      rawCount = result.messages.length;
+      lastRawId = rawCount > 0 ? result.messages[rawCount - 1].id : 0;
       messages = result.messages.filter(
         (m): m is Api.Message => m instanceof Api.Message,
       );
@@ -139,7 +148,7 @@ async function backfillDialog(
       return;
     }
 
-    if (messages.length === 0) {
+    if (rawCount === 0) {
       await postProgress({ tg_chat_id, status: 'complete', fetched_messages: fetched });
       console.log(`[backfill] dialog ${index + 1}/${total} complete (empty page) fetched=${fetched}`);
       break;
@@ -192,12 +201,11 @@ async function backfillDialog(
     }
 
     fetched += messages.length;
-    // Next page starts from the smallest (oldest) message id in this batch
-    offsetId = messages[messages.length - 1].id;
+    // Advance using the raw last item ID — pages past MessageService/MessageEmpty entries
+    offsetId = lastRawId;
 
-    // A page smaller than the limit means we've reached the beginning of history
-    if (messages.length < 100) {
-      // Combine progress + completion into a single call
+    // A raw page smaller than the limit means we've reached the beginning of history
+    if (rawCount < 100) {
       await postProgress({ tg_chat_id, oldest_message_id: offsetId, fetched_messages: fetched, status: 'complete' });
       console.log(`[backfill] dialog ${index + 1}/${total} complete fetched=${fetched}`);
       break;
@@ -309,7 +317,9 @@ async function main(): Promise<void> {
   process.exit(0);
 }
 
-main().catch((err: unknown) => {
-  console.error('[backfill] fatal:', err instanceof Error ? err.message : String(err));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err: unknown) => {
+    console.error('[backfill] fatal:', err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  });
+}

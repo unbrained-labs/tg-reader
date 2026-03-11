@@ -348,7 +348,9 @@ async function main(): Promise<void> {
   process.exit(0);
 }
 
-main().catch((err: unknown) => {
-  console.error('[seed] fatal error:', err instanceof Error ? err.message : String(err));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err: unknown) => {
+    console.error('[seed] fatal error:', err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  });
+}
