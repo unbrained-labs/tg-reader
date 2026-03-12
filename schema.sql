@@ -1,12 +1,14 @@
 -- TG Reader — PostgreSQL Schema
 -- Single source of truth. Apply with:
 --   psql $DATABASE_URL -f schema.sql
+--
+-- Safe to re-run against an existing database — all statements use IF NOT EXISTS.
 
 -- ---------------------------------------------------------------------------
 -- Tables
 -- ---------------------------------------------------------------------------
 
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
   id                   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   account_id           TEXT NOT NULL DEFAULT 'primary',  -- which TG account captured this
   tg_message_id        TEXT NOT NULL,           -- TEXT: Telegram message IDs may exceed 32-bit INTEGER precision
@@ -42,21 +44,22 @@ CREATE TABLE messages (
   UNIQUE(account_id, tg_chat_id, tg_message_id)
 );
 
-CREATE TABLE chat_config (
+CREATE TABLE IF NOT EXISTS chat_config (
   account_id   TEXT NOT NULL DEFAULT 'primary',
   tg_chat_id   TEXT NOT NULL,
   chat_name    TEXT,
   sync         TEXT CHECK(sync IN ('include', 'exclude')) DEFAULT 'include',
+  label        TEXT,   -- freeform tag e.g. 'work', 'client', 'team', 'personal'
   updated_at   BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
   PRIMARY KEY (account_id, tg_chat_id)
 );
 
-CREATE TABLE global_config (
+CREATE TABLE IF NOT EXISTS global_config (
   key   TEXT PRIMARY KEY,
   value TEXT
 );
 
-CREATE TABLE contacts (
+CREATE TABLE IF NOT EXISTS contacts (
   account_id   TEXT NOT NULL DEFAULT 'primary',
   tg_user_id   TEXT NOT NULL,               -- stored as TEXT, 64-bit
   phone        TEXT,
@@ -69,7 +72,7 @@ CREATE TABLE contacts (
   PRIMARY KEY (account_id, tg_user_id)
 );
 
-CREATE TABLE backfill_state (
+CREATE TABLE IF NOT EXISTS backfill_state (
   account_id         TEXT NOT NULL DEFAULT 'primary',
   tg_chat_id         TEXT NOT NULL,
   chat_name          TEXT,
@@ -88,23 +91,93 @@ CREATE TABLE backfill_state (
 -- ---------------------------------------------------------------------------
 
 -- Composite: covers chat timeline queries (most common pattern)
-CREATE INDEX idx_chat_time ON messages(account_id, tg_chat_id, sent_at DESC);
+CREATE INDEX IF NOT EXISTS idx_chat_time ON messages(account_id, tg_chat_id, sent_at DESC);
 
 -- Individual: for cross-chat time queries and sender lookups
-CREATE INDEX idx_sent_at   ON messages(account_id, sent_at);
-CREATE INDEX idx_sender_id ON messages(account_id, sender_id);
+CREATE INDEX IF NOT EXISTS idx_sent_at   ON messages(account_id, sent_at);
+CREATE INDEX IF NOT EXISTS idx_sender_id ON messages(account_id, sender_id);
 
 -- Covers keyset pagination ORDER BY (sent_at, id)
-CREATE INDEX idx_account_sent_id ON messages(account_id, sent_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_account_sent_id ON messages(account_id, sent_at DESC, id DESC);
 
 -- Covers thread reconstruction queries (reply chains)
-CREATE INDEX idx_reply_to ON messages(account_id, tg_chat_id, reply_to_message_id)
+CREATE INDEX IF NOT EXISTS idx_reply_to ON messages(account_id, tg_chat_id, reply_to_message_id)
   WHERE reply_to_message_id IS NOT NULL;
 
-CREATE INDEX idx_contacts_username ON contacts(account_id, username);
+CREATE INDEX IF NOT EXISTS idx_contacts_username ON contacts(account_id, username);
 
 -- Full-text search (replaces FTS5 virtual table)
-CREATE INDEX idx_messages_fts ON messages USING GIN (search_vector);
+CREATE INDEX IF NOT EXISTS idx_messages_fts ON messages USING GIN (search_vector);
+
+-- ---------------------------------------------------------------------------
+-- Outbox (drafts, scheduled sends, replies, mass sends)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS outbox (
+  id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account_id          TEXT NOT NULL DEFAULT 'primary',
+  -- single-send target (NULL when recipients rows exist for mass sends)
+  tg_chat_id          TEXT,
+  reply_to_message_id BIGINT,
+  -- message text; may contain {user}, {first_name}, {last_name}, {username} placeholders
+  text                TEXT NOT NULL,
+  -- draft      → not yet queued
+  -- scheduled  → queued but wait until scheduled_at
+  -- pending    → ready for immediate pickup by GramJS
+  -- sending    → GramJS has claimed it (prevents double-send)
+  -- sent       → delivered (single send)
+  -- failed     → delivery failed (single send or entire mass send)
+  -- partial    → mass send where at least one recipient failed
+  status              TEXT NOT NULL DEFAULT 'draft'
+                        CHECK(status IN ('draft','scheduled','pending','sending','sent','failed','partial')),
+  scheduled_at        BIGINT,   -- unix epoch seconds; NULL = send immediately when triggered
+  error               TEXT,
+  created_at          BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+  updated_at          BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+  sent_at             BIGINT    -- unix epoch seconds when actually sent (mass send: when started)
+);
+
+-- Per-recipient rows for mass sends; absent = single-chat send
+CREATE TABLE IF NOT EXISTS outbox_recipients (
+  id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  outbox_id   BIGINT NOT NULL REFERENCES outbox(id) ON DELETE CASCADE,
+  tg_chat_id  TEXT NOT NULL,
+  first_name  TEXT,
+  username    TEXT,
+  last_name   TEXT,
+  status      TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','sent','failed')),
+  sent_at     BIGINT,
+  error       TEXT
+);
+
+-- GramJS polls for pending/due-scheduled items
+CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(account_id, status, scheduled_at)
+  WHERE status IN ('pending','scheduled','sending');
+
+CREATE INDEX IF NOT EXISTS idx_outbox_recipients_pending ON outbox_recipients(outbox_id)
+  WHERE status = 'pending';
+
+-- ---------------------------------------------------------------------------
+-- Pending actions (edit / delete / forward on already-sent messages)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS pending_actions (
+  id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account_id    TEXT NOT NULL DEFAULT 'primary',
+  action        TEXT NOT NULL CHECK(action IN ('edit', 'delete', 'forward')),
+  tg_chat_id    TEXT NOT NULL,   -- source chat
+  tg_message_id TEXT NOT NULL,   -- source message ID (string — 64-bit)
+  text          TEXT,            -- edit only: new message text
+  to_chat_id    TEXT,            -- forward only: destination chat ID
+  status        TEXT NOT NULL DEFAULT 'pending'
+                  CHECK(status IN ('pending', 'done', 'failed')),
+  error         TEXT,
+  created_at    BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_actions_due ON pending_actions(account_id, status)
+  WHERE status = 'pending';
 
 -- ---------------------------------------------------------------------------
 -- Seed data

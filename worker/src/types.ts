@@ -1,3 +1,32 @@
+// Outbox recipient — one row per target for mass sends
+export interface OutboxRecipient {
+  id: number;
+  outbox_id: number;
+  tg_chat_id: string;   // always string — Telegram IDs are 64-bit
+  first_name?: string;
+  username?: string;
+  last_name?: string;
+  status: 'pending' | 'sent' | 'failed';
+  sent_at?: number;
+  error?: string;
+}
+
+// Outbox item — one row per message (draft / scheduled / single / mass)
+export interface OutboxItem {
+  id: number;
+  account_id: string;
+  tg_chat_id?: string;            // null for mass sends
+  reply_to_message_id?: number;
+  text: string;
+  status: 'draft' | 'scheduled' | 'pending' | 'sending' | 'sent' | 'failed' | 'partial';
+  scheduled_at?: number;          // unix epoch seconds
+  error?: string;
+  created_at: number;
+  updated_at: number;
+  sent_at?: number;
+  recipients?: OutboxRecipient[]; // populated by /outbox/due
+}
+
 // Cloudflare Worker environment bindings
 export interface Env {
   DATABASE_URL: string;
