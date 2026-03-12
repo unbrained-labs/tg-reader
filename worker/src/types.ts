@@ -7,7 +7,7 @@ export interface Env {
 
 // Message row — matches schema.sql exactly
 export interface Message {
-  tg_message_id: number;
+  tg_message_id: string;  // TEXT in DB — Telegram IDs may exceed 32 bits
   tg_chat_id: string;           // always string — Telegram IDs are 64-bit
   chat_name?: string;
   chat_type?: 'user' | 'group' | 'supergroup' | 'channel' | 'bot';

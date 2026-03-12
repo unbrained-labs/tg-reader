@@ -108,11 +108,14 @@ function shouldSync(tgChatId: string, config: SyncConfig): boolean {
 
 let buffer: Message[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
+let flushing = false; // re-entrancy guard (L-2): prevents concurrent flushBuffer calls
 const seenSenderIds = new Set<string>(); // dedup upsertSenderContact within session
 
 async function flushBuffer(): Promise<void> {
-  if (buffer.length === 0) return;
-  const batch = buffer.splice(0, 100);
+  if (flushing || buffer.length === 0) return;
+  flushing = true;
+  // Take first 100 with slice — messages stay in buffer until confirmed delivery
+  const batch = buffer.slice(0, 100);
   try {
     const res = await fetch(`${WORKER_URL}/ingest`, {
       method: 'POST',
@@ -124,15 +127,19 @@ async function flushBuffer(): Promise<void> {
       body: JSON.stringify({ messages: batch }),
     });
     if (!res.ok) {
-      console.error(`[ingest] HTTP ${res.status} for batch of ${batch.length} — re-queuing`);
-      buffer.unshift(...batch); // put back at front so they're retried next flush
+      // L-1: messages were never removed (slice), do NOT unshift — that would duplicate them
+      console.error(`[ingest] HTTP ${res.status} for batch of ${batch.length} — will retry on next flush`);
     } else {
-      const { inserted, skipped } = (await res.json()) as { inserted: number; skipped: number };
-      console.log(`[ingest] inserted=${inserted} skipped=${skipped} batch=${batch.length}`);
+      // Only remove from buffer after confirmed delivery
+      buffer.splice(0, batch.length);
+      const { written, noop } = (await res.json()) as { written: number; noop: number };
+      console.log(`[ingest] written=${written} noop=${noop} batch=${batch.length}`);
     }
   } catch (err) {
-    console.error(`[ingest] fetch error:`, err instanceof Error ? err.message : String(err), '— re-queuing');
-    buffer.unshift(...batch); // put back at front so they're retried next flush
+    // L-1: same — messages still in buffer, do NOT unshift
+    console.error(`[ingest] fetch error:`, err instanceof Error ? err.message : String(err), '— will retry on next flush');
+  } finally {
+    flushing = false;
   }
 }
 
@@ -178,7 +185,7 @@ function mapMessage(raw: Api.Message): Message {
   }
 
   return {
-    tg_message_id: raw.id,
+    tg_message_id: String(raw.id), // S-1: always string — Telegram IDs are 64-bit
     tg_chat_id,
     chat_name,
     chat_type: chat_type as Message['chat_type'],
@@ -186,7 +193,7 @@ function mapMessage(raw: Api.Message): Message {
     sender_username,
     sender_first_name,
     sender_last_name,
-    direction: raw.out ? 'out' : 'in',
+    direction: raw.out ? 'out' : (raw.fromId instanceof Api.PeerUser ? 'in' : undefined),
     message_type: resolveMessageType(raw),
     text: raw.message || undefined,
     media_type: resolveMediaType(raw.media ?? undefined),
@@ -258,9 +265,9 @@ async function syncContacts(client: TelegramClient): Promise<void> {
 async function upsertSenderContact(msg: Message): Promise<void> {
   if (!msg.sender_id) return;
   if (seenSenderIds.has(msg.sender_id)) return;
-  seenSenderIds.add(msg.sender_id);
+  // L-8: add to seenSenderIds AFTER confirmed delivery so failed upserts are retried
   try {
-    await fetch(`${WORKER_URL}/contacts`, {
+    const res = await fetch(`${WORKER_URL}/contacts`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
       body: JSON.stringify({
@@ -272,8 +279,9 @@ async function upsertSenderContact(msg: Message): Promise<void> {
         }],
       }),
     });
+    if (res.ok) seenSenderIds.add(msg.sender_id);
   } catch {
-    // Ignore — contact upsert is best-effort
+    // Ignore — contact upsert is best-effort; will be retried on next message from this sender
   }
 }
 
@@ -283,39 +291,56 @@ async function upsertSenderContact(msg: Message): Promise<void> {
 
 const STATE_FILE = '/data/state.json';
 
-async function loadPts(): Promise<number | null> {
+interface PtsState {
+  pts: number;
+  qts: number; // L-5: track qts alongside pts for GetDifference
+}
+
+async function loadPtsState(): Promise<PtsState | null> {
   try {
-    const data = JSON.parse(await fs.promises.readFile(STATE_FILE, 'utf-8')) as { pts?: number };
-    return data.pts ?? null;
+    const data = JSON.parse(await fs.promises.readFile(STATE_FILE, 'utf-8')) as Partial<PtsState>;
+    return data.pts ? { pts: data.pts, qts: data.qts ?? 0 } : null;
   } catch {
     return null;
   }
 }
 
-async function savePts(pts: number): Promise<void> {
+async function savePtsState(state: PtsState): Promise<void> {
   try {
-    await fs.promises.writeFile(STATE_FILE, JSON.stringify({ pts }), 'utf-8');
+    await fs.promises.writeFile(STATE_FILE, JSON.stringify(state), 'utf-8');
   } catch (err) {
-    console.error('[pts] failed to save pts:', err instanceof Error ? err.message : String(err));
+    console.error('[pts] failed to save state:', err instanceof Error ? err.message : String(err));
   }
 }
 
-function buildGapMessage(raw: Api.Message, chats: Api.TypeChat[]): Message {
+function buildGapMessage(raw: Api.Message, chats: Api.TypeChat[], users: Api.TypeUser[]): Message {
   const { tg_chat_id, chat_type: rawChatType } = resolvePeer(raw.peerId);
-  const chatEntity = raw.peerId instanceof Api.PeerChannel
-    ? chats.find((c): c is Api.Channel => c instanceof Api.Channel && String(c.id) === tg_chat_id)
-    : undefined;
-  const chat_type = (rawChatType === 'channel' && chatEntity?.megagroup) ? 'supergroup' : rawChatType;
+
+  // L-6: resolve chat_name for all peer types, not just channels
+  let chat_name: string | undefined;
+  let chat_type = rawChatType;
+  if (raw.peerId instanceof Api.PeerChannel) {
+    const ch = chats.find((c): c is Api.Channel => c instanceof Api.Channel && String(c.id) === tg_chat_id);
+    chat_name = ch?.title ?? undefined;
+    chat_type = (rawChatType === 'channel' && ch?.megagroup) ? 'supergroup' : rawChatType;
+  } else if (raw.peerId instanceof Api.PeerChat) {
+    const ch = chats.find(c => 'id' in c && String((c as { id: { toString(): string } }).id) === tg_chat_id);
+    chat_name = ch && 'title' in ch ? (ch as { title: string }).title : undefined;
+  } else if (raw.peerId instanceof Api.PeerUser) {
+    const u = users.find((u): u is Api.User => u instanceof Api.User && String(u.id) === tg_chat_id);
+    if (u) chat_name = [u.firstName, u.lastName].filter(Boolean).join(' ') || undefined;
+  }
+
   return {
-    tg_message_id: raw.id,
+    tg_message_id: String(raw.id), // S-1
     tg_chat_id,
     chat_type: chat_type as Message['chat_type'],
-    chat_name: undefined,
+    chat_name,
     sender_id: resolveSenderId(raw.fromId),
     sender_username: undefined,
     sender_first_name: undefined,
     sender_last_name: undefined,
-    direction: raw.out ? 'out' : 'in',
+    direction: raw.out ? 'out' : (raw.fromId instanceof Api.PeerUser ? 'in' : undefined),
     message_type: resolveMessageType(raw),
     text: raw.message || undefined,
     media_type: resolveMediaType(raw.media ?? undefined),
@@ -331,30 +356,37 @@ function buildGapMessage(raw: Api.Message, chats: Api.TypeChat[]): Message {
 }
 
 async function runGapRecovery(client: TelegramClient): Promise<void> {
-  const pts = await loadPts();
-  if (!pts) {
+  const ptsState = await loadPtsState();
+  if (!ptsState) {
     console.log('[gap-recovery] no saved pts, skipping');
     return;
   }
-  console.log(`[gap-recovery] recovering from pts=${pts}`);
+  console.log(`[gap-recovery] recovering from pts=${ptsState.pts} qts=${ptsState.qts}`);
 
-  let currentPts = pts;
+  let currentPts = ptsState.pts;
+  let currentQts = ptsState.qts; // L-5: carry real qts so Telegram returns correct secret-chat updates
   let totalMissed = 0;
+  // Safety cap: 1000 iterations covers ~5 days of typical update volume
+  const MAX_ITERATIONS = 1000;
+  let iterations = 0;
 
   try {
-    while (true) {
+    while (iterations < MAX_ITERATIONS) {
+      iterations++;
       const result = await client.invoke(
-        new Api.updates.GetDifference({ pts: currentPts, date: Math.floor(Date.now() / 1000), qts: 0 }),
+        new Api.updates.GetDifference({ pts: currentPts, date: Math.floor(Date.now() / 1000), qts: currentQts }),
       );
 
       if (result instanceof Api.updates.DifferenceTooLong) {
         console.warn('[gap-recovery] DifferenceTooLong — pts too stale, resetting. Messages during gap are unrecoverable.');
+        await flushBuffer(); // L-4: flush partial batch before exiting
         await persistPts(client);
         break;
       }
 
       if (result instanceof Api.updates.DifferenceEmpty) {
         console.log('[gap-recovery] up to date (DifferenceEmpty)');
+        await flushBuffer(); // L-4
         break;
       }
 
@@ -364,7 +396,7 @@ async function runGapRecovery(client: TelegramClient): Promise<void> {
 
       for (const raw of messages) {
         if (!(raw instanceof Api.Message)) continue;
-        const gapMsg = buildGapMessage(raw, result.chats);
+        const gapMsg = buildGapMessage(raw, result.chats, result.users); // L-6: pass users
         if (!shouldSync(gapMsg.tg_chat_id, syncConfig)) continue;
         buffer.push(gapMsg);
         if (buffer.length >= 100) await flushBuffer();
@@ -378,9 +410,23 @@ async function runGapRecovery(client: TelegramClient): Promise<void> {
       }
 
       // DifferenceSlice — more pages, advance pts and loop
-      currentPts = result.intermediateState.pts;
-      await savePts(currentPts); // persist so a crash mid-recovery doesn't restart from the beginning
+      const newPts = result.intermediateState.pts;
+      const newQts = result.intermediateState.qts;
+      if (newPts === currentPts) {
+        // pts didn't advance — Telegram API anomaly, break to avoid infinite loop
+        console.error('[gap-recovery] pts stalled, aborting to prevent infinite loop');
+        await flushBuffer(); // L-4: flush partial batch before exiting
+        await savePtsState({ pts: currentPts, qts: currentQts });
+        break;
+      }
+      currentPts = newPts;
+      currentQts = newQts; // L-5: keep qts in sync
+      await savePtsState({ pts: currentPts, qts: currentQts });
       console.log(`[gap-recovery] slice batch=${messages.length} next_pts=${currentPts}`);
+    }
+    if (iterations >= MAX_ITERATIONS) {
+      console.error(`[gap-recovery] hit iteration cap (${MAX_ITERATIONS}), gap recovery incomplete`);
+      await flushBuffer(); // L-4: flush whatever we collected before giving up
     }
   } catch (err) {
     console.error('[gap-recovery] error:', err instanceof Error ? err.message : String(err));
@@ -390,9 +436,9 @@ async function runGapRecovery(client: TelegramClient): Promise<void> {
 async function persistPts(client: TelegramClient): Promise<void> {
   try {
     const state = await client.invoke(new Api.updates.GetState());
-    await savePts(state.pts);
+    await savePtsState({ pts: state.pts, qts: state.qts }); // L-5: persist both
   } catch {
-    // ignore — pts will be persisted on next tick
+    // ignore — state will be persisted on next tick
   }
 }
 
@@ -486,7 +532,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    const messages = event.deletedIds.map((id: number) => ({ tg_chat_id, tg_message_id: id }));
+    const messages = event.deletedIds.map((id: number) => ({ tg_chat_id, tg_message_id: String(id) })); // S-1
     try {
       await fetch(`${WORKER_URL}/deleted`, {
         method: 'POST',

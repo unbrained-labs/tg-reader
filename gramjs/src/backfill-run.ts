@@ -65,15 +65,32 @@ async function postProgress(accountId: string, body: {
 // Peer helpers
 // ---------------------------------------------------------------------------
 
-function dlgToInputPeer(peer: Api.TypePeer): Api.TypeInputPeer {
+// B-1: resolve InputPeer from the GetDialogs result so we carry the real accessHash
+// for channels/users instead of bigInt(0), which causes CHANNEL_INVALID errors.
+function resolveInputPeerFromResult(
+  peer: Api.TypePeer,
+  result: Api.messages.Dialogs | Api.messages.DialogsSlice,
+): Api.TypeInputPeer {
   if (peer instanceof Api.PeerUser) {
-    return new Api.InputPeerUser({ userId: peer.userId, accessHash: bigInt(0) });
+    const user = result.users.find(
+      (u): u is Api.User => u instanceof Api.User && u.id.equals(peer.userId),
+    );
+    return new Api.InputPeerUser({
+      userId: peer.userId,
+      accessHash: user?.accessHash ?? bigInt(0),
+    });
   }
   if (peer instanceof Api.PeerChat) {
     return new Api.InputPeerChat({ chatId: peer.chatId });
   }
   if (peer instanceof Api.PeerChannel) {
-    return new Api.InputPeerChannel({ channelId: peer.channelId, accessHash: bigInt(0) });
+    const channel = result.chats.find(
+      (c): c is Api.Channel => c instanceof Api.Channel && c.id.equals(peer.channelId),
+    );
+    return new Api.InputPeerChannel({
+      channelId: peer.channelId,
+      accessHash: channel?.accessHash ?? bigInt(0),
+    });
   }
   return new Api.InputPeerEmpty();
 }
@@ -191,30 +208,38 @@ async function backfillDialog(
     // Map raw Api.Message objects to our Message type.
     // chat_type is not resolved here — the worker stores it from backfill-seed.ts
     // and the ingest endpoint allows it to be undefined (ON CONFLICT preserves existing).
-    const batch: Message[] = messages.map(raw => ({
-      tg_message_id: raw.id,
-      tg_chat_id,
-      chat_name: dialog.chat_name ?? undefined,
-      chat_type: undefined,
-      sender_id: resolveSenderId(raw.fromId),
-      sender_username: undefined,
-      sender_first_name: undefined,
-      sender_last_name: undefined,
-      direction: (raw.out ?? false) ? 'out' : 'in',
-      message_type: resolveMessageType(raw),
-      text: raw.message || undefined,  // raw.message is the text field in GramJS
-      media_type: resolveMediaType(raw.media ?? undefined),
-      media_file_id: undefined,
-      reply_to_message_id: raw.replyTo?.replyToMsgId ?? undefined,
-      forwarded_from_id: raw.fwdFrom?.fromId
-        ? resolveSenderId(raw.fwdFrom.fromId)
-        : undefined,
-      forwarded_from_name: raw.fwdFrom?.fromName ?? undefined,
-      sent_at: raw.date, // already Unix epoch seconds — DO NOT call new Date()
-      edit_date: raw.editDate ?? undefined,
-      is_deleted: 0,
-      deleted_at: undefined,
-    }));
+    const batch: Message[] = messages.map(raw => {
+      const senderId = resolveSenderId(raw.fromId);
+      // B-4: channel posts have no real user sender — direction is meaningless for them.
+      // Detect by absence of a PeerUser fromId (fromId is either null or PeerChannel for broadcasts).
+      const direction: 'in' | 'out' | undefined = raw.out
+        ? 'out'
+        : (raw.fromId instanceof Api.PeerUser ? 'in' : undefined);
+      return {
+        tg_message_id: String(raw.id), // S-1: always string
+        tg_chat_id,
+        chat_name: dialog.chat_name ?? undefined,
+        chat_type: undefined,
+        sender_id: senderId,
+        sender_username: undefined,
+        sender_first_name: undefined,
+        sender_last_name: undefined,
+        direction,
+        message_type: resolveMessageType(raw),
+        text: raw.message || undefined,  // raw.message is the text field in GramJS
+        media_type: resolveMediaType(raw.media ?? undefined),
+        media_file_id: undefined,
+        reply_to_message_id: raw.replyTo?.replyToMsgId ?? undefined,
+        forwarded_from_id: raw.fwdFrom?.fromId
+          ? resolveSenderId(raw.fwdFrom.fromId)
+          : undefined,
+        forwarded_from_name: raw.fwdFrom?.fromName ?? undefined,
+        sent_at: raw.date, // already Unix epoch seconds — DO NOT call new Date()
+        edit_date: raw.editDate ?? undefined,
+        is_deleted: 0,
+        deleted_at: undefined,
+      };
+    });
 
     // POST batch to /ingest — duplicates are safely handled by ON CONFLICT in D1
     // Bug 1 fix: on non-2xx OR network error, mark dialog failed and return without
@@ -232,8 +257,8 @@ async function backfillDialog(
         return;
       }
       ingestOk = true;
-      const { inserted, skipped } = (await res.json()) as { inserted: number; skipped: number };
-      console.log(`[backfill] dialog ${index + 1}/${total} page inserted=${inserted} skipped=${skipped} offsetId=${offsetId}`);
+      const { written, noop } = (await res.json()) as { written: number; noop: number };
+      console.log(`[backfill] dialog ${index + 1}/${total} page written=${written} noop=${noop} offsetId=${offsetId}`);
     } catch (err) {
       // Network error — do NOT advance cursor; stop and let operator retry
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -245,7 +270,7 @@ async function backfillDialog(
     // Only advance the cursor if ingest succeeded
     if (!ingestOk) return;
 
-    fetched += messages.length;
+    fetched += rawCount; // B-2: track raw count (incl. service msgs) to match what Telegram reports
     // Advance using the raw last item ID — pages past MessageService/MessageEmpty entries
     offsetId = lastRawId;
 
@@ -315,7 +340,8 @@ async function warmEntityCache(client: TelegramClient): Promise<void> {
       if (lastMsg && 'date' in lastMsg) {
         offsetDate = (lastMsg as { date: number }).date;
         offsetId = lastMsg.id;
-        offsetPeer = dlgToInputPeer(lastDlg.peer);
+        // B-1: use real accessHash from result to avoid CHANNEL_INVALID on next page
+        offsetPeer = resolveInputPeerFromResult(lastDlg.peer, result);
       } else {
         console.warn(`[backfill] warmEntityCache page=${page} topMessage not found, stopping early`);
         break;
@@ -378,6 +404,18 @@ async function runBackfill(client: TelegramClient, accountId?: string): Promise<
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  // B-6: per CLAUDE.md, backfill must not run immediately after first login.
+  // The operator must explicitly set BACKFILL_ALLOWED=true after running the listener
+  // for 1-2 days to warm up the session and avoid FLOOD_WAIT bans.
+  if (process.env['BACKFILL_ALLOWED'] !== 'true') {
+    console.error(
+      '[backfill] BACKFILL_ALLOWED env var is not set to "true".\n' +
+      '  Per CLAUDE.md anti-ban rules: run the listener for 1-2 days before backfilling.\n' +
+      '  Once ready, set BACKFILL_ALLOWED=true (Fly secret or .env) and re-run.',
+    );
+    process.exit(1);
+  }
+
   const session = new StringSession(GRAMJS_SESSION);
   const client = new TelegramClient(session, API_ID, API_HASH, {
     floodSleepThreshold: 300,

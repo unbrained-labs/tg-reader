@@ -1,5 +1,7 @@
 # Search API
 
+> Machine-readable spec: [`openapi.yaml`](../openapi.yaml) — import into Postman, Insomnia, or view at [editor.swagger.io](https://editor.swagger.io).
+
 All endpoints are on the Cloudflare Worker URL. All requests require:
 
 ```

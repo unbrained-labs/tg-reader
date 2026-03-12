@@ -101,15 +101,32 @@ function resolveChatName(
 // Peer to InputPeer conversion (for pagination offset)
 // ---------------------------------------------------------------------------
 
-function dlgToInputPeer(peer: Api.TypePeer): Api.TypeInputPeer {
+// B-1: resolve InputPeer from the GetDialogs result so we carry the real accessHash.
+// Using accessHash=0 for channels/users causes CHANNEL_INVALID on the next page fetch.
+function dlgToInputPeer(
+  peer: Api.TypePeer,
+  result: Api.messages.Dialogs | Api.messages.DialogsSlice,
+): Api.TypeInputPeer {
   if (peer instanceof Api.PeerUser) {
-    return new Api.InputPeerUser({ userId: peer.userId, accessHash: bigInt(0) });
+    const user = result.users.find(
+      (u): u is Api.User => u instanceof Api.User && u.id.equals(peer.userId),
+    );
+    return new Api.InputPeerUser({
+      userId: peer.userId,
+      accessHash: user?.accessHash ?? bigInt(0),
+    });
   }
   if (peer instanceof Api.PeerChat) {
     return new Api.InputPeerChat({ chatId: peer.chatId });
   }
   if (peer instanceof Api.PeerChannel) {
-    return new Api.InputPeerChannel({ channelId: peer.channelId, accessHash: bigInt(0) });
+    const channel = result.chats.find(
+      (c): c is Api.Channel => c instanceof Api.Channel && c.id.equals(peer.channelId),
+    );
+    return new Api.InputPeerChannel({
+      channelId: peer.channelId,
+      accessHash: channel?.accessHash ?? bigInt(0),
+    });
   }
   return new Api.InputPeerEmpty();
 }
@@ -219,7 +236,7 @@ async function enumerateDialogs(
       if (lastMsg && 'date' in lastMsg) {
         offsetDate = (lastMsg as { date: number }).date;
         offsetId = lastMsg.id;
-        offsetPeer = dlgToInputPeer(lastDlg.peer);
+        offsetPeer = dlgToInputPeer(lastDlg.peer, result); // B-1: pass result for real accessHash
       } else {
         console.warn(`[seed] page=${page} topMessage not in result.messages, stopping early`);
         break;
@@ -240,6 +257,7 @@ async function enumerateDialogs(
 
 async function seedWorker(dialogs: DialogSeedEntry[], accountId: string): Promise<void> {
   let seededTotal = 0;
+  let failedTotal = 0;
   const batchSize = 100;
 
   for (let i = 0; i < dialogs.length; i += batchSize) {
@@ -258,7 +276,9 @@ async function seedWorker(dialogs: DialogSeedEntry[], accountId: string): Promis
       });
 
       if (!res.ok) {
-        console.error(`[seed] batch=${batchNum} HTTP ${res.status}`);
+        // C-3: track failed batches — these dialogs will not be seeded and must be re-run
+        failedTotal += batch.length;
+        console.error(`[seed] batch=${batchNum} HTTP ${res.status} — ${batch.length} dialogs NOT seeded`);
       } else {
         const { seeded } = (await res.json()) as { seeded: number };
         seededTotal += seeded;
@@ -267,15 +287,20 @@ async function seedWorker(dialogs: DialogSeedEntry[], accountId: string): Promis
         );
       }
     } catch (err) {
+      failedTotal += batch.length;
       console.error(
-        `[seed] batch=${batchNum} fetch error:`,
-        err instanceof Error ? err.message : String(err),
+        `[seed] batch=${batchNum} fetch error: ${err instanceof Error ? err.message : String(err)} — ${batch.length} dialogs NOT seeded`,
       );
     }
   }
 
+  if (failedTotal > 0) {
+    console.error(
+      `[seed] WARNING: ${failedTotal} dialogs failed to seed. Re-run this script to retry.`,
+    );
+  }
   console.log(
-    `[seed] done. dialogs_found=${dialogs.length} newly_seeded=${seededTotal}`,
+    `[seed] done. dialogs_found=${dialogs.length} newly_seeded=${seededTotal} failed=${failedTotal}`,
   );
 }
 
