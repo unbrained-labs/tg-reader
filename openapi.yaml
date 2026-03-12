@@ -1,0 +1,865 @@
+openapi: 3.0.3
+info:
+  title: TG Reader Worker API
+  description: |
+    Cloudflare Worker API for the TG Reader Telegram archive.
+
+    ## Authentication
+    Every request (except OPTIONS preflight) must include:
+    - `X-Ingest-Token: <token>` — shared secret matching the `INGEST_TOKEN` Worker secret
+    - `X-Account-ID: <id>` — Telegram user ID (numeric string) or `"primary"` (default)
+
+    ## Notes
+    - `tg_message_id`, `tg_chat_id`, `sender_id` are always **strings** — Telegram IDs are 64-bit
+    - `sent_at`, `edit_date`, `deleted_at` are Unix epoch **seconds** (integers)
+    - Batch ingest accepts up to 100 messages per request
+  version: 1.0.0
+
+servers:
+  - url: https://{worker_url}
+    variables:
+      worker_url:
+        default: your-worker.workers.dev
+        description: Deployed Cloudflare Worker URL
+
+security:
+  - IngestToken: []
+
+components:
+  securitySchemes:
+    IngestToken:
+      type: apiKey
+      in: header
+      name: X-Ingest-Token
+
+  parameters:
+    AccountID:
+      name: X-Account-ID
+      in: header
+      required: false
+      schema:
+        type: string
+        default: primary
+      description: Telegram user ID (numeric) or "primary". Scopes all reads/writes to that account.
+
+  schemas:
+    Message:
+      type: object
+      required: [tg_message_id, tg_chat_id, sent_at]
+      properties:
+        tg_message_id:
+          type: string
+          description: Telegram message ID (string — 64-bit safe)
+        tg_chat_id:
+          type: string
+          description: Telegram chat ID (string — 64-bit safe, may be negative)
+        chat_name:
+          type: string
+          nullable: true
+        chat_type:
+          type: string
+          nullable: true
+          enum: [user, group, supergroup, channel, bot]
+        sender_id:
+          type: string
+          nullable: true
+          description: Telegram user ID of sender (string — 64-bit safe)
+        sender_username:
+          type: string
+          nullable: true
+        sender_first_name:
+          type: string
+          nullable: true
+        sender_last_name:
+          type: string
+          nullable: true
+        direction:
+          type: string
+          nullable: true
+          enum: [in, out]
+          description: Null for channel posts (no meaningful direction)
+        message_type:
+          type: string
+          nullable: true
+          description: "text, sticker, poll, location, contact, dice, etc."
+        text:
+          type: string
+          nullable: true
+        media_type:
+          type: string
+          nullable: true
+          description: "photo, video, document, voice, audio, sticker, etc."
+        media_file_id:
+          type: string
+          nullable: true
+        reply_to_message_id:
+          type: integer
+          nullable: true
+        forwarded_from_id:
+          type: string
+          nullable: true
+        forwarded_from_name:
+          type: string
+          nullable: true
+        sent_at:
+          type: integer
+          description: Unix epoch seconds
+        edit_date:
+          type: integer
+          nullable: true
+          description: Unix epoch seconds of last edit
+        is_deleted:
+          type: integer
+          enum: [0, 1]
+          default: 0
+        deleted_at:
+          type: integer
+          nullable: true
+          description: Unix epoch seconds when deletion was observed
+
+    MessageRow:
+      allOf:
+        - $ref: '#/components/schemas/Message'
+        - type: object
+          properties:
+            id:
+              type: integer
+              description: Internal autoincrement row ID
+
+    Contact:
+      type: object
+      required: [tg_user_id]
+      properties:
+        tg_user_id:
+          type: string
+          description: Telegram user ID (string — 64-bit safe)
+        phone:
+          type: string
+          nullable: true
+        username:
+          type: string
+          nullable: true
+        first_name:
+          type: string
+          nullable: true
+        last_name:
+          type: string
+          nullable: true
+        is_mutual:
+          type: integer
+          enum: [0, 1]
+          nullable: true
+        is_bot:
+          type: integer
+          enum: [0, 1]
+          nullable: true
+
+    ContactRow:
+      allOf:
+        - $ref: '#/components/schemas/Contact'
+        - type: object
+          properties:
+            message_count:
+              type: integer
+            last_seen:
+              type: integer
+              nullable: true
+              description: Unix epoch seconds of last message from this contact
+
+    Error:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: false
+        error:
+          type: string
+
+paths:
+  # ---------------------------------------------------------------------------
+  # Ingest
+  # ---------------------------------------------------------------------------
+  /ingest:
+    post:
+      summary: Ingest messages
+      description: |
+        Upsert up to 100 messages. Duplicate `(account_id, tg_chat_id, tg_message_id)` tuples
+        trigger an `ON CONFLICT DO UPDATE` that COALESCEs metadata fields (richer value wins over null)
+        and preserves `original_text` on first edit.
+      parameters:
+        - $ref: '#/components/parameters/AccountID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messages]
+              properties:
+                messages:
+                  type: array
+                  minItems: 1
+                  maxItems: 100
+                  items:
+                    $ref: '#/components/schemas/Message'
+      responses:
+        '200':
+          description: Batch processed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  written:
+                    type: integer
+                    description: Messages inserted or updated (rows_written > 0)
+                  noop:
+                    type: integer
+                    description: Messages that were exact duplicates (rows_written = 0)
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+
+  # ---------------------------------------------------------------------------
+  # Search
+  # ---------------------------------------------------------------------------
+  /search:
+    get:
+      summary: Search messages
+      description: |
+        Full-text search (FTS5) when `q` is provided, otherwise B-tree scan.
+        Results are sorted by relevance then recency (FTS path) or recency only (no-query path).
+        Paginate backwards using `before_id` + `before_sent_at` from the previous response.
+      parameters:
+        - $ref: '#/components/parameters/AccountID'
+        - name: q
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Search keywords. Multiple words are ANDed. Min 2 chars per token.
+        - name: chat_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter to a specific chat
+        - name: sender_username
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Filter by sender username (without @)
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Start of date range — ISO 8601 or Unix epoch seconds
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+          description: End of date range — ISO 8601 or Unix epoch seconds. Defaults to tomorrow.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: before_id
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Keyset cursor — pass `next_before_id` from the previous response
+        - name: before_sent_at
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Keyset cursor — must be paired with `before_id`
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MessageRow'
+                  total:
+                    type: integer
+                    description: Count of results matching the query (from cursor position onward if paginating)
+                  limit:
+                    type: integer
+                  next_before_id:
+                    type: integer
+                    nullable: true
+                    description: Pass to next request to get the next (older) page. Null on last page.
+                  next_before_sent_at:
+                    type: integer
+                    nullable: true
+                    description: Pass to next request alongside next_before_id.
+        '400':
+          description: Invalid FTS5 query or parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+
+  # ---------------------------------------------------------------------------
+  # Stats
+  # ---------------------------------------------------------------------------
+  /stats:
+    get:
+      summary: Archive statistics
+      parameters:
+        - $ref: '#/components/parameters/AccountID'
+      responses:
+        '200':
+          description: Statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_messages:
+                    type: integer
+                  total_chats:
+                    type: integer
+                  earliest_message_at:
+                    type: integer
+                    nullable: true
+                    description: Unix epoch seconds
+                  latest_message_at:
+                    type: integer
+                    nullable: true
+                    description: Unix epoch seconds
+                  deleted_count:
+                    type: integer
+                  edited_count:
+                    type: integer
+                  sent_count:
+                    type: integer
+                  received_count:
+                    type: integer
+                  total_contacts:
+                    type: integer
+        '401':
+          description: Unauthorized
+
+  # ---------------------------------------------------------------------------
+  # Chats
+  # ---------------------------------------------------------------------------
+  /chats:
+    get:
+      summary: List chats
+      description: Returns all chats with message counts, sorted by most recent activity.
+      parameters:
+        - $ref: '#/components/parameters/AccountID'
+        - name: name
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Case-insensitive partial match on chat name (ASCII only)
+      responses:
+        '200':
+          description: Chat list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    tg_chat_id:
+                      type: string
+                    chat_name:
+                      type: string
+                      nullable: true
+                    chat_type:
+                      type: string
+                      nullable: true
+                      enum: [user, group, supergroup, channel, bot]
+                    message_count:
+                      type: integer
+                    last_message_at:
+                      type: integer
+                      nullable: true
+                      description: Unix epoch seconds
+                    sync_status:
+                      type: string
+                      enum: [include, exclude, default]
+        '401':
+          description: Unauthorized
+
+  # ---------------------------------------------------------------------------
+  # Contacts
+  # ---------------------------------------------------------------------------
+  /contacts:
+    get:
+      summary: List contacts
+      description: Returns all contacts joined with message count and last seen timestamp.
+      parameters:
+        - $ref: '#/components/parameters/AccountID'
+      responses:
+        '200':
+          description: Contact list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ContactRow'
+        '401':
+          description: Unauthorized
+
+    post:
+      summary: Upsert contacts
+      description: Insert or update up to 500 contacts. COALESCEs — existing non-null values are not overwritten by null.
+      parameters:
+        - $ref: '#/components/parameters/AccountID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contacts]
+              properties:
+                contacts:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    $ref: '#/components/schemas/Contact'
+      responses:
+        '200':
+          description: Upsert result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  upserted:
+                    type: integer
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+
+  # ---------------------------------------------------------------------------
+  # Global config
+  # ---------------------------------------------------------------------------
+  /config:
+    get:
+      summary: Get global sync mode
+      responses:
+        '200':
+          description: Current sync mode
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sync_mode:
+                    type: string
+                    enum: [all, blacklist, whitelist, none]
+        '401':
+          description: Unauthorized
+
+    post:
+      summary: Set global sync mode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sync_mode]
+              properties:
+                sync_mode:
+                  type: string
+                  enum: [all, blacklist, whitelist, none]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        '400':
+          description: Invalid sync_mode
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+
+  # ---------------------------------------------------------------------------
+  # Per-chat config
+  # ---------------------------------------------------------------------------
+  /chats/config:
+    get:
+      summary: List per-chat sync overrides
+      parameters:
+        - $ref: '#/components/parameters/AccountID'
+      responses:
+        '200':
+          description: Chat override list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    tg_chat_id:
+                      type: string
+                    chat_name:
+                      type: string
+                      nullable: true
+                    sync:
+                      type: string
+                      enum: [include, exclude]
+                    updated_at:
+                      type: integer
+                      description: Unix epoch seconds
+        '401':
+          description: Unauthorized
+
+    post:
+      summary: Set per-chat sync override
+      parameters:
+        - $ref: '#/components/parameters/AccountID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tg_chat_id, sync]
+              properties:
+                tg_chat_id:
+                  type: string
+                chat_name:
+                  type: string
+                  nullable: true
+                sync:
+                  type: string
+                  enum: [include, exclude]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+
+  /chats/config/{tg_chat_id}:
+    delete:
+      summary: Remove per-chat sync override
+      parameters:
+        - $ref: '#/components/parameters/AccountID'
+        - name: tg_chat_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Telegram chat ID (URL-encoded if negative)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        '401':
+          description: Unauthorized
+
+  # ---------------------------------------------------------------------------
+  # Deleted messages
+  # ---------------------------------------------------------------------------
+  /deleted:
+    post:
+      summary: Mark messages as deleted
+      description: |
+        Sets `is_deleted=1` and `deleted_at=now()` on matched messages.
+        Only works for channels/supergroups — private chat deletions do not include peer context
+        in the Telegram API and cannot be matched.
+      parameters:
+        - $ref: '#/components/parameters/AccountID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messages]
+              properties:
+                messages:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    type: object
+                    required: [tg_chat_id, tg_message_id]
+                    properties:
+                      tg_chat_id:
+                        type: string
+                      tg_message_id:
+                        type: string
+      responses:
+        '200':
+          description: Mark result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  marked:
+                    type: integer
+                    description: Number of rows actually updated
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+
+  # ---------------------------------------------------------------------------
+  # Backfill
+  # ---------------------------------------------------------------------------
+  /backfill/seed:
+    post:
+      summary: Seed backfill state
+      description: |
+        Registers dialogs for backfill. Uses `INSERT OR IGNORE` — already-seeded dialogs are skipped.
+        Run `backfill-seed.ts` to call this automatically from GetDialogs.
+      parameters:
+        - $ref: '#/components/parameters/AccountID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [dialogs]
+              properties:
+                dialogs:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items:
+                    type: object
+                    required: [tg_chat_id]
+                    properties:
+                      tg_chat_id:
+                        type: string
+                      chat_name:
+                        type: string
+                        nullable: true
+                      total_messages:
+                        type: integer
+                        nullable: true
+      responses:
+        '200':
+          description: Seed result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  seeded:
+                    type: integer
+                    description: Newly inserted rows (existing ignored)
+        '401':
+          description: Unauthorized
+
+  /backfill/pending:
+    get:
+      summary: List pending/in-progress dialogs
+      description: Returns dialogs with status `pending` or `in_progress`, ordered by tg_chat_id. Used by `backfill-run.ts` to determine what to process.
+      parameters:
+        - $ref: '#/components/parameters/AccountID'
+      responses:
+        '200':
+          description: Pending dialog list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    tg_chat_id:
+                      type: string
+                    chat_name:
+                      type: string
+                      nullable: true
+                    total_messages:
+                      type: integer
+                      nullable: true
+                    fetched_messages:
+                      type: integer
+                    oldest_message_id:
+                      type: integer
+                      nullable: true
+                      description: offsetId anchor for next GetHistory page
+                    status:
+                      type: string
+                      enum: [pending, in_progress]
+        '401':
+          description: Unauthorized
+
+  /backfill/progress:
+    post:
+      summary: Update backfill progress
+      description: Called by `backfill-run.ts` after each page to checkpoint progress and update status.
+      parameters:
+        - $ref: '#/components/parameters/AccountID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tg_chat_id]
+              properties:
+                tg_chat_id:
+                  type: string
+                status:
+                  type: string
+                  enum: [in_progress, complete, failed]
+                oldest_message_id:
+                  type: integer
+                  description: Last offsetId used (cursor for next run)
+                fetched_messages:
+                  type: integer
+                  description: Cumulative messages fetched so far
+                last_error:
+                  type: string
+                  maxLength: 1000
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+
+  # ---------------------------------------------------------------------------
+  # MCP
+  # ---------------------------------------------------------------------------
+  /mcp:
+    options:
+      summary: CORS preflight
+      security: []
+      responses:
+        '204':
+          description: No content
+
+    post:
+      summary: Model Context Protocol endpoint
+      description: |
+        JSON-RPC 2.0 / MCP Streamable HTTP transport (spec 2024-11-05).
+        Accepts single requests or batch arrays.
+
+        **Supported methods:**
+        - `initialize` — handshake, returns tool list and instructions
+        - `notifications/initialized` — notification, returns 204
+        - `tools/list` — returns available tools
+        - `tools/call` — executes a tool
+
+        **Tools:** `search`, `chats`, `history`, `contacts`, `recent`, `stats`
+      parameters:
+        - $ref: '#/components/parameters/AccountID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - description: Single JSON-RPC 2.0 request
+                  type: object
+                  required: [jsonrpc, method]
+                  properties:
+                    jsonrpc:
+                      type: string
+                      enum: ['2.0']
+                    id:
+                      oneOf:
+                        - type: string
+                        - type: integer
+                        - type: 'null'
+                    method:
+                      type: string
+                    params:
+                      type: object
+                - description: Batch array of requests
+                  type: array
+                  items:
+                    type: object
+      responses:
+        '200':
+          description: JSON-RPC response (single or batch array)
+          content:
+            application/json:
+              schema:
+                type: object
+        '204':
+          description: Notification acknowledged (no response body)
+        '400':
+          description: Parse error
+        '401':
+          description: Unauthorized
