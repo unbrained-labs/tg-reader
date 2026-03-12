@@ -1,4 +1,4 @@
-import { Pool } from '@neondatabase/serverless';
+import { neon, NeonQueryFunction } from '@neondatabase/serverless';
 import type { Env, Message } from './types';
 
 // ---------------------------------------------------------------------------
@@ -12,8 +12,8 @@ function json(data: unknown, status = 200): Response {
   });
 }
 
-function getPool(env: Env): Pool {
-  return new Pool({ connectionString: env.HYPERDRIVE.connectionString });
+function getSql(env: Env): NeonQueryFunction<false, false> {
+  return neon(env.DATABASE_URL);
 }
 
 // ---------------------------------------------------------------------------
@@ -153,10 +153,10 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
   `.trim();
 
   const msgs = messages as Message[];
-  const pool = getPool(env);
+  const sql = getSql(env);
   let result;
   try {
-    result = await pool.query(SQL, [
+    result = await sql(SQL, [
       accountId,
       msgs.map(m => m.tg_message_id),
       msgs.map(m => m.tg_chat_id),
@@ -178,13 +178,13 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
       msgs.map(m => m.edit_date ?? null),
       msgs.map(m => m.is_deleted ?? 0),
       msgs.map(m => m.deleted_at ?? null),
-    ]);
+    ], { fullResults: true });
   } catch (err) {
     console.error('[POST /ingest] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  const written = result.rowCount ?? 0;
+  const written = parseInt(result.rowCount ?? '0', 10);
   const noop = msgs.length - written;
   console.log(`[POST /ingest] written=${written} noop=${noop}`);
   return json({ written, noop });
@@ -234,7 +234,7 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
   const beforeSentAt = p.get('before_sent_at') ? parseInt(p.get('before_sent_at')!, 10) : null;
   const beforeId = p.get('before_id') ? parseInt(p.get('before_id')!, 10) : null;
 
-  const pool = getPool(env);
+  const sql = getSql(env);
 
   try {
     let dataRows: Array<{ id: number; sent_at: number }>;
@@ -283,11 +283,11 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
         : [];
 
       const [dataResult, countResult] = await Promise.all([
-        pool.query(DATA_SQL, [...baseBinds, ...keysetBinds, limit]),
-        pool.query<{ total: string }>(COUNT_SQL, [...baseBinds, ...keysetBinds]),
+        sql(DATA_SQL, [...baseBinds, ...keysetBinds, limit]),
+        sql(COUNT_SQL, [...baseBinds, ...keysetBinds]),
       ]);
-      dataRows = dataResult.rows as Array<{ id: number; sent_at: number }>;
-      total = parseInt(countResult.rows[0].total, 10);
+      dataRows = dataResult as Array<{ id: number; sent_at: number }>;
+      total = parseInt((countResult[0] as { total: string }).total, 10);
     } else {
       // B-tree path: no query, sort by recency
       const keysetClause = beforeSentAt !== null && beforeId !== null
@@ -329,11 +329,11 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
         : [];
 
       const [dataResult, countResult] = await Promise.all([
-        pool.query(DATA_SQL, [...baseBinds, ...keysetBinds, limit]),
-        pool.query<{ total: string }>(COUNT_SQL, [...baseBinds, ...keysetBinds]),
+        sql(DATA_SQL, [...baseBinds, ...keysetBinds, limit]),
+        sql(COUNT_SQL, [...baseBinds, ...keysetBinds]),
       ]);
-      dataRows = dataResult.rows as Array<{ id: number; sent_at: number }>;
-      total = parseInt(countResult.rows[0].total, 10);
+      dataRows = dataResult as Array<{ id: number; sent_at: number }>;
+      total = parseInt((countResult[0] as { total: string }).total, 10);
     }
 
     const lastRow = dataRows.length === limit ? dataRows[dataRows.length - 1] : null;
@@ -409,10 +409,10 @@ async function handlePostContacts(request: Request, env: Env, accountId: string)
   `.trim();
 
   const cs = contacts as ContactPayload[];
-  const pool = getPool(env);
+  const sql = getSql(env);
   let result;
   try {
-    result = await pool.query(SQL, [
+    result = await sql(SQL, [
       accountId,
       cs.map(c => c.tg_user_id),
       cs.map(c => c.phone ?? null),
@@ -421,13 +421,13 @@ async function handlePostContacts(request: Request, env: Env, accountId: string)
       cs.map(c => c.last_name ?? null),
       cs.map(c => c.is_mutual ?? null),
       cs.map(c => c.is_bot ?? null),
-    ]);
+    ], { fullResults: true });
   } catch (err) {
     console.error('[POST /contacts] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  const upserted = result.rowCount ?? 0;
+  const upserted = parseInt(result.rowCount ?? '0', 10);
   console.log(`[POST /contacts] upserted=${upserted}`);
   return json({ upserted });
 }
@@ -451,14 +451,14 @@ async function handleGetContacts(_request: Request, env: Env, accountId: string)
     ORDER BY last_seen DESC NULLS LAST
   `.trim();
 
-  const pool = getPool(env);
+  const sql = getSql(env);
   try {
-    const { rows } = await pool.query<{
+    const rows = await sql(SQL, [accountId]) as Array<{
       tg_user_id: string; phone: string | null; username: string | null;
       first_name: string | null; last_name: string | null;
       is_mutual: number; is_bot: number;
       message_count: string; last_seen: string | null;
-    }>(SQL, [accountId]);
+    }>;
     console.log(`[GET /contacts] account=${accountId} count=${rows.length}`);
     return json(rows.map(r => ({
       ...r,
@@ -498,12 +498,12 @@ async function handleChats(request: Request, env: Env, accountId: string): Promi
     ? `%${nameFilter.replace(/[%_\\]/g, '\\$&')}%`
     : null;
 
-  const pool = getPool(env);
+  const sql = getSql(env);
   try {
-    const { rows } = await pool.query<{
+    const rows = await sql(SQL, [accountId, namePattern, namePattern]) as Array<{
       tg_chat_id: string; chat_name: string | null; chat_type: string | null;
       message_count: string; last_message_at: string | null; sync_status: string;
-    }>(SQL, [accountId, namePattern, namePattern]);
+    }>;
     console.log(`[GET /chats] account=${accountId} count=${rows.length}`);
     return json(rows.map(r => ({
       ...r,
@@ -533,10 +533,10 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
 
   const CONTACT_SQL = `SELECT COUNT(*) AS total_contacts FROM contacts WHERE account_id = $1`;
 
-  const pool = getPool(env);
+  const sql = getSql(env);
   try {
     const [msgResult, contactResult] = await Promise.all([
-      pool.query<{
+      sql(SQL, [accountId]) as Promise<Array<{
         total_messages: string;
         total_chats: string;
         earliest_message_at: number | null;
@@ -545,11 +545,11 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
         edited_count: string;
         sent_count: string;
         received_count: string;
-      }>(SQL, [accountId]),
-      pool.query<{ total_contacts: string }>(CONTACT_SQL, [accountId]),
+      }>>,
+      sql(CONTACT_SQL, [accountId]) as Promise<Array<{ total_contacts: string }>>,
     ]);
-    const stats = msgResult.rows[0];
-    const total_contacts = parseInt(contactResult.rows[0].total_contacts, 10);
+    const stats = msgResult[0];
+    const total_contacts = parseInt(contactResult[0].total_contacts, 10);
     return json({
       total_messages: parseInt(stats.total_messages, 10),
       total_chats: parseInt(stats.total_chats, 10),
@@ -568,12 +568,9 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
 }
 
 async function handleGetConfig(_request: Request, env: Env): Promise<Response> {
-  const pool = getPool(env);
+  const sql = getSql(env);
   try {
-    const { rows } = await pool.query<{ value: string }>(
-      `SELECT value FROM global_config WHERE key = 'sync_mode'`,
-      [],
-    );
+    const rows = await sql(`SELECT value FROM global_config WHERE key = 'sync_mode'`) as Array<{ value: string }>;
     return json({ sync_mode: rows[0]?.value ?? 'all' });
   } catch (err) {
     console.error('[GET /config] DB error', err);
@@ -590,9 +587,9 @@ async function handlePostConfig(request: Request, env: Env): Promise<Response> {
     return json({ ok: false, error: `sync_mode must be one of: ${VALID_SYNC_MODES.join(', ')}` }, 400);
   }
 
-  const pool = getPool(env);
+  const sql = getSql(env);
   try {
-    await pool.query(
+    await sql(
       `INSERT INTO global_config (key, value) VALUES ('sync_mode', $1) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value`,
       [syncMode],
     );
@@ -604,9 +601,9 @@ async function handlePostConfig(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleGetChatsConfig(_request: Request, env: Env, accountId: string): Promise<Response> {
-  const pool = getPool(env);
+  const sql = getSql(env);
   try {
-    const { rows } = await pool.query(
+    const rows = await sql(
       `SELECT tg_chat_id, chat_name, sync, updated_at FROM chat_config WHERE account_id = $1 ORDER BY updated_at DESC`,
       [accountId],
     );
@@ -629,9 +626,9 @@ async function handlePostChatsConfig(request: Request, env: Env, accountId: stri
     return json({ ok: false, error: `sync must be 'include' or 'exclude'` }, 400);
   }
 
-  const pool = getPool(env);
+  const sql = getSql(env);
   try {
-    await pool.query(
+    await sql(
       `INSERT INTO chat_config (account_id, tg_chat_id, chat_name, sync, updated_at)
        VALUES ($1, $2, $3, $4, EXTRACT(EPOCH FROM NOW())::BIGINT)
        ON CONFLICT(account_id, tg_chat_id) DO UPDATE SET
@@ -648,9 +645,9 @@ async function handlePostChatsConfig(request: Request, env: Env, accountId: stri
 }
 
 async function handleDeleteChatsConfig(tgChatId: string, env: Env, accountId: string): Promise<Response> {
-  const pool = getPool(env);
+  const sql = getSql(env);
   try {
-    await pool.query(
+    await sql(
       `DELETE FROM chat_config WHERE account_id = $1 AND tg_chat_id = $2`,
       [accountId, tgChatId],
     );
@@ -711,20 +708,20 @@ async function handleDeleted(request: Request, env: Env, accountId: string): Pro
       AND (tg_chat_id, tg_message_id) IN (SELECT * FROM UNNEST($2::text[], $3::text[]))
   `.trim();
 
-  const pool = getPool(env);
+  const sql = getSql(env);
   let result;
   try {
-    result = await pool.query(SQL, [
+    result = await sql(SQL, [
       accountId,
       messages.map(m => m.tg_chat_id),
       messages.map(m => m.tg_message_id),
-    ]);
+    ], { fullResults: true });
   } catch (err) {
     console.error('[POST /deleted] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  const marked = result.rowCount ?? 0;
+  const marked = parseInt(result.rowCount ?? '0', 10);
   console.log(`[POST /deleted] marked=${marked}`);
   return json({ marked });
 }
@@ -757,21 +754,21 @@ async function handleBackfillSeed(request: Request, env: Env, accountId: string)
     ON CONFLICT DO NOTHING
   `.trim();
 
-  const pool = getPool(env);
+  const sql = getSql(env);
   let result;
   try {
-    result = await pool.query(SQL, [
+    result = await sql(SQL, [
       accountId,
       dialogs.map(d => d.tg_chat_id),
       dialogs.map(d => d.chat_name ?? null),
       dialogs.map(d => d.total_messages ?? null),
-    ]);
+    ], { fullResults: true });
   } catch (err) {
     console.error('[POST /backfill/seed] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  const seeded = result.rowCount ?? 0;
+  const seeded = parseInt(result.rowCount ?? '0', 10);
   console.log(`[POST /backfill/seed] seeded=${seeded}`);
   return json({ seeded });
 }
@@ -784,9 +781,9 @@ async function handleBackfillPending(_request: Request, env: Env, accountId: str
     ORDER BY tg_chat_id
   `.trim();
 
-  const pool = getPool(env);
+  const sql = getSql(env);
   try {
-    const { rows } = await pool.query(SQL, [accountId]);
+    const rows = await sql(SQL, [accountId]);
     console.log(`[GET /backfill/pending] account=${accountId} count=${rows.length}`);
     return json(rows);
   } catch (err) {
@@ -858,9 +855,9 @@ async function handleBackfillProgress(request: Request, env: Env, accountId: str
 
   console.log(`[POST /backfill/progress] account=${accountId} sets=${sets.length}`);
 
-  const pool = getPool(env);
+  const sql = getSql(env);
   try {
-    await pool.query(SQL, binds);
+    await sql(SQL, binds);
     return json({ ok: true });
   } catch (err) {
     console.error('[POST /backfill/progress] DB error', err);
@@ -1029,12 +1026,12 @@ async function dispatchMcpTool(
       LIMIT $${afterSentAt !== null && afterId !== null ? 5 : 3}
     `.trim();
 
-    const pool = getPool(env);
+    const sql = getSql(env);
     const binds: unknown[] = afterSentAt !== null && afterId !== null
       ? [accountId, chatId, afterSentAt, afterId, limit]
       : [accountId, chatId, limit];
 
-    const { rows } = await pool.query(SQL, binds);
+    const rows = await sql(SQL, binds);
     const typedRows = rows as Array<Record<string, unknown> & { id: number; sent_at: number }>;
     const lastRow = typedRows.length === limit ? typedRows[typedRows.length - 1] : null;
 
@@ -1068,12 +1065,12 @@ async function dispatchMcpTool(
       GROUP BY c.tg_user_id, c.phone, c.username, c.first_name, c.last_name, c.is_mutual, c.is_bot
       ORDER BY last_seen DESC NULLS LAST
     `.trim();
-    const { rows } = await getPool(env).query<{
+    const rows = await getSql(env)(SQL, [accountId, search]) as Array<{
       tg_user_id: string; phone: string | null; username: string | null;
       first_name: string | null; last_name: string | null;
       is_mutual: number; is_bot: number;
       message_count: string; last_seen: string | null;
-    }>(SQL, [accountId, search]);
+    }>;
     return rows.map(r => ({
       ...r,
       message_count: parseInt(r.message_count, 10),
@@ -1299,9 +1296,9 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
 // Fetch handler
 // ---------------------------------------------------------------------------
 
-// W-2: account ID must be 'primary' or a numeric Telegram user ID (up to 20 digits).
+// W-2: account ID must be a non-empty alphanumeric slug (letters, digits, hyphens, underscores).
 function isValidAccountId(id: string): boolean {
-  return id === 'primary' || /^\d{1,20}$/.test(id);
+  return /^[\w-]{1,64}$/.test(id);
 }
 
 async function fetch(request: Request, env: Env): Promise<Response> {
@@ -1343,12 +1340,12 @@ async function fetch(request: Request, env: Env): Promise<Response> {
 // Scheduled handler (cron backup)
 // ---------------------------------------------------------------------------
 
-async function* streamMessages(pool: Pool): AsyncGenerator<string> {
+async function* streamMessages(sql: NeonQueryFunction<false, false>): AsyncGenerator<string> {
   // W-12: use keyset pagination (WHERE id > lastId) instead of OFFSET.
   const batchSize = 1000;
   let lastId = 0;
   while (true) {
-    const { rows } = await pool.query(
+    const rows = await sql(
       `SELECT id, account_id, tg_message_id, tg_chat_id, chat_name, chat_type,
               sender_id, sender_username, sender_first_name, sender_last_name,
               direction, message_type, text, media_type, media_file_id,
@@ -1369,7 +1366,7 @@ async function* streamMessages(pool: Pool): AsyncGenerator<string> {
 async function runBackup(env: Env): Promise<void> {
   const date = new Date().toISOString().slice(0, 10);
   const key = `backup-${date}.ndjson`;
-  const pool = getPool(env);
+  const sql = getSql(env);
 
   try {
     const encoder = new TextEncoder();
@@ -1378,7 +1375,7 @@ async function runBackup(env: Env): Promise<void> {
     const stream = new ReadableStream({
       async start(controller) {
         try {
-          for await (const line of streamMessages(pool)) {
+          for await (const line of streamMessages(sql)) {
             controller.enqueue(encoder.encode(line));
             rowCount++;
           }
@@ -1399,12 +1396,11 @@ async function runBackup(env: Env): Promise<void> {
 }
 
 async function runStorageCheck(env: Env): Promise<void> {
-  const pool = getPool(env);
+  const sql = getSql(env);
   try {
-    const { rows } = await pool.query<{ total_messages: string; text_bytes: string }>(
+    const rows = await sql(
       `SELECT COUNT(*) AS total_messages, SUM(LENGTH(COALESCE(text, ''))) AS text_bytes FROM messages`,
-      [],
-    );
+    ) as Array<{ total_messages: string; text_bytes: string }>;
 
     const row = rows[0];
     if (!row) return;

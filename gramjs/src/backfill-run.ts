@@ -54,7 +54,8 @@ async function postProgress(accountId: string, body: {
     });
     // Bug 3 fix: check res.ok — a 5xx means checkpoint was NOT saved; log clearly but don't throw
     if (!res.ok) {
-      console.warn(`[backfill] postProgress HTTP ${res.status} — checkpoint may not have been saved for chat=${body.tg_chat_id}`);
+      const errBody = await res.text().catch(() => '(unreadable)');
+      console.warn(`[backfill] postProgress HTTP ${res.status} body=${errBody} — checkpoint may not have been saved for chat=${body.tg_chat_id}`);
     }
   } catch (err) {
     console.error('[backfill] progress update failed:', err instanceof Error ? err.message : String(err));
@@ -126,8 +127,8 @@ async function backfillDialog(
 
   await postProgress(accountId, { tg_chat_id, status: 'in_progress' });
 
-  let offsetId = dialog.oldest_message_id ?? 0;
-  let fetched = dialog.fetched_messages ?? 0;
+  let offsetId = Number(dialog.oldest_message_id ?? 0);
+  let fetched = Number(dialog.fetched_messages ?? 0);
 
   let inputPeer: Api.TypeInputPeer;
   try {
@@ -241,7 +242,19 @@ async function backfillDialog(
       };
     });
 
-    // POST batch to /ingest — duplicates are safely handled by ON CONFLICT in D1
+    // Skip ingest if all messages in the page were MessageService (calls, joins, etc.)
+    if (batch.length === 0) {
+      offsetId = lastRawId;
+      if (rawCount < 100) {
+        await postProgress(accountId, { tg_chat_id, oldest_message_id: offsetId, fetched_messages: fetched, status: 'complete' });
+        console.log(`[backfill] dialog ${index + 1}/${total} complete (service-only page) fetched=${fetched}`);
+        break;
+      }
+      await sleep(Math.random() * 2500 + 1500);
+      continue;
+    }
+
+    // POST batch to /ingest — duplicates are safely handled by ON CONFLICT
     // Bug 1 fix: on non-2xx OR network error, mark dialog failed and return without
     // advancing the cursor. The operator can re-run to retry from the last checkpoint.
     let ingestOk = false;

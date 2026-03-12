@@ -1,8 +1,6 @@
-import type { Hyperdrive } from '@cloudflare/workers-types';
-
 // Cloudflare Worker environment bindings
 export interface Env {
-  HYPERDRIVE: Hyperdrive;
+  DATABASE_URL: string;
   BACKUP_BUCKET: R2Bucket;
   INGEST_TOKEN: string;
 }

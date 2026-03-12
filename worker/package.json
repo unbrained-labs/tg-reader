@@ -8,10 +8,12 @@
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
-    "@neondatabase/serverless": "^0.10.4"
+    "@neondatabase/serverless": "^0.10.4",
+    "pg": "^8.20.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250430.0",
+    "@types/pg": "^8.18.0",
     "typescript": "^5.4.0",
     "wrangler": "^3.57.0"
   }
