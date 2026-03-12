@@ -1,11 +1,12 @@
 name = "tg-reader"
 main = "src/index.ts"
 compatibility_date = "2025-03-01"
+compatibility_flags = ["nodejs_compat"]
 
-[[d1_databases]]
-binding = "DB"
-database_name = "tg-archive"
-database_id = "430ffb40-988f-4929-bde2-8b2be617de3d"
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "REPLACE_WITH_HYPERDRIVE_CONFIG_ID"
+# Create with: wrangler hyperdrive create tg-reader-pg --connection-string="postgresql://..."
 
 [[r2_buckets]]
 binding = "BACKUP_BUCKET"

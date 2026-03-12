@@ -1,3 +1,4 @@
+import { Pool } from '@neondatabase/serverless';
 import type { Env, Message } from './types';
 
 // ---------------------------------------------------------------------------
@@ -9,6 +10,10 @@ function json(data: unknown, status = 200): Response {
     status,
     headers: { 'Content-Type': 'application/json' },
   });
+}
+
+function getPool(env: Env): Pool {
+  return new Pool({ connectionString: env.HYPERDRIVE.connectionString });
 }
 
 // ---------------------------------------------------------------------------
@@ -28,7 +33,7 @@ async function timingSafeTokenEqual(provided: string, expected: string): Promise
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign'],
-  );
+  ) as CryptoKey;
   const [sigA, sigB] = await Promise.all([
     crypto.subtle.sign('HMAC', key, a),
     crypto.subtle.sign('HMAC', key, b),
@@ -91,7 +96,8 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
 
   console.log(`[POST /ingest] account=${accountId} count=${messages.length}`);
 
-  // Build one prepared statement per message
+  // Single UNNEST INSERT — one round trip for up to 100 messages.
+  // $1 = account_id scalar; $2–$21 = per-column arrays in message order.
   const SQL = `
     INSERT INTO messages (
       account_id, tg_message_id, tg_chat_id, chat_name, chat_type,
@@ -99,82 +105,87 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
       direction, message_type, text, media_type, media_file_id,
       reply_to_message_id, forwarded_from_id, forwarded_from_name,
       sent_at, edit_date, is_deleted, deleted_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    )
+    SELECT $1,
+      v.tg_message_id, v.tg_chat_id, v.chat_name, v.chat_type,
+      v.sender_id, v.sender_username, v.sender_first_name, v.sender_last_name,
+      v.direction, v.message_type, v.text, v.media_type, v.media_file_id,
+      v.reply_to_message_id, v.forwarded_from_id, v.forwarded_from_name,
+      v.sent_at, v.edit_date, v.is_deleted, v.deleted_at
+    FROM UNNEST(
+      $2::text[], $3::text[], $4::text[], $5::text[],
+      $6::text[], $7::text[], $8::text[], $9::text[],
+      $10::text[], $11::text[], $12::text[], $13::text[], $14::text[],
+      $15::bigint[], $16::text[], $17::text[],
+      $18::bigint[], $19::bigint[], $20::smallint[], $21::bigint[]
+    ) AS v(
+      tg_message_id, tg_chat_id, chat_name, chat_type,
+      sender_id, sender_username, sender_first_name, sender_last_name,
+      direction, message_type, text, media_type, media_file_id,
+      reply_to_message_id, forwarded_from_id, forwarded_from_name,
+      sent_at, edit_date, is_deleted, deleted_at
+    )
     ON CONFLICT(account_id, tg_chat_id, tg_message_id) DO UPDATE SET
-      text = excluded.text,
-      edit_date = excluded.edit_date,
-      is_deleted = excluded.is_deleted,
-      deleted_at = excluded.deleted_at,
+      text = EXCLUDED.text,
+      edit_date = EXCLUDED.edit_date,
+      is_deleted = EXCLUDED.is_deleted,
+      deleted_at = EXCLUDED.deleted_at,
       -- W-4/C-2: COALESCE so a richer incoming value wins over null,
       -- but an existing non-null value is never overwritten by null.
       -- Backfill sends null chat_type; live listener sends the correct type.
-      chat_name         = COALESCE(excluded.chat_name, messages.chat_name),
-      chat_type         = COALESCE(excluded.chat_type, messages.chat_type),
-      sender_id         = COALESCE(excluded.sender_id, messages.sender_id),
-      sender_username   = COALESCE(excluded.sender_username, messages.sender_username),
-      sender_first_name = COALESCE(excluded.sender_first_name, messages.sender_first_name),
-      sender_last_name  = COALESCE(excluded.sender_last_name, messages.sender_last_name),
-      direction         = COALESCE(excluded.direction, messages.direction),
-      message_type      = COALESCE(excluded.message_type, messages.message_type),
-      media_type        = COALESCE(excluded.media_type, messages.media_type),
-      reply_to_message_id  = COALESCE(excluded.reply_to_message_id, messages.reply_to_message_id),
-      forwarded_from_id    = COALESCE(excluded.forwarded_from_id, messages.forwarded_from_id),
-      forwarded_from_name  = COALESCE(excluded.forwarded_from_name, messages.forwarded_from_name),
+      chat_name         = COALESCE(EXCLUDED.chat_name, messages.chat_name),
+      chat_type         = COALESCE(EXCLUDED.chat_type, messages.chat_type),
+      sender_id         = COALESCE(EXCLUDED.sender_id, messages.sender_id),
+      sender_username   = COALESCE(EXCLUDED.sender_username, messages.sender_username),
+      sender_first_name = COALESCE(EXCLUDED.sender_first_name, messages.sender_first_name),
+      sender_last_name  = COALESCE(EXCLUDED.sender_last_name, messages.sender_last_name),
+      direction         = COALESCE(EXCLUDED.direction, messages.direction),
+      message_type      = COALESCE(EXCLUDED.message_type, messages.message_type),
+      media_type        = COALESCE(EXCLUDED.media_type, messages.media_type),
+      reply_to_message_id  = COALESCE(EXCLUDED.reply_to_message_id, messages.reply_to_message_id),
+      forwarded_from_id    = COALESCE(EXCLUDED.forwarded_from_id, messages.forwarded_from_id),
+      forwarded_from_name  = COALESCE(EXCLUDED.forwarded_from_name, messages.forwarded_from_name),
       original_text = CASE
-        WHEN excluded.edit_date IS NOT NULL
+        WHEN EXCLUDED.edit_date IS NOT NULL
         THEN COALESCE(messages.original_text, messages.text)
         ELSE messages.original_text
       END
   `.trim();
 
-  const stmts = (messages as Message[]).map((msg) =>
-    env.DB.prepare(SQL).bind(
-      accountId,
-      msg.tg_message_id,
-      msg.tg_chat_id,
-      msg.chat_name ?? null,
-      msg.chat_type ?? null,
-      msg.sender_id ?? null,
-      msg.sender_username ?? null,
-      msg.sender_first_name ?? null,
-      msg.sender_last_name ?? null,
-      msg.direction ?? null,
-      msg.message_type ?? null,
-      msg.text ?? null,
-      msg.media_type ?? null,
-      msg.media_file_id ?? null,
-      msg.reply_to_message_id ?? null,
-      msg.forwarded_from_id ?? null,
-      msg.forwarded_from_name ?? null,
-      msg.sent_at,
-      msg.edit_date ?? null,
-      msg.is_deleted ?? 0,
-      msg.deleted_at ?? null,
-    ),
-  );
-
-  // Execute batch
-  let results: D1Result[];
+  const msgs = messages as Message[];
+  const pool = getPool(env);
+  let result;
   try {
-    results = await env.DB.batch(stmts);
+    result = await pool.query(SQL, [
+      accountId,
+      msgs.map(m => m.tg_message_id),
+      msgs.map(m => m.tg_chat_id),
+      msgs.map(m => m.chat_name ?? null),
+      msgs.map(m => m.chat_type ?? null),
+      msgs.map(m => m.sender_id ?? null),
+      msgs.map(m => m.sender_username ?? null),
+      msgs.map(m => m.sender_first_name ?? null),
+      msgs.map(m => m.sender_last_name ?? null),
+      msgs.map(m => m.direction ?? null),
+      msgs.map(m => m.message_type ?? null),
+      msgs.map(m => m.text ?? null),
+      msgs.map(m => m.media_type ?? null),
+      msgs.map(m => m.media_file_id ?? null),
+      msgs.map(m => m.reply_to_message_id ?? null),
+      msgs.map(m => m.forwarded_from_id ?? null),
+      msgs.map(m => m.forwarded_from_name ?? null),
+      msgs.map(m => m.sent_at),
+      msgs.map(m => m.edit_date ?? null),
+      msgs.map(m => m.is_deleted ?? 0),
+      msgs.map(m => m.deleted_at ?? null),
+    ]);
   } catch (err) {
-    console.error('[POST /ingest] DB batch error', err);
+    console.error('[POST /ingest] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  // W-5: rows_written > 0 for both INSERT and UPDATE — rename to written/noop to
-  // avoid implying only new rows are counted. A true no-op (all columns unchanged)
-  // may yield rows_written=0, counted as noop.
-  let written = 0;
-  let noop = 0;
-  for (const result of results) {
-    if (result.meta.rows_written > 0) {
-      written++;
-    } else {
-      noop++;
-    }
-  }
-
+  const written = result.rowCount ?? 0;
+  const noop = msgs.length - written;
   console.log(`[POST /ingest] written=${written} noop=${noop}`);
   return json({ written, noop });
 }
@@ -200,17 +211,19 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
   console.log(`[GET /search] account=${accountId} params=${[...p.keys()].join(',')}`);
 
   const qRaw = p.get('q');
-  // Sanitize FTS5 query: quote each token individually to prevent operator injection
-  // while preserving multi-word AND semantics ("hello" "world" = hello AND world).
-  // W-9: enforce min token length of 2 to prevent unbounded FTS prefix scans.
-  // If q was provided but every token is too short, return an error rather than
-  // silently falling through to an unfiltered B-tree scan.
-  const qTokens = qRaw !== null ? qRaw.trim().split(/\s+/).filter(t => t.length >= 2) : null;
+  // Sanitize tsquery: strip non-word chars from each token first, then enforce min length of 2
+  // on the stripped form (W-9: prevents unbounded FTS prefix scans and invalid ":*" tokens
+  // that would result from purely-symbolic input like "---" or emojis stripping to empty).
+  const qTokens = qRaw !== null
+    ? qRaw.trim().split(/\s+/)
+        .map(t => t.replace(/[^a-zA-Z0-9\u00C0-\u017F]/g, ''))
+        .filter(t => t.length >= 2)
+    : null;
   if (qRaw !== null && qRaw.trim() !== '' && qTokens !== null && qTokens.length === 0) {
     return json({ ok: false, error: 'Search query must contain at least one term with 2 or more characters' }, 400);
   }
   const q = qTokens !== null && qTokens.length > 0
-    ? qTokens.map(t => '"' + t.replace(/"/g, '""') + '"*').join(' ')
+    ? qTokens.map(t => t + ':*').join(' & ')
     : null;
   const chatId = p.get('chat_id') ?? null;
   const senderUsername = p.get('sender_username') ?? null;
@@ -221,109 +234,118 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
   const beforeSentAt = p.get('before_sent_at') ? parseInt(p.get('before_sent_at')!, 10) : null;
   const beforeId = p.get('before_id') ? parseInt(p.get('before_id')!, 10) : null;
 
-  // Build keyset WHERE clause — handles both first-page (no cursor) and subsequent pages
-  // Compound cursor: (sent_at < X) OR (sent_at = X AND id < Y)
-  const keysetClause = beforeSentAt !== null && beforeId !== null
-    ? `AND (m.sent_at < ? OR (m.sent_at = ? AND m.id < ?))`
-    : ``;
-  const keysetBinds = beforeSentAt !== null && beforeId !== null
-    ? [beforeSentAt, beforeSentAt, beforeId]
-    : [];
-
-  // Plain messages table version (no FTS5)
-  const plainKeysetClause = beforeSentAt !== null && beforeId !== null
-    ? `AND (sent_at < ? OR (sent_at = ? AND id < ?))`
-    : ``;
+  const pool = getPool(env);
 
   try {
-    let dataStmt: D1PreparedStatement;
-    let countStmt: D1PreparedStatement;
+    let dataRows: Array<{ id: number; sent_at: number }>;
+    let total: number;
 
     if (q !== null) {
-      // FTS5 path: sort by recency only — rank dropped because it is a per-query BM25
-      // score that is not stable across requests and cannot be included in a keyset cursor.
-      const SQL = `
+      // FTS path: search_vector @@ to_tsquery, sort by recency
+      const keysetClause = beforeSentAt !== null && beforeId !== null
+        ? `AND (m.sent_at < $9 OR (m.sent_at = $9 AND m.id < $10))`
+        : ``;
+
+      const DATA_SQL = `
         SELECT m.id, m.tg_message_id, m.tg_chat_id, m.chat_name, m.chat_type,
                m.sender_id, m.sender_username, m.sender_first_name, m.sender_last_name,
                m.direction, m.message_type, m.text, m.media_type,
                m.reply_to_message_id, m.forwarded_from_name, m.sent_at
         FROM messages m
-        JOIN messages_fts ON messages_fts.rowid = m.id
-        WHERE messages_fts MATCH ?
-          AND m.account_id = ?
+        WHERE m.search_vector @@ to_tsquery('simple', $1)
+          AND m.account_id = $2
           AND m.is_deleted = 0
-          AND (m.tg_chat_id = ? OR ? IS NULL)
-          AND (m.sender_username = ? OR ? IS NULL)
-          AND m.sent_at >= ?
-          AND m.sent_at <= ?
+          AND (m.tg_chat_id = $3 OR $4 IS NULL)
+          AND (m.sender_username = $5 OR $6 IS NULL)
+          AND m.sent_at >= $7
+          AND m.sent_at <= $8
           ${keysetClause}
         ORDER BY m.sent_at DESC, m.id DESC
-        LIMIT ?
+        LIMIT $${beforeSentAt !== null && beforeId !== null ? 11 : 9}
       `.trim();
-      // W-14: include keysetClause in COUNT so total reflects remaining results, not all results
+
       const COUNT_SQL = `
         SELECT COUNT(*) AS total
         FROM messages m
-        JOIN messages_fts ON messages_fts.rowid = m.id
-        WHERE messages_fts MATCH ?
-          AND m.account_id = ?
+        WHERE m.search_vector @@ to_tsquery('simple', $1)
+          AND m.account_id = $2
           AND m.is_deleted = 0
-          AND (m.tg_chat_id = ? OR ? IS NULL)
-          AND (m.sender_username = ? OR ? IS NULL)
-          AND m.sent_at >= ?
-          AND m.sent_at <= ?
+          AND (m.tg_chat_id = $3 OR $4 IS NULL)
+          AND (m.sender_username = $5 OR $6 IS NULL)
+          AND m.sent_at >= $7
+          AND m.sent_at <= $8
           ${keysetClause}
       `.trim();
-      dataStmt = env.DB.prepare(SQL).bind(q, accountId, chatId, chatId, senderUsername, senderUsername, from, to, ...keysetBinds, limit);
-      countStmt = env.DB.prepare(COUNT_SQL).bind(q, accountId, chatId, chatId, senderUsername, senderUsername, from, to, ...keysetBinds);
+
+      const baseBinds: unknown[] = [q, accountId, chatId, chatId, senderUsername, senderUsername, from, to];
+      const keysetBinds: unknown[] = beforeSentAt !== null && beforeId !== null
+        ? [beforeSentAt, beforeId]
+        : [];
+
+      const [dataResult, countResult] = await Promise.all([
+        pool.query(DATA_SQL, [...baseBinds, ...keysetBinds, limit]),
+        pool.query<{ total: string }>(COUNT_SQL, [...baseBinds, ...keysetBinds]),
+      ]);
+      dataRows = dataResult.rows as Array<{ id: number; sent_at: number }>;
+      total = parseInt(countResult.rows[0].total, 10);
     } else {
       // B-tree path: no query, sort by recency
-      const SQL = `
+      const keysetClause = beforeSentAt !== null && beforeId !== null
+        ? `AND (sent_at < $8 OR (sent_at = $8 AND id < $9))`
+        : ``;
+
+      const DATA_SQL = `
         SELECT id, tg_message_id, tg_chat_id, chat_name, chat_type,
                sender_id, sender_username, sender_first_name, sender_last_name,
                direction, message_type, text, media_type,
                reply_to_message_id, forwarded_from_name, sent_at
         FROM messages
-        WHERE account_id = ?
+        WHERE account_id = $1
           AND is_deleted = 0
-          AND (tg_chat_id = ? OR ? IS NULL)
-          AND (sender_username = ? OR ? IS NULL)
-          AND sent_at >= ?
-          AND sent_at <= ?
-          ${plainKeysetClause}
+          AND (tg_chat_id = $2 OR $3 IS NULL)
+          AND (sender_username = $4 OR $5 IS NULL)
+          AND sent_at >= $6
+          AND sent_at <= $7
+          ${keysetClause}
         ORDER BY sent_at DESC, id DESC
-        LIMIT ?
+        LIMIT $${beforeSentAt !== null && beforeId !== null ? 10 : 8}
       `.trim();
-      // W-14: include plainKeysetClause in COUNT
+
       const COUNT_SQL = `
         SELECT COUNT(*) AS total
         FROM messages
-        WHERE account_id = ?
+        WHERE account_id = $1
           AND is_deleted = 0
-          AND (tg_chat_id = ? OR ? IS NULL)
-          AND (sender_username = ? OR ? IS NULL)
-          AND sent_at >= ?
-          AND sent_at <= ?
-          ${plainKeysetClause}
+          AND (tg_chat_id = $2 OR $3 IS NULL)
+          AND (sender_username = $4 OR $5 IS NULL)
+          AND sent_at >= $6
+          AND sent_at <= $7
+          ${keysetClause}
       `.trim();
-      dataStmt = env.DB.prepare(SQL).bind(accountId, chatId, chatId, senderUsername, senderUsername, from, to, ...keysetBinds, limit);
-      countStmt = env.DB.prepare(COUNT_SQL).bind(accountId, chatId, chatId, senderUsername, senderUsername, from, to, ...keysetBinds);
+
+      const baseBinds: unknown[] = [accountId, chatId, chatId, senderUsername, senderUsername, from, to];
+      const keysetBinds: unknown[] = beforeSentAt !== null && beforeId !== null
+        ? [beforeSentAt, beforeId]
+        : [];
+
+      const [dataResult, countResult] = await Promise.all([
+        pool.query(DATA_SQL, [...baseBinds, ...keysetBinds, limit]),
+        pool.query<{ total: string }>(COUNT_SQL, [...baseBinds, ...keysetBinds]),
+      ]);
+      dataRows = dataResult.rows as Array<{ id: number; sent_at: number }>;
+      total = parseInt(countResult.rows[0].total, 10);
     }
 
-    const [dataResult, countResult] = await env.DB.batch([dataStmt, countStmt]);
-    const total = (countResult.results[0] as { total: number }).total;
-    const rows = dataResult.results as Array<{ id: number; sent_at: number }>;
-    const lastRow = rows.length === limit ? rows[rows.length - 1] : null;
+    const lastRow = dataRows.length === limit ? dataRows[dataRows.length - 1] : null;
     return json({
-      results: rows,
+      results: dataRows,
       total,
       limit,
-      // Compound cursor — pass both to next request as before_sent_at + before_id
       next_before_id: lastRow?.id ?? null,
       next_before_sent_at: lastRow?.sent_at ?? null,
     });
   } catch (err) {
-    if (q !== null && err instanceof Error && err.message.toLowerCase().includes('fts5')) {
+    if (q !== null && err instanceof Error && err.message.toLowerCase().includes('tsquery')) {
       return json({ ok: false, error: 'Invalid search query — check for unmatched quotes or special characters' }, 400);
     }
     console.error('[GET /search] DB error', err);
@@ -369,47 +391,43 @@ async function handlePostContacts(request: Request, env: Env, accountId: string)
 
   console.log(`[POST /contacts] account=${accountId} count=${contacts.length}`);
 
+  // Single UNNEST INSERT — one round trip for up to 500 contacts.
   const SQL = `
     INSERT INTO contacts (account_id, tg_user_id, phone, username, first_name, last_name, is_mutual, is_bot, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+    SELECT $1, v.tg_user_id, v.phone, v.username, v.first_name, v.last_name, v.is_mutual, v.is_bot,
+           EXTRACT(EPOCH FROM NOW())::BIGINT
+    FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::smallint[], $8::smallint[])
+      AS v(tg_user_id, phone, username, first_name, last_name, is_mutual, is_bot)
     ON CONFLICT(account_id, tg_user_id) DO UPDATE SET
-      phone       = COALESCE(excluded.phone, contacts.phone),
-      username    = COALESCE(excluded.username, contacts.username),
-      first_name  = COALESCE(excluded.first_name, contacts.first_name),
-      last_name   = COALESCE(excluded.last_name, contacts.last_name),
-      is_mutual   = COALESCE(excluded.is_mutual, contacts.is_mutual),
-      is_bot      = COALESCE(excluded.is_bot, contacts.is_bot),
-      updated_at  = unixepoch()
+      phone       = COALESCE(EXCLUDED.phone, contacts.phone),
+      username    = COALESCE(EXCLUDED.username, contacts.username),
+      first_name  = COALESCE(EXCLUDED.first_name, contacts.first_name),
+      last_name   = COALESCE(EXCLUDED.last_name, contacts.last_name),
+      is_mutual   = COALESCE(EXCLUDED.is_mutual, contacts.is_mutual),
+      is_bot      = COALESCE(EXCLUDED.is_bot, contacts.is_bot),
+      updated_at  = EXTRACT(EPOCH FROM NOW())::BIGINT
   `.trim();
 
-  const stmts = (contacts as ContactPayload[]).map((c) =>
-    env.DB.prepare(SQL).bind(
-      accountId,
-      c.tg_user_id,
-      c.phone ?? null,
-      c.username ?? null,
-      c.first_name ?? null,
-      c.last_name ?? null,
-      c.is_mutual ?? null,
-      c.is_bot ?? null,
-    ),
-  );
-
-  let results: D1Result[];
+  const cs = contacts as ContactPayload[];
+  const pool = getPool(env);
+  let result;
   try {
-    results = await env.DB.batch(stmts);
+    result = await pool.query(SQL, [
+      accountId,
+      cs.map(c => c.tg_user_id),
+      cs.map(c => c.phone ?? null),
+      cs.map(c => c.username ?? null),
+      cs.map(c => c.first_name ?? null),
+      cs.map(c => c.last_name ?? null),
+      cs.map(c => c.is_mutual ?? null),
+      cs.map(c => c.is_bot ?? null),
+    ]);
   } catch (err) {
-    console.error('[POST /contacts] DB batch error', err);
+    console.error('[POST /contacts] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  let upserted = 0;
-  for (const result of results) {
-    if (result.meta.rows_written > 0) {
-      upserted++;
-    }
-  }
-
+  const upserted = result.rowCount ?? 0;
   console.log(`[POST /contacts] upserted=${upserted}`);
   return json({ upserted });
 }
@@ -428,40 +446,49 @@ async function handleGetContacts(_request: Request, env: Env, accountId: string)
       MAX(m.sent_at) AS last_seen
     FROM contacts c
     LEFT JOIN messages m ON m.account_id = c.account_id AND m.sender_id = c.tg_user_id
-    WHERE c.account_id = ?
-    GROUP BY c.tg_user_id
+    WHERE c.account_id = $1
+    GROUP BY c.tg_user_id, c.phone, c.username, c.first_name, c.last_name, c.is_mutual, c.is_bot
     ORDER BY last_seen DESC NULLS LAST
   `.trim();
 
-  let results: unknown[];
+  const pool = getPool(env);
   try {
-    const outcome = await env.DB.prepare(SQL).bind(accountId).all();
-    results = outcome.results;
+    const { rows } = await pool.query<{
+      tg_user_id: string; phone: string | null; username: string | null;
+      first_name: string | null; last_name: string | null;
+      is_mutual: number; is_bot: number;
+      message_count: string; last_seen: string | null;
+    }>(SQL, [accountId]);
+    console.log(`[GET /contacts] account=${accountId} count=${rows.length}`);
+    return json(rows.map(r => ({
+      ...r,
+      message_count: parseInt(r.message_count, 10),
+      last_seen: r.last_seen !== null ? parseInt(r.last_seen, 10) : null,
+    })));
   } catch (err) {
     console.error('[GET /contacts] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
   }
-
-  console.log(`[GET /contacts] account=${accountId} count=${results.length}`);
-  return json(results);
 }
 
 async function handleChats(request: Request, env: Env, accountId: string): Promise<Response> {
   const url = new URL(request.url);
   const nameFilter = url.searchParams.get('name') ?? null;
 
+  // GROUP BY tg_chat_id only — avoids duplicate rows if chat_name/type changed over time.
+  // MAX(chat_name)/MAX(chat_type) picks a deterministic canonical value per chat.
   const SQL = `
     SELECT
       m.tg_chat_id,
-      m.chat_name,
-      m.chat_type,
+      MAX(m.chat_name) AS chat_name,
+      MAX(m.chat_type) AS chat_type,
       COUNT(m.id) AS message_count,
       MAX(m.sent_at) AS last_message_at,
-      COALESCE(cc.sync, 'default') AS sync_status
+      COALESCE(MAX(cc.sync), 'default') AS sync_status
     FROM messages m
     LEFT JOIN chat_config cc ON cc.account_id = m.account_id AND cc.tg_chat_id = m.tg_chat_id
-    WHERE m.account_id = ?
-      AND (m.chat_name LIKE ? ESCAPE '\\' OR ? IS NULL)
+    WHERE m.account_id = $1
+      AND (m.chat_name ILIKE $2 OR $3 IS NULL)
     GROUP BY m.tg_chat_id
     ORDER BY last_message_at DESC
   `.trim();
@@ -471,17 +498,22 @@ async function handleChats(request: Request, env: Env, accountId: string): Promi
     ? `%${nameFilter.replace(/[%_\\]/g, '\\$&')}%`
     : null;
 
-  let results: unknown[];
+  const pool = getPool(env);
   try {
-    const outcome = await env.DB.prepare(SQL).bind(accountId, namePattern, namePattern).all();
-    results = outcome.results;
+    const { rows } = await pool.query<{
+      tg_chat_id: string; chat_name: string | null; chat_type: string | null;
+      message_count: string; last_message_at: string | null; sync_status: string;
+    }>(SQL, [accountId, namePattern, namePattern]);
+    console.log(`[GET /chats] account=${accountId} count=${rows.length}`);
+    return json(rows.map(r => ({
+      ...r,
+      message_count: parseInt(r.message_count, 10),
+      last_message_at: r.last_message_at !== null ? parseInt(r.last_message_at, 10) : null,
+    })));
   } catch (err) {
     console.error('[GET /chats] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
   }
-
-  console.log(`[GET /chats] account=${accountId} count=${results.length}`);
-  return json(results);
 }
 
 async function handleStats(_request: Request, env: Env, accountId: string): Promise<Response> {
@@ -496,28 +528,39 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
       SUM(CASE WHEN direction = 'out' THEN 1 ELSE 0 END) AS sent_count,
       SUM(CASE WHEN direction = 'in' THEN 1 ELSE 0 END) AS received_count
     FROM messages
-    WHERE account_id = ?
+    WHERE account_id = $1
   `.trim();
 
-  const CONTACT_SQL = `SELECT COUNT(*) AS total_contacts FROM contacts WHERE account_id = ?`;
+  const CONTACT_SQL = `SELECT COUNT(*) AS total_contacts FROM contacts WHERE account_id = $1`;
 
+  const pool = getPool(env);
   try {
-    const [msgResult, contactResult] = await env.DB.batch([
-      env.DB.prepare(SQL).bind(accountId),
-      env.DB.prepare(CONTACT_SQL).bind(accountId),
+    const [msgResult, contactResult] = await Promise.all([
+      pool.query<{
+        total_messages: string;
+        total_chats: string;
+        earliest_message_at: number | null;
+        latest_message_at: number | null;
+        deleted_count: string;
+        edited_count: string;
+        sent_count: string;
+        received_count: string;
+      }>(SQL, [accountId]),
+      pool.query<{ total_contacts: string }>(CONTACT_SQL, [accountId]),
     ]);
-    const stats = msgResult.results[0] as {
-      total_messages: number;
-      total_chats: number;
-      earliest_message_at: number | null;
-      latest_message_at: number | null;
-      deleted_count: number;
-      edited_count: number;
-      sent_count: number;
-      received_count: number;
-    };
-    const contacts = contactResult.results[0] as { total_contacts: number };
-    return json({ ...stats, total_contacts: contacts.total_contacts });
+    const stats = msgResult.rows[0];
+    const total_contacts = parseInt(contactResult.rows[0].total_contacts, 10);
+    return json({
+      total_messages: parseInt(stats.total_messages, 10),
+      total_chats: parseInt(stats.total_chats, 10),
+      earliest_message_at: stats.earliest_message_at,
+      latest_message_at: stats.latest_message_at,
+      deleted_count: parseInt(stats.deleted_count, 10),
+      edited_count: parseInt(stats.edited_count, 10),
+      sent_count: parseInt(stats.sent_count, 10),
+      received_count: parseInt(stats.received_count, 10),
+      total_contacts,
+    });
   } catch (err) {
     console.error('[GET /stats] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
@@ -525,9 +568,13 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
 }
 
 async function handleGetConfig(_request: Request, env: Env): Promise<Response> {
+  const pool = getPool(env);
   try {
-    const row = await env.DB.prepare(`SELECT value FROM global_config WHERE key = 'sync_mode'`).first<{ value: string }>();
-    return json({ sync_mode: row?.value ?? 'all' });
+    const { rows } = await pool.query<{ value: string }>(
+      `SELECT value FROM global_config WHERE key = 'sync_mode'`,
+      [],
+    );
+    return json({ sync_mode: rows[0]?.value ?? 'all' });
   } catch (err) {
     console.error('[GET /config] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
@@ -543,8 +590,12 @@ async function handlePostConfig(request: Request, env: Env): Promise<Response> {
     return json({ ok: false, error: `sync_mode must be one of: ${VALID_SYNC_MODES.join(', ')}` }, 400);
   }
 
+  const pool = getPool(env);
   try {
-    await env.DB.prepare(`INSERT INTO global_config (key, value) VALUES ('sync_mode', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(syncMode).run();
+    await pool.query(
+      `INSERT INTO global_config (key, value) VALUES ('sync_mode', $1) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value`,
+      [syncMode],
+    );
     return json({ ok: true });
   } catch (err) {
     console.error('[POST /config] DB error', err);
@@ -553,11 +604,13 @@ async function handlePostConfig(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleGetChatsConfig(_request: Request, env: Env, accountId: string): Promise<Response> {
+  const pool = getPool(env);
   try {
-    const { results } = await env.DB.prepare(
-      `SELECT tg_chat_id, chat_name, sync, updated_at FROM chat_config WHERE account_id = ? ORDER BY updated_at DESC`
-    ).bind(accountId).all();
-    return json(results);
+    const { rows } = await pool.query(
+      `SELECT tg_chat_id, chat_name, sync, updated_at FROM chat_config WHERE account_id = $1 ORDER BY updated_at DESC`,
+      [accountId],
+    );
+    return json(rows);
   } catch (err) {
     console.error('[GET /chats/config] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
@@ -576,11 +629,17 @@ async function handlePostChatsConfig(request: Request, env: Env, accountId: stri
     return json({ ok: false, error: `sync must be 'include' or 'exclude'` }, 400);
   }
 
+  const pool = getPool(env);
   try {
-    await env.DB.prepare(`
-      INSERT INTO chat_config (account_id, tg_chat_id, chat_name, sync, updated_at) VALUES (?, ?, ?, ?, unixepoch())
-      ON CONFLICT(account_id, tg_chat_id) DO UPDATE SET chat_name = excluded.chat_name, sync = excluded.sync, updated_at = unixepoch()
-    `.trim()).bind(accountId, b.tg_chat_id, b.chat_name ?? null, b.sync).run();
+    await pool.query(
+      `INSERT INTO chat_config (account_id, tg_chat_id, chat_name, sync, updated_at)
+       VALUES ($1, $2, $3, $4, EXTRACT(EPOCH FROM NOW())::BIGINT)
+       ON CONFLICT(account_id, tg_chat_id) DO UPDATE SET
+         chat_name = EXCLUDED.chat_name,
+         sync = EXCLUDED.sync,
+         updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT`,
+      [accountId, b.tg_chat_id, b.chat_name ?? null, b.sync],
+    );
     return json({ ok: true });
   } catch (err) {
     console.error('[POST /chats/config] DB error', err);
@@ -589,8 +648,12 @@ async function handlePostChatsConfig(request: Request, env: Env, accountId: stri
 }
 
 async function handleDeleteChatsConfig(tgChatId: string, env: Env, accountId: string): Promise<Response> {
+  const pool = getPool(env);
   try {
-    await env.DB.prepare(`DELETE FROM chat_config WHERE account_id = ? AND tg_chat_id = ?`).bind(accountId, tgChatId).run();
+    await pool.query(
+      `DELETE FROM chat_config WHERE account_id = $1 AND tg_chat_id = $2`,
+      [accountId, tgChatId],
+    );
     return json({ ok: true });
   } catch (err) {
     console.error('[DELETE /chats/config] DB error', err);
@@ -626,7 +689,7 @@ async function handleDeleted(request: Request, env: Env, accountId: string): Pro
     return json({ ok: false, error: 'messages array must have 1–500 items' }, 400);
   }
 
-  // W-8: validate each item individually — unvalidated cast could bind undefined/null
+  // W-8: validate each item individually
   for (let i = 0; i < rawMessages.length; i++) {
     const m = rawMessages[i] as Record<string, unknown>;
     if (typeof m.tg_chat_id !== 'string' || typeof m.tg_message_id !== 'string') {
@@ -640,20 +703,28 @@ async function handleDeleted(request: Request, env: Env, accountId: string): Pro
 
   console.log(`[POST /deleted] account=${accountId} count=${messages.length}`);
 
-  const SQL = `UPDATE messages SET is_deleted = 1, deleted_at = unixepoch() WHERE account_id = ? AND tg_chat_id = ? AND tg_message_id = ?`;
-  const stmts = messages.map((m) =>
-    env.DB.prepare(SQL).bind(accountId, m.tg_chat_id, m.tg_message_id),
-  );
+  // Single UPDATE with UNNEST — one round trip for up to 500 deletions.
+  const SQL = `
+    UPDATE messages
+    SET is_deleted = 1, deleted_at = EXTRACT(EPOCH FROM NOW())::BIGINT
+    WHERE account_id = $1
+      AND (tg_chat_id, tg_message_id) IN (SELECT * FROM UNNEST($2::text[], $3::text[]))
+  `.trim();
 
-  let results: D1Result[];
+  const pool = getPool(env);
+  let result;
   try {
-    results = await env.DB.batch(stmts);
+    result = await pool.query(SQL, [
+      accountId,
+      messages.map(m => m.tg_chat_id),
+      messages.map(m => m.tg_message_id),
+    ]);
   } catch (err) {
-    console.error('[POST /deleted] DB batch error', err);
+    console.error('[POST /deleted] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  const marked = results.filter(r => r.meta.rows_written > 0).length;
+  const marked = result.rowCount ?? 0;
   console.log(`[POST /deleted] marked=${marked}`);
   return json({ marked });
 }
@@ -678,27 +749,29 @@ async function handleBackfillSeed(request: Request, env: Env, accountId: string)
 
   console.log(`[POST /backfill/seed] account=${accountId} count=${dialogs.length}`);
 
-  const SQL = `INSERT OR IGNORE INTO backfill_state (account_id, tg_chat_id, chat_name, total_messages, status) VALUES (?, ?, ?, ?, 'pending')`;
+  // Single UNNEST INSERT — one round trip for up to 500 dialogs.
+  const SQL = `
+    INSERT INTO backfill_state (account_id, tg_chat_id, chat_name, total_messages, status)
+    SELECT $1, v.tg_chat_id, v.chat_name, v.total_messages, 'pending'
+    FROM UNNEST($2::text[], $3::text[], $4::bigint[]) AS v(tg_chat_id, chat_name, total_messages)
+    ON CONFLICT DO NOTHING
+  `.trim();
 
-  const stmts = dialogs.map((d) =>
-    env.DB.prepare(SQL).bind(accountId, d.tg_chat_id, d.chat_name ?? null, d.total_messages ?? null),
-  );
-
-  let results: D1Result[];
+  const pool = getPool(env);
+  let result;
   try {
-    results = await env.DB.batch(stmts);
+    result = await pool.query(SQL, [
+      accountId,
+      dialogs.map(d => d.tg_chat_id),
+      dialogs.map(d => d.chat_name ?? null),
+      dialogs.map(d => d.total_messages ?? null),
+    ]);
   } catch (err) {
-    console.error('[POST /backfill/seed] DB batch error', err);
+    console.error('[POST /backfill/seed] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  let seeded = 0;
-  for (const result of results) {
-    if (result.meta.rows_written > 0) {
-      seeded++;
-    }
-  }
-
+  const seeded = result.rowCount ?? 0;
   console.log(`[POST /backfill/seed] seeded=${seeded}`);
   return json({ seeded });
 }
@@ -707,14 +780,15 @@ async function handleBackfillPending(_request: Request, env: Env, accountId: str
   const SQL = `
     SELECT tg_chat_id, chat_name, total_messages, fetched_messages, oldest_message_id, status
     FROM backfill_state
-    WHERE account_id = ? AND status IN ('pending', 'in_progress')
+    WHERE account_id = $1 AND status IN ('pending', 'in_progress')
     ORDER BY tg_chat_id
   `.trim();
 
+  const pool = getPool(env);
   try {
-    const { results } = await env.DB.prepare(SQL).bind(accountId).all();
-    console.log(`[GET /backfill/pending] account=${accountId} count=${results.length}`);
-    return json(results);
+    const { rows } = await pool.query(SQL, [accountId]);
+    console.log(`[GET /backfill/pending] account=${accountId} count=${rows.length}`);
+    return json(rows);
   } catch (err) {
     console.error('[GET /backfill/pending] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
@@ -741,29 +815,37 @@ async function handleBackfillProgress(request: Request, env: Env, accountId: str
 
   const sets: string[] = [];
   const binds: (string | number | null)[] = [];
+  let p = 0;
+  const next = () => `$${++p}`;
 
-  // W-7: validate each field type before accepting — prevents storage exhaustion and silent coercions
-  if (b.status !== undefined) { sets.push('status = ?'); binds.push(b.status as string); }
+  // W-7: validate each field type before accepting
+  if (b.status !== undefined) { sets.push(`status = ${next()}`); binds.push(b.status as string); }
   if (b.oldest_message_id !== undefined) {
     if (typeof b.oldest_message_id !== 'number' || !Number.isInteger(b.oldest_message_id)) {
       return json({ ok: false, error: 'oldest_message_id must be an integer' }, 400);
     }
-    sets.push('oldest_message_id = ?'); binds.push(b.oldest_message_id);
+    sets.push(`oldest_message_id = ${next()}`); binds.push(b.oldest_message_id);
   }
   if (b.fetched_messages !== undefined) {
     if (typeof b.fetched_messages !== 'number' || !Number.isInteger(b.fetched_messages)) {
       return json({ ok: false, error: 'fetched_messages must be an integer' }, 400);
     }
-    sets.push('fetched_messages = ?'); binds.push(b.fetched_messages);
+    sets.push(`fetched_messages = ${next()}`); binds.push(b.fetched_messages);
   }
   if (b.last_error !== undefined) {
     if (typeof b.last_error !== 'string') {
       return json({ ok: false, error: 'last_error must be a string' }, 400);
     }
-    sets.push('last_error = ?'); binds.push((b.last_error as string).slice(0, 1000)); // cap at 1000 chars
+    sets.push(`last_error = ${next()}`); binds.push((b.last_error as string).slice(0, 1000));
   }
-  if (b.status === 'in_progress') { sets.push('started_at = COALESCE(started_at, unixepoch())'); }
-  if (b.status === 'complete' || b.status === 'failed') { sets.push('completed_at = unixepoch()'); }
+  if (b.status === 'in_progress') {
+    sets.push(`started_at = COALESCE(started_at, ${next()})`);
+    binds.push(Math.floor(Date.now() / 1000));
+  }
+  if (b.status === 'complete' || b.status === 'failed') {
+    sets.push(`completed_at = ${next()}`);
+    binds.push(Math.floor(Date.now() / 1000));
+  }
 
   if (sets.length === 0) {
     return json({ ok: false, error: 'nothing to update' }, 400);
@@ -772,10 +854,13 @@ async function handleBackfillProgress(request: Request, env: Env, accountId: str
   binds.push(accountId);
   binds.push(b.tg_chat_id as string);
 
+  const SQL = `UPDATE backfill_state SET ${sets.join(', ')} WHERE account_id = ${next()} AND tg_chat_id = ${next()}`;
+
   console.log(`[POST /backfill/progress] account=${accountId} sets=${sets.length}`);
 
+  const pool = getPool(env);
   try {
-    await env.DB.prepare(`UPDATE backfill_state SET ${sets.join(', ')} WHERE account_id = ? AND tg_chat_id = ?`).bind(...binds).run();
+    await pool.query(SQL, binds);
     return json({ ok: true });
   } catch (err) {
     console.error('[POST /backfill/progress] DB error', err);
@@ -920,8 +1005,6 @@ async function dispatchMcpTool(
 
   if (name === 'history') {
     // W-11: use ASC ordering with after_ keyset cursors so pages advance forward in time.
-    // The old approach (reverse DESC results + before_ cursor) sent page 2 to older messages
-    // than page 1 — backwards for a chronological reader.
     if (typeof args.chat_id !== 'string') throw new Error('chat_id is required');
     const chatId = args.chat_id;
     const limit = Math.min(typeof args.limit === 'number' ? args.limit : 20, 50);
@@ -929,11 +1012,8 @@ async function dispatchMcpTool(
     const afterId = typeof args.after_id === 'number' ? args.after_id : null;
 
     const keysetClause = afterSentAt !== null && afterId !== null
-      ? `AND (sent_at > ? OR (sent_at = ? AND id > ?))`
+      ? `AND (sent_at > $3 OR (sent_at = $3 AND id > $4))`
       : ``;
-    const keysetBinds: (number | string)[] = afterSentAt !== null && afterId !== null
-      ? [afterSentAt, afterSentAt, afterId]
-      : [];
 
     const SQL = `
       SELECT id, tg_message_id, tg_chat_id, chat_name, chat_type,
@@ -941,23 +1021,25 @@ async function dispatchMcpTool(
              direction, message_type, text, media_type,
              reply_to_message_id, forwarded_from_name, sent_at
       FROM messages
-      WHERE account_id = ?
-        AND tg_chat_id = ?
+      WHERE account_id = $1
+        AND tg_chat_id = $2
         AND is_deleted = 0
         ${keysetClause}
       ORDER BY sent_at ASC, id ASC
-      LIMIT ?
+      LIMIT $${afterSentAt !== null && afterId !== null ? 5 : 3}
     `.trim();
 
-    const { results } = await env.DB.prepare(SQL)
-      .bind(accountId, chatId, ...keysetBinds, limit)
-      .all();
+    const pool = getPool(env);
+    const binds: unknown[] = afterSentAt !== null && afterId !== null
+      ? [accountId, chatId, afterSentAt, afterId, limit]
+      : [accountId, chatId, limit];
 
-    const rows = results as Array<Record<string, unknown> & { id: number; sent_at: number }>;
-    const lastRow = rows.length === limit ? rows[rows.length - 1] : null;
+    const { rows } = await pool.query(SQL, binds);
+    const typedRows = rows as Array<Record<string, unknown> & { id: number; sent_at: number }>;
+    const lastRow = typedRows.length === limit ? typedRows[typedRows.length - 1] : null;
 
     return {
-      results: rows.map(truncateText),
+      results: typedRows.map(truncateText),
       limit,
       next_after_id: lastRow?.id ?? null,
       next_after_sent_at: lastRow?.sent_at ?? null,
@@ -965,18 +1047,38 @@ async function dispatchMcpTool(
   }
 
   if (name === 'contacts') {
-    const req = new Request(`${baseUrl}/contacts`);
-    const res = await handleGetContacts(req, env, accountId);
-    const data = await res.json() as Array<Record<string, unknown>>;
-    if (typeof args.search === 'string' && args.search.trim() !== '') {
-      const term = args.search.toLowerCase();
-      return data.filter((c) => {
-        const name = String(c.first_name ?? '') + ' ' + String(c.last_name ?? '');
-        const username = String(c.username ?? '');
-        return name.toLowerCase().includes(term) || username.toLowerCase().includes(term);
-      });
-    }
-    return data;
+    const search = typeof args.search === 'string' && args.search.trim() !== ''
+      ? `%${args.search.trim()}%`
+      : null;
+    const SQL = `
+      SELECT
+        c.tg_user_id,
+        c.phone,
+        c.username,
+        c.first_name,
+        c.last_name,
+        c.is_mutual,
+        c.is_bot,
+        COUNT(m.id) AS message_count,
+        MAX(m.sent_at) AS last_seen
+      FROM contacts c
+      LEFT JOIN messages m ON m.account_id = c.account_id AND m.sender_id = c.tg_user_id
+      WHERE c.account_id = $1
+        AND ($2::text IS NULL OR c.first_name ILIKE $2 OR c.last_name ILIKE $2 OR c.username ILIKE $2)
+      GROUP BY c.tg_user_id, c.phone, c.username, c.first_name, c.last_name, c.is_mutual, c.is_bot
+      ORDER BY last_seen DESC NULLS LAST
+    `.trim();
+    const { rows } = await getPool(env).query<{
+      tg_user_id: string; phone: string | null; username: string | null;
+      first_name: string | null; last_name: string | null;
+      is_mutual: number; is_bot: number;
+      message_count: string; last_seen: string | null;
+    }>(SQL, [accountId, search]);
+    return rows.map(r => ({
+      ...r,
+      message_count: parseInt(r.message_count, 10),
+      last_seen: r.last_seen !== null ? parseInt(r.last_seen, 10) : null,
+    }));
   }
 
   if (name === 'recent') {
@@ -1198,8 +1300,6 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
 // ---------------------------------------------------------------------------
 
 // W-2: account ID must be 'primary' or a numeric Telegram user ID (up to 20 digits).
-// This blocks cross-account enumeration attacks — any authenticated caller who supplies
-// an arbitrary X-Account-ID header could otherwise read/write another account's data.
 function isValidAccountId(id: string): boolean {
   return id === 'primary' || /^\d{1,20}$/.test(id);
 }
@@ -1215,7 +1315,6 @@ async function fetch(request: Request, env: Env): Promise<Response> {
 
   // For /mcp: the claude.ai connector dialog only supports a URL — no custom headers.
   // Fall back to ?token= and ?account_id= query params so connector URLs keep working.
-  // All other endpoints are server-to-server (GramJS) and must use headers only.
   const tokenOverride = isMcp ? url.searchParams.get('token') : null;
   const accountIdOverride = isMcp ? url.searchParams.get('account_id') : null;
 
@@ -1244,29 +1343,33 @@ async function fetch(request: Request, env: Env): Promise<Response> {
 // Scheduled handler (cron backup)
 // ---------------------------------------------------------------------------
 
-async function* streamMessages(db: D1Database): AsyncGenerator<string> {
+async function* streamMessages(pool: Pool): AsyncGenerator<string> {
   // W-12: use keyset pagination (WHERE id > lastId) instead of OFFSET.
-  // OFFSET is unsafe under concurrent inserts: new rows can shift the window,
-  // causing rows to be skipped or duplicated between pages.
   const batchSize = 1000;
   let lastId = 0;
   while (true) {
-    const { results } = await db
-      .prepare('SELECT * FROM messages WHERE id > ? ORDER BY id LIMIT ?')
-      .bind(lastId, batchSize)
-      .all();
-    if (results.length === 0) break;
-    for (const row of results) {
+    const { rows } = await pool.query(
+      `SELECT id, account_id, tg_message_id, tg_chat_id, chat_name, chat_type,
+              sender_id, sender_username, sender_first_name, sender_last_name,
+              direction, message_type, text, media_type, media_file_id,
+              reply_to_message_id, forwarded_from_id, forwarded_from_name,
+              sent_at, edit_date, original_text, is_deleted, deleted_at, indexed_at
+       FROM messages WHERE id > $1 ORDER BY id LIMIT $2`,
+      [lastId, batchSize],
+    );
+    if (rows.length === 0) break;
+    for (const row of rows) {
       yield JSON.stringify(row) + '\n';
     }
-    lastId = (results[results.length - 1] as { id: number }).id;
-    if (results.length < batchSize) break;
+    lastId = (rows[rows.length - 1] as { id: number }).id;
+    if (rows.length < batchSize) break;
   }
 }
 
 async function runBackup(env: Env): Promise<void> {
   const date = new Date().toISOString().slice(0, 10);
   const key = `backup-${date}.ndjson`;
+  const pool = getPool(env);
 
   try {
     const encoder = new TextEncoder();
@@ -1275,7 +1378,7 @@ async function runBackup(env: Env): Promise<void> {
     const stream = new ReadableStream({
       async start(controller) {
         try {
-          for await (const line of streamMessages(env.DB)) {
+          for await (const line of streamMessages(pool)) {
             controller.enqueue(encoder.encode(line));
             rowCount++;
           }
@@ -1296,24 +1399,30 @@ async function runBackup(env: Env): Promise<void> {
 }
 
 async function runStorageCheck(env: Env): Promise<void> {
+  const pool = getPool(env);
   try {
-    const row = await env.DB.prepare(
+    const { rows } = await pool.query<{ total_messages: string; text_bytes: string }>(
       `SELECT COUNT(*) AS total_messages, SUM(LENGTH(COALESCE(text, ''))) AS text_bytes FROM messages`,
-    ).first<{ total_messages: number; text_bytes: number }>();
+      [],
+    );
 
+    const row = rows[0];
     if (!row) return;
 
-    // Conservative estimate: 1 KB per row (covers FTS5 index overhead)
-    const estimatedBytes = row.total_messages * 1024;
-    const estimatedGB = (estimatedBytes / 1_073_741_824).toFixed(2);
-    const textGB = ((row.text_bytes ?? 0) / 1_073_741_824).toFixed(2);
+    const totalMessages = parseInt(row.total_messages, 10);
+    const textBytes = parseInt(row.text_bytes ?? '0', 10);
 
-    const level = estimatedBytes > 7 * 1_073_741_824 ? 'WARNING' : 'INFO';
+    // Conservative estimate: 1 KB per row overhead
+    const estimatedBytes = totalMessages * 1024;
+    const estimatedGB = (estimatedBytes / 1_073_741_824).toFixed(2);
+    const textGB = (textBytes / 1_073_741_824).toFixed(2);
+
+    const level = estimatedBytes > 50 * 1_073_741_824 ? 'WARNING' : 'INFO';
     console.log(
-      `[storage-check] ${level} total_messages=${row.total_messages} text_gb=${textGB} estimated_gb=${estimatedGB}`,
+      `[storage-check] ${level} total_messages=${totalMessages} text_gb=${textGB} estimated_gb=${estimatedGB}`,
     );
     if (level === 'WARNING') {
-      console.warn('[storage-check] approaching D1 10 GB limit — consider pruning or exporting old messages');
+      console.warn('[storage-check] large dataset — consider archiving old messages');
     }
   } catch (err) {
     console.error('[storage-check] failed', err);
@@ -1321,7 +1430,6 @@ async function runStorageCheck(env: Env): Promise<void> {
 }
 
 // W-13: match both cron expressions explicitly to avoid accidental backup runs
-// if a new cron is added later. Unknown expressions log an error instead of defaulting.
 const CRON_DAILY_BACKUP        = '0 3 * * *';   // matches wrangler.toml
 const CRON_MONTHLY_STORAGE_CHK = '0 4 1 * *';   // matches wrangler.toml
 

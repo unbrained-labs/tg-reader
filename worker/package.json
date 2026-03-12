@@ -3,12 +3,15 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "wrangler dev --local",
+    "dev": "wrangler dev --remote",
     "deploy": "wrangler deploy",
     "type-check": "tsc --noEmit"
   },
+  "dependencies": {
+    "@neondatabase/serverless": "^0.10.4"
+  },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240512.0",
+    "@cloudflare/workers-types": "^4.20250430.0",
     "typescript": "^5.4.0",
     "wrangler": "^3.57.0"
   }
