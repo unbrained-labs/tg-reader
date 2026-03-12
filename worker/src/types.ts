@@ -1,6 +1,8 @@
+import type { Hyperdrive } from '@cloudflare/workers-types';
+
 // Cloudflare Worker environment bindings
 export interface Env {
-  DB: D1Database;
+  HYPERDRIVE: Hyperdrive;
   BACKUP_BUCKET: R2Bucket;
   INGEST_TOKEN: string;
 }
@@ -26,6 +28,6 @@ export interface Message {
   sent_at: number;              // Unix epoch seconds — always integer, never new Date()
   edit_date?: number;
   original_text?: string;       // text before first edit; undefined/null if never edited
-  is_deleted?: number;
+  is_deleted?: number;          // SMALLINT 0/1
   deleted_at?: number;
 }
