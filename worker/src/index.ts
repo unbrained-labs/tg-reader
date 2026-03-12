@@ -40,10 +40,10 @@ async function timingSafeTokenEqual(provided: string, expected: string): Promise
   return diff === 0;
 }
 
-// W-1: accept token only from X-Ingest-Token header — never from query string.
-// W-3: use timing-safe comparison.
-async function authenticate(request: Request, env: Env): Promise<Response | null> {
-  const token = request.headers.get('X-Ingest-Token');
+// W-1/W-3: timing-safe token check. tokenOverride lets /mcp pass a query-string token
+// for claude.ai connectors, which embed credentials in the URL (no custom header support).
+async function authenticate(request: Request, env: Env, tokenOverride?: string | null): Promise<Response | null> {
+  const token = tokenOverride ?? request.headers.get('X-Ingest-Token');
   if (!token || !(await timingSafeTokenEqual(token, env.INGEST_TOKEN))) {
     return json({ ok: false, error: 'Unauthorized' }, 401);
   }
@@ -202,10 +202,15 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
   const qRaw = p.get('q');
   // Sanitize FTS5 query: quote each token individually to prevent operator injection
   // while preserving multi-word AND semantics ("hello" "world" = hello AND world).
-  // W-9: enforce min token length of 2 to prevent unbounded FTS prefix scans
-  // (e.g. q=a would match every word in the index without this guard).
-  const q = qRaw !== null
-    ? qRaw.trim().split(/\s+/).filter(t => t.length >= 2).map(t => '"' + t.replace(/"/g, '""') + '"*').join(' ') || null
+  // W-9: enforce min token length of 2 to prevent unbounded FTS prefix scans.
+  // If q was provided but every token is too short, return an error rather than
+  // silently falling through to an unfiltered B-tree scan.
+  const qTokens = qRaw !== null ? qRaw.trim().split(/\s+/).filter(t => t.length >= 2) : null;
+  if (qRaw !== null && qRaw.trim() !== '' && qTokens !== null && qTokens.length === 0) {
+    return json({ ok: false, error: 'Search query must contain at least one term with 2 or more characters' }, 400);
+  }
+  const q = qTokens !== null && qTokens.length > 0
+    ? qTokens.map(t => '"' + t.replace(/"/g, '""') + '"*').join(' ')
     : null;
   const chatId = p.get('chat_id') ?? null;
   const senderUsername = p.get('sender_username') ?? null;
@@ -235,7 +240,8 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
     let countStmt: D1PreparedStatement;
 
     if (q !== null) {
-      // FTS5 path: sort by relevance rank first, then recency as tiebreaker
+      // FTS5 path: sort by recency only — rank dropped because it is a per-query BM25
+      // score that is not stable across requests and cannot be included in a keyset cursor.
       const SQL = `
         SELECT m.id, m.tg_message_id, m.tg_chat_id, m.chat_name, m.chat_type,
                m.sender_id, m.sender_username, m.sender_first_name, m.sender_last_name,
@@ -251,7 +257,7 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
           AND m.sent_at >= ?
           AND m.sent_at <= ?
           ${keysetClause}
-        ORDER BY messages_fts.rank, m.sent_at DESC, m.id DESC
+        ORDER BY m.sent_at DESC, m.id DESC
         LIMIT ?
       `.trim();
       // W-14: include keysetClause in COUNT so total reflects remaining results, not all results
@@ -1204,11 +1210,19 @@ async function fetch(request: Request, env: Env): Promise<Response> {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
 
-  const authError = await authenticate(request, env);
+  const url = new URL(request.url);
+  const isMcp = url.pathname === '/mcp';
+
+  // For /mcp: the claude.ai connector dialog only supports a URL — no custom headers.
+  // Fall back to ?token= and ?account_id= query params so connector URLs keep working.
+  // All other endpoints are server-to-server (GramJS) and must use headers only.
+  const tokenOverride = isMcp ? url.searchParams.get('token') : null;
+  const accountIdOverride = isMcp ? url.searchParams.get('account_id') : null;
+
+  const authError = await authenticate(request, env, tokenOverride);
   if (authError) {
     // W-15: add CORS headers to auth errors on /mcp so browser callers see a readable 401
-    const url = new URL(request.url);
-    if (url.pathname === '/mcp') {
+    if (isMcp) {
       return new Response(authError.body, {
         status: authError.status,
         headers: { ...Object.fromEntries(authError.headers.entries()), ...CORS_HEADERS },
@@ -1217,8 +1231,8 @@ async function fetch(request: Request, env: Env): Promise<Response> {
     return authError;
   }
 
-  // W-1: removed query-string account_id fallback — accept from header only
-  const accountId = request.headers.get('X-Account-ID') ?? 'primary';
+  // W-2: account ID from header; query-string fallback for /mcp connector URLs only
+  const accountId = request.headers.get('X-Account-ID') ?? accountIdOverride ?? 'primary';
   if (!isValidAccountId(accountId)) {
     return json({ ok: false, error: 'Invalid X-Account-ID: must be "primary" or a numeric Telegram user ID' }, 400);
   }
