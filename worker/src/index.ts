@@ -15,10 +15,36 @@ function json(data: unknown, status = 200): Response {
 // Auth middleware
 // ---------------------------------------------------------------------------
 
-function authenticate(request: Request, env: Env): Response | null {
-  const url = new URL(request.url);
-  const token = request.headers.get('X-Ingest-Token') ?? url.searchParams.get('token');
-  if (!token || token !== env.INGEST_TOKEN) {
+// W-3: constant-time token comparison to prevent timing side-channel attacks.
+// Signs both strings with HMAC-SHA256 using a fresh ephemeral key, then XORs
+// the fixed-length digests — the loop always runs the same number of iterations.
+async function timingSafeTokenEqual(provided: string, expected: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const a = enc.encode(provided);
+  const b = enc.encode(expected);
+  // Length is not secret (token length is fixed), but we still guard it
+  if (a.byteLength !== b.byteLength) return false;
+  const key = await crypto.subtle.generateKey(
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const [sigA, sigB] = await Promise.all([
+    crypto.subtle.sign('HMAC', key, a),
+    crypto.subtle.sign('HMAC', key, b),
+  ]);
+  const va = new Uint8Array(sigA);
+  const vb = new Uint8Array(sigB);
+  let diff = 0;
+  for (let i = 0; i < va.length; i++) diff |= va[i] ^ vb[i];
+  return diff === 0;
+}
+
+// W-1: accept token only from X-Ingest-Token header — never from query string.
+// W-3: use timing-safe comparison.
+async function authenticate(request: Request, env: Env): Promise<Response | null> {
+  const token = request.headers.get('X-Ingest-Token');
+  if (!token || !(await timingSafeTokenEqual(token, env.INGEST_TOKEN))) {
     return json({ ok: false, error: 'Unauthorized' }, 401);
   }
   return null;
@@ -55,11 +81,11 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
     );
   }
 
-  // Validate required fields on each message
+  // Validate required fields on each message (S-1: tg_message_id is now string)
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i] as Record<string, unknown>;
-    if (typeof m.tg_message_id !== 'number' || typeof m.tg_chat_id !== 'string' || typeof m.sent_at !== 'number') {
-      return json({ ok: false, error: `messages[${i}] missing required fields: tg_message_id (number), tg_chat_id (string), sent_at (number)` }, 400);
+    if (typeof m.tg_message_id !== 'string' || typeof m.tg_chat_id !== 'string' || typeof m.sent_at !== 'number') {
+      return json({ ok: false, error: `messages[${i}] missing required fields: tg_message_id (string), tg_chat_id (string), sent_at (number)` }, 400);
     }
   }
 
@@ -79,8 +105,21 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
       edit_date = excluded.edit_date,
       is_deleted = excluded.is_deleted,
       deleted_at = excluded.deleted_at,
-      chat_name = excluded.chat_name,
-      chat_type = excluded.chat_type,
+      -- W-4/C-2: COALESCE so a richer incoming value wins over null,
+      -- but an existing non-null value is never overwritten by null.
+      -- Backfill sends null chat_type; live listener sends the correct type.
+      chat_name         = COALESCE(excluded.chat_name, messages.chat_name),
+      chat_type         = COALESCE(excluded.chat_type, messages.chat_type),
+      sender_id         = COALESCE(excluded.sender_id, messages.sender_id),
+      sender_username   = COALESCE(excluded.sender_username, messages.sender_username),
+      sender_first_name = COALESCE(excluded.sender_first_name, messages.sender_first_name),
+      sender_last_name  = COALESCE(excluded.sender_last_name, messages.sender_last_name),
+      direction         = COALESCE(excluded.direction, messages.direction),
+      message_type      = COALESCE(excluded.message_type, messages.message_type),
+      media_type        = COALESCE(excluded.media_type, messages.media_type),
+      reply_to_message_id  = COALESCE(excluded.reply_to_message_id, messages.reply_to_message_id),
+      forwarded_from_id    = COALESCE(excluded.forwarded_from_id, messages.forwarded_from_id),
+      forwarded_from_name  = COALESCE(excluded.forwarded_from_name, messages.forwarded_from_name),
       original_text = CASE
         WHEN excluded.edit_date IS NOT NULL
         THEN COALESCE(messages.original_text, messages.text)
@@ -123,19 +162,21 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  // Count inserted vs skipped by rows_written
-  let inserted = 0;
-  let skipped = 0;
+  // W-5: rows_written > 0 for both INSERT and UPDATE — rename to written/noop to
+  // avoid implying only new rows are counted. A true no-op (all columns unchanged)
+  // may yield rows_written=0, counted as noop.
+  let written = 0;
+  let noop = 0;
   for (const result of results) {
     if (result.meta.rows_written > 0) {
-      inserted++;
+      written++;
     } else {
-      skipped++;
+      noop++;
     }
   }
 
-  console.log(`[POST /ingest] inserted=${inserted} skipped=${skipped}`);
-  return json({ inserted, skipped });
+  console.log(`[POST /ingest] written=${written} noop=${noop}`);
+  return json({ written, noop });
 }
 
 const VALID_SYNC_MODES = ['all', 'blacklist', 'whitelist', 'none'] as const;
@@ -161,8 +202,10 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
   const qRaw = p.get('q');
   // Sanitize FTS5 query: quote each token individually to prevent operator injection
   // while preserving multi-word AND semantics ("hello" "world" = hello AND world).
+  // W-9: enforce min token length of 2 to prevent unbounded FTS prefix scans
+  // (e.g. q=a would match every word in the index without this guard).
   const q = qRaw !== null
-    ? qRaw.trim().split(/\s+/).filter(Boolean).map(t => '"' + t.replace(/"/g, '""') + '"*').join(' ') || null
+    ? qRaw.trim().split(/\s+/).filter(t => t.length >= 2).map(t => '"' + t.replace(/"/g, '""') + '"*').join(' ') || null
     : null;
   const chatId = p.get('chat_id') ?? null;
   const senderUsername = p.get('sender_username') ?? null;
@@ -211,6 +254,7 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
         ORDER BY messages_fts.rank, m.sent_at DESC, m.id DESC
         LIMIT ?
       `.trim();
+      // W-14: include keysetClause in COUNT so total reflects remaining results, not all results
       const COUNT_SQL = `
         SELECT COUNT(*) AS total
         FROM messages m
@@ -222,9 +266,10 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
           AND (m.sender_username = ? OR ? IS NULL)
           AND m.sent_at >= ?
           AND m.sent_at <= ?
+          ${keysetClause}
       `.trim();
       dataStmt = env.DB.prepare(SQL).bind(q, accountId, chatId, chatId, senderUsername, senderUsername, from, to, ...keysetBinds, limit);
-      countStmt = env.DB.prepare(COUNT_SQL).bind(q, accountId, chatId, chatId, senderUsername, senderUsername, from, to);
+      countStmt = env.DB.prepare(COUNT_SQL).bind(q, accountId, chatId, chatId, senderUsername, senderUsername, from, to, ...keysetBinds);
     } else {
       // B-tree path: no query, sort by recency
       const SQL = `
@@ -243,6 +288,7 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
         ORDER BY sent_at DESC, id DESC
         LIMIT ?
       `.trim();
+      // W-14: include plainKeysetClause in COUNT
       const COUNT_SQL = `
         SELECT COUNT(*) AS total
         FROM messages
@@ -252,9 +298,10 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
           AND (sender_username = ? OR ? IS NULL)
           AND sent_at >= ?
           AND sent_at <= ?
+          ${plainKeysetClause}
       `.trim();
       dataStmt = env.DB.prepare(SQL).bind(accountId, chatId, chatId, senderUsername, senderUsername, from, to, ...keysetBinds, limit);
-      countStmt = env.DB.prepare(COUNT_SQL).bind(accountId, chatId, chatId, senderUsername, senderUsername, from, to);
+      countStmt = env.DB.prepare(COUNT_SQL).bind(accountId, chatId, chatId, senderUsername, senderUsername, from, to, ...keysetBinds);
     }
 
     const [dataResult, countResult] = await env.DB.batch([dataStmt, countStmt]);
@@ -408,12 +455,15 @@ async function handleChats(request: Request, env: Env, accountId: string): Promi
     FROM messages m
     LEFT JOIN chat_config cc ON cc.account_id = m.account_id AND cc.tg_chat_id = m.tg_chat_id
     WHERE m.account_id = ?
-      AND (m.chat_name LIKE ? OR ? IS NULL)
+      AND (m.chat_name LIKE ? ESCAPE '\\' OR ? IS NULL)
     GROUP BY m.tg_chat_id
     ORDER BY last_message_at DESC
   `.trim();
 
-  const namePattern = nameFilter !== null ? `%${nameFilter}%` : null;
+  // W-6: escape LIKE metacharacters so % and _ in nameFilter are treated as literals
+  const namePattern = nameFilter !== null
+    ? `%${nameFilter.replace(/[%_\\]/g, '\\$&')}%`
+    : null;
 
   let results: unknown[];
   try {
@@ -565,10 +615,22 @@ async function handleDeleted(request: Request, env: Env, accountId: string): Pro
     return json({ ok: false, error: 'Body must be { messages: [{tg_chat_id, tg_message_id}][] }' }, 400);
   }
 
-  const messages = b.messages as Array<{ tg_chat_id: string; tg_message_id: number }>;
-  if (messages.length < 1 || messages.length > 500) {
+  const rawMessages = b.messages as Array<unknown>;
+  if (rawMessages.length < 1 || rawMessages.length > 500) {
     return json({ ok: false, error: 'messages array must have 1–500 items' }, 400);
   }
+
+  // W-8: validate each item individually — unvalidated cast could bind undefined/null
+  for (let i = 0; i < rawMessages.length; i++) {
+    const m = rawMessages[i] as Record<string, unknown>;
+    if (typeof m.tg_chat_id !== 'string' || typeof m.tg_message_id !== 'string') {
+      return json({
+        ok: false,
+        error: `messages[${i}] must have tg_chat_id (string) and tg_message_id (string)`,
+      }, 400);
+    }
+  }
+  const messages = rawMessages as Array<{ tg_chat_id: string; tg_message_id: string }>;
 
   console.log(`[POST /deleted] account=${accountId} count=${messages.length}`);
 
@@ -674,10 +736,26 @@ async function handleBackfillProgress(request: Request, env: Env, accountId: str
   const sets: string[] = [];
   const binds: (string | number | null)[] = [];
 
+  // W-7: validate each field type before accepting — prevents storage exhaustion and silent coercions
   if (b.status !== undefined) { sets.push('status = ?'); binds.push(b.status as string); }
-  if (b.oldest_message_id !== undefined) { sets.push('oldest_message_id = ?'); binds.push(b.oldest_message_id as number); }
-  if (b.fetched_messages !== undefined) { sets.push('fetched_messages = ?'); binds.push(b.fetched_messages as number); }
-  if (b.last_error !== undefined) { sets.push('last_error = ?'); binds.push(b.last_error as string); }
+  if (b.oldest_message_id !== undefined) {
+    if (typeof b.oldest_message_id !== 'number' || !Number.isInteger(b.oldest_message_id)) {
+      return json({ ok: false, error: 'oldest_message_id must be an integer' }, 400);
+    }
+    sets.push('oldest_message_id = ?'); binds.push(b.oldest_message_id);
+  }
+  if (b.fetched_messages !== undefined) {
+    if (typeof b.fetched_messages !== 'number' || !Number.isInteger(b.fetched_messages)) {
+      return json({ ok: false, error: 'fetched_messages must be an integer' }, 400);
+    }
+    sets.push('fetched_messages = ?'); binds.push(b.fetched_messages);
+  }
+  if (b.last_error !== undefined) {
+    if (typeof b.last_error !== 'string') {
+      return json({ ok: false, error: 'last_error must be a string' }, 400);
+    }
+    sets.push('last_error = ?'); binds.push((b.last_error as string).slice(0, 1000)); // cap at 1000 chars
+  }
   if (b.status === 'in_progress') { sets.push('started_at = COALESCE(started_at, unixepoch())'); }
   if (b.status === 'complete' || b.status === 'failed') { sets.push('completed_at = unixepoch()'); }
 
@@ -751,14 +829,14 @@ const MCP_TOOL_DEFINITIONS = [
   },
   {
     name: 'history',
-    description: 'Get messages from one chat in chronological order (oldest first). Use after chats gives you a chat_id. For finding specific content within a chat, prefer search with chat_id filter instead. Paginate by passing the smallest id from the previous page as before_id + its sent_at as before_sent_at.',
+    description: 'Get messages from one chat in chronological order (oldest first). Use after chats gives you a chat_id. For finding specific content within a chat, prefer search with chat_id filter instead. Paginate forward by passing next_after_id + next_after_sent_at from the previous response.',
     inputSchema: {
       type: 'object',
       properties: {
         chat_id: { type: 'string', description: 'Chat ID (string, may be negative for groups/channels). Get from the chats tool.' },
         limit: { type: 'number', description: 'Messages per page (default 20, max 50).' },
-        before_id: { type: 'number', description: 'Pagination: row id of the oldest message from the previous page. Paired with before_sent_at.' },
-        before_sent_at: { type: 'number', description: 'Pagination: sent_at (Unix seconds) of the oldest message from the previous page. Paired with before_id.' },
+        after_id: { type: 'number', description: 'Pagination: pass next_after_id from the previous response to get the next (newer) page.' },
+        after_sent_at: { type: 'number', description: 'Pagination: pass next_after_sent_at from the previous response. Must be paired with after_id.' },
       },
       required: ['chat_id'],
     },
@@ -835,21 +913,49 @@ async function dispatchMcpTool(
   }
 
   if (name === 'history') {
+    // W-11: use ASC ordering with after_ keyset cursors so pages advance forward in time.
+    // The old approach (reverse DESC results + before_ cursor) sent page 2 to older messages
+    // than page 1 — backwards for a chronological reader.
     if (typeof args.chat_id !== 'string') throw new Error('chat_id is required');
-    const params = new URLSearchParams();
-    params.set('chat_id', args.chat_id);
+    const chatId = args.chat_id;
     const limit = Math.min(typeof args.limit === 'number' ? args.limit : 20, 50);
-    params.set('limit', String(limit));
-    if (typeof args.before_id === 'number') params.set('before_id', String(args.before_id));
-    if (typeof args.before_sent_at === 'number') params.set('before_sent_at', String(args.before_sent_at));
-    const req = new Request(`${baseUrl}/search?${params.toString()}`);
-    const res = await handleSearch(req, env, accountId);
-    const data = await res.json() as { results?: unknown[]; total?: number; limit?: number; next_before_id?: number | null; next_before_sent_at?: number | null };
-    // Return chronological order (reverse the DESC-sorted results)
-    if (Array.isArray(data.results)) {
-      data.results = [...data.results].reverse();
-    }
-    return data;
+    const afterSentAt = typeof args.after_sent_at === 'number' ? args.after_sent_at : null;
+    const afterId = typeof args.after_id === 'number' ? args.after_id : null;
+
+    const keysetClause = afterSentAt !== null && afterId !== null
+      ? `AND (sent_at > ? OR (sent_at = ? AND id > ?))`
+      : ``;
+    const keysetBinds: (number | string)[] = afterSentAt !== null && afterId !== null
+      ? [afterSentAt, afterSentAt, afterId]
+      : [];
+
+    const SQL = `
+      SELECT id, tg_message_id, tg_chat_id, chat_name, chat_type,
+             sender_id, sender_username, sender_first_name, sender_last_name,
+             direction, message_type, text, media_type,
+             reply_to_message_id, forwarded_from_name, sent_at
+      FROM messages
+      WHERE account_id = ?
+        AND tg_chat_id = ?
+        AND is_deleted = 0
+        ${keysetClause}
+      ORDER BY sent_at ASC, id ASC
+      LIMIT ?
+    `.trim();
+
+    const { results } = await env.DB.prepare(SQL)
+      .bind(accountId, chatId, ...keysetBinds, limit)
+      .all();
+
+    const rows = results as Array<Record<string, unknown> & { id: number; sent_at: number }>;
+    const lastRow = rows.length === limit ? rows[rows.length - 1] : null;
+
+    return {
+      results: rows.map(truncateText),
+      limit,
+      next_after_id: lastRow?.id ?? null,
+      next_after_sent_at: lastRow?.sent_at ?? null,
+    };
   }
 
   if (name === 'contacts') {
@@ -893,7 +999,7 @@ async function handleMcpMessage(
   msg: Record<string, unknown>,
   env: Env,
   accountId: string,
-): Promise<object> {
+): Promise<object | null> { // null = notification — caller must not send a response
   const { jsonrpc, id, method, params } = msg as {
     jsonrpc: string;
     id: unknown;
@@ -923,7 +1029,7 @@ TOOL SELECTION GUIDE:
 - "contacts" — find people by name/username. Use to look up sender_username before filtering search.
 - "recent" — latest messages across all chats. Use only for "what's new" queries.
 
-PAGINATION: search and history return next_before_id + next_before_sent_at. Pass both to the next call to get the next page.
+PAGINATION: search returns next_before_id + next_before_sent_at (pass to next call to go to older results). history returns next_after_id + next_after_sent_at (pass to next call to go to newer/later messages).
 
 IMPORTANT: The archive is complete and historical. Never tell the user data is unavailable — search with broader terms or a wider date range. If a search returns nothing, try synonyms or remove filters before giving up.`,
       },
@@ -931,7 +1037,8 @@ IMPORTANT: The archive is complete and historical. Never tell the user data is u
   }
 
   if (method === 'notifications/initialized') {
-    return { jsonrpc: '2.0', id, result: null };
+    // W-10: JSON-RPC 2.0 spec — servers MUST NOT send a response to notifications.
+    return null;
   }
 
   if (method === 'tools/list') {
@@ -981,15 +1088,20 @@ async function handleMcp(request: Request, env: Env, accountId: string): Promise
     if (body.length === 0) {
       return mcpJson(mcpError(null, -32600, 'Invalid Request: empty batch'), 400);
     }
-    const responses = await Promise.all(
+    const all = await Promise.all(
       body.map((msg) => handleMcpMessage(msg as Record<string, unknown>, env, accountId)),
     );
+    // W-10: omit null entries (notifications) from batch response per JSON-RPC 2.0
+    const responses = all.filter((r): r is object => r !== null);
+    if (responses.length === 0) return new Response(null, { status: 204 });
     return mcpJson(responses);
   }
 
   // Single message
   if (typeof body === 'object' && body !== null) {
     const response = await handleMcpMessage(body as Record<string, unknown>, env, accountId);
+    // W-10: notification — no response body
+    if (response === null) return new Response(null, { status: 204, headers: CORS_HEADERS });
     return mcpJson(response);
   }
 
@@ -1079,17 +1191,38 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
 // Fetch handler
 // ---------------------------------------------------------------------------
 
+// W-2: account ID must be 'primary' or a numeric Telegram user ID (up to 20 digits).
+// This blocks cross-account enumeration attacks — any authenticated caller who supplies
+// an arbitrary X-Account-ID header could otherwise read/write another account's data.
+function isValidAccountId(id: string): boolean {
+  return id === 'primary' || /^\d{1,20}$/.test(id);
+}
+
 async function fetch(request: Request, env: Env): Promise<Response> {
   // OPTIONS preflight must bypass auth — claude.ai makes cross-origin requests
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
 
-  const authError = authenticate(request, env);
-  if (authError) return authError;
+  const authError = await authenticate(request, env);
+  if (authError) {
+    // W-15: add CORS headers to auth errors on /mcp so browser callers see a readable 401
+    const url = new URL(request.url);
+    if (url.pathname === '/mcp') {
+      return new Response(authError.body, {
+        status: authError.status,
+        headers: { ...Object.fromEntries(authError.headers.entries()), ...CORS_HEADERS },
+      });
+    }
+    return authError;
+  }
 
-  const url = new URL(request.url);
-  const accountId = request.headers.get('X-Account-ID') ?? url.searchParams.get('account_id') ?? 'primary';
+  // W-1: removed query-string account_id fallback — accept from header only
+  const accountId = request.headers.get('X-Account-ID') ?? 'primary';
+  if (!isValidAccountId(accountId)) {
+    return json({ ok: false, error: 'Invalid X-Account-ID: must be "primary" or a numeric Telegram user ID' }, 400);
+  }
+
   return route(request, env, accountId);
 }
 
@@ -1098,19 +1231,22 @@ async function fetch(request: Request, env: Env): Promise<Response> {
 // ---------------------------------------------------------------------------
 
 async function* streamMessages(db: D1Database): AsyncGenerator<string> {
+  // W-12: use keyset pagination (WHERE id > lastId) instead of OFFSET.
+  // OFFSET is unsafe under concurrent inserts: new rows can shift the window,
+  // causing rows to be skipped or duplicated between pages.
   const batchSize = 1000;
-  let offset = 0;
+  let lastId = 0;
   while (true) {
     const { results } = await db
-      .prepare('SELECT * FROM messages ORDER BY id LIMIT ? OFFSET ?')
-      .bind(batchSize, offset)
+      .prepare('SELECT * FROM messages WHERE id > ? ORDER BY id LIMIT ?')
+      .bind(lastId, batchSize)
       .all();
     if (results.length === 0) break;
     for (const row of results) {
       yield JSON.stringify(row) + '\n';
     }
+    lastId = (results[results.length - 1] as { id: number }).id;
     if (results.length < batchSize) break;
-    offset += batchSize;
   }
 }
 
@@ -1170,15 +1306,22 @@ async function runStorageCheck(env: Env): Promise<void> {
   }
 }
 
+// W-13: match both cron expressions explicitly to avoid accidental backup runs
+// if a new cron is added later. Unknown expressions log an error instead of defaulting.
+const CRON_DAILY_BACKUP        = '0 3 * * *';   // matches wrangler.toml
+const CRON_MONTHLY_STORAGE_CHK = '0 4 1 * *';   // matches wrangler.toml
+
 async function scheduled(
   event: ScheduledEvent,
   env: Env,
   _ctx: ExecutionContext,
 ): Promise<void> {
-  if (event.cron === '0 4 1 * *') {
+  if (event.cron === CRON_DAILY_BACKUP) {
+    await runBackup(env);
+  } else if (event.cron === CRON_MONTHLY_STORAGE_CHK) {
     await runStorageCheck(env);
   } else {
-    await runBackup(env);
+    console.error(`[scheduled] unknown cron expression: ${event.cron} — no action taken`);
   }
 }
 

@@ -10,7 +10,7 @@
 CREATE TABLE messages (
   id                   INTEGER PRIMARY KEY AUTOINCREMENT,
   account_id           TEXT NOT NULL DEFAULT 'primary',  -- which TG account captured this
-  tg_message_id        INTEGER NOT NULL,
+  tg_message_id        TEXT NOT NULL,           -- TEXT: Telegram message IDs may exceed 32-bit INTEGER precision
   tg_chat_id           TEXT NOT NULL,         -- stored as TEXT, Telegram IDs are 64-bit
   chat_name            TEXT,
   chat_type            TEXT CHECK(chat_type IN ('user', 'group', 'supergroup', 'channel', 'bot')),
@@ -87,8 +87,7 @@ CREATE INDEX idx_chat_time ON messages(account_id, tg_chat_id, sent_at DESC);
 CREATE INDEX idx_sent_at   ON messages(account_id, sent_at);
 CREATE INDEX idx_sender_id ON messages(account_id, sender_id);
 
--- Covers /chats GROUP BY aggregation and keyset pagination ORDER BY (sent_at, id)
-CREATE INDEX idx_account_chat    ON messages(account_id, tg_chat_id);
+-- Covers keyset pagination ORDER BY (sent_at, id)
 CREATE INDEX idx_account_sent_id ON messages(account_id, sent_at DESC, id DESC);
 
 -- Covers thread reconstruction queries (reply chains)
@@ -125,7 +124,14 @@ CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
   VALUES ('delete', old.id, old.text, old.sender_username, old.sender_first_name, old.chat_name);
 END;
 
-CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
+-- Only re-index when FTS-indexed columns actually change — avoids phantom FTS rows on
+-- is_deleted / indexed_at updates which fire on every upsert.
+CREATE TRIGGER messages_au AFTER UPDATE ON messages
+WHEN OLD.text IS NOT NEW.text
+  OR OLD.sender_username IS NOT NEW.sender_username
+  OR OLD.sender_first_name IS NOT NEW.sender_first_name
+  OR OLD.chat_name IS NOT NEW.chat_name
+BEGIN
   INSERT INTO messages_fts(messages_fts, rowid, text, sender_username, sender_first_name, chat_name)
   VALUES ('delete', old.id, old.text, old.sender_username, old.sender_first_name, old.chat_name);
   INSERT INTO messages_fts(rowid, text, sender_username, sender_first_name, chat_name)

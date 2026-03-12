@@ -2,7 +2,7 @@
 // Mirrors worker/src/types.ts Message interface — kept in sync manually.
 
 export interface Message {
-  tg_message_id: number;
+  tg_message_id: string;  // TEXT in DB — Telegram IDs may exceed 32 bits
   tg_chat_id: string;
   chat_name?: string;
   chat_type?: 'user' | 'group' | 'supergroup' | 'channel' | 'bot';
