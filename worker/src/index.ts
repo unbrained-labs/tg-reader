@@ -211,15 +211,19 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
   console.log(`[GET /search] account=${accountId} params=${[...p.keys()].join(',')}`);
 
   const qRaw = p.get('q');
-  // Sanitize tsquery: strip non-word chars from each token, append :* for prefix matching,
-  // join with & for AND semantics.
-  // W-9: enforce min token length of 2 to prevent unbounded FTS prefix scans.
-  const qTokens = qRaw !== null ? qRaw.trim().split(/\s+/).filter(t => t.length >= 2) : null;
+  // Sanitize tsquery: strip non-word chars from each token first, then enforce min length of 2
+  // on the stripped form (W-9: prevents unbounded FTS prefix scans and invalid ":*" tokens
+  // that would result from purely-symbolic input like "---" or emojis stripping to empty).
+  const qTokens = qRaw !== null
+    ? qRaw.trim().split(/\s+/)
+        .map(t => t.replace(/[^a-zA-Z0-9\u00C0-\u017F]/g, ''))
+        .filter(t => t.length >= 2)
+    : null;
   if (qRaw !== null && qRaw.trim() !== '' && qTokens !== null && qTokens.length === 0) {
     return json({ ok: false, error: 'Search query must contain at least one term with 2 or more characters' }, 400);
   }
   const q = qTokens !== null && qTokens.length > 0
-    ? qTokens.map(t => t.replace(/[^a-zA-Z0-9\u00C0-\u017F]/g, '') + ':*').join(' & ')
+    ? qTokens.map(t => t + ':*').join(' & ')
     : null;
   const chatId = p.get('chat_id') ?? null;
   const senderUsername = p.get('sender_username') ?? null;
@@ -449,9 +453,18 @@ async function handleGetContacts(_request: Request, env: Env, accountId: string)
 
   const pool = getPool(env);
   try {
-    const { rows } = await pool.query(SQL, [accountId]);
+    const { rows } = await pool.query<{
+      tg_user_id: string; phone: string | null; username: string | null;
+      first_name: string | null; last_name: string | null;
+      is_mutual: number; is_bot: number;
+      message_count: string; last_seen: string | null;
+    }>(SQL, [accountId]);
     console.log(`[GET /contacts] account=${accountId} count=${rows.length}`);
-    return json(rows);
+    return json(rows.map(r => ({
+      ...r,
+      message_count: parseInt(r.message_count, 10),
+      last_seen: r.last_seen !== null ? parseInt(r.last_seen, 10) : null,
+    })));
   } catch (err) {
     console.error('[GET /contacts] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
@@ -462,19 +475,21 @@ async function handleChats(request: Request, env: Env, accountId: string): Promi
   const url = new URL(request.url);
   const nameFilter = url.searchParams.get('name') ?? null;
 
+  // GROUP BY tg_chat_id only — avoids duplicate rows if chat_name/type changed over time.
+  // MAX(chat_name)/MAX(chat_type) picks a deterministic canonical value per chat.
   const SQL = `
     SELECT
       m.tg_chat_id,
-      m.chat_name,
-      m.chat_type,
+      MAX(m.chat_name) AS chat_name,
+      MAX(m.chat_type) AS chat_type,
       COUNT(m.id) AS message_count,
       MAX(m.sent_at) AS last_message_at,
-      COALESCE(cc.sync, 'default') AS sync_status
+      COALESCE(MAX(cc.sync), 'default') AS sync_status
     FROM messages m
     LEFT JOIN chat_config cc ON cc.account_id = m.account_id AND cc.tg_chat_id = m.tg_chat_id
     WHERE m.account_id = $1
       AND (m.chat_name ILIKE $2 OR $3 IS NULL)
-    GROUP BY m.tg_chat_id, m.chat_name, m.chat_type, cc.sync
+    GROUP BY m.tg_chat_id
     ORDER BY last_message_at DESC
   `.trim();
 
@@ -485,9 +500,16 @@ async function handleChats(request: Request, env: Env, accountId: string): Promi
 
   const pool = getPool(env);
   try {
-    const { rows } = await pool.query(SQL, [accountId, namePattern, namePattern]);
+    const { rows } = await pool.query<{
+      tg_chat_id: string; chat_name: string | null; chat_type: string | null;
+      message_count: string; last_message_at: string | null; sync_status: string;
+    }>(SQL, [accountId, namePattern, namePattern]);
     console.log(`[GET /chats] account=${accountId} count=${rows.length}`);
-    return json(rows);
+    return json(rows.map(r => ({
+      ...r,
+      message_count: parseInt(r.message_count, 10),
+      last_message_at: r.last_message_at !== null ? parseInt(r.last_message_at, 10) : null,
+    })));
   } catch (err) {
     console.error('[GET /chats] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
@@ -1046,8 +1068,17 @@ async function dispatchMcpTool(
       GROUP BY c.tg_user_id, c.phone, c.username, c.first_name, c.last_name, c.is_mutual, c.is_bot
       ORDER BY last_seen DESC NULLS LAST
     `.trim();
-    const { rows } = await getPool(env).query(SQL, [accountId, search]);
-    return rows;
+    const { rows } = await getPool(env).query<{
+      tg_user_id: string; phone: string | null; username: string | null;
+      first_name: string | null; last_name: string | null;
+      is_mutual: number; is_bot: number;
+      message_count: string; last_seen: string | null;
+    }>(SQL, [accountId, search]);
+    return rows.map(r => ({
+      ...r,
+      message_count: parseInt(r.message_count, 10),
+      last_seen: r.last_seen !== null ? parseInt(r.last_seen, 10) : null,
+    }));
   }
 
   if (name === 'recent') {
@@ -1318,7 +1349,12 @@ async function* streamMessages(pool: Pool): AsyncGenerator<string> {
   let lastId = 0;
   while (true) {
     const { rows } = await pool.query(
-      'SELECT * FROM messages WHERE id > $1 ORDER BY id LIMIT $2',
+      `SELECT id, account_id, tg_message_id, tg_chat_id, chat_name, chat_type,
+              sender_id, sender_username, sender_first_name, sender_last_name,
+              direction, message_type, text, media_type, media_file_id,
+              reply_to_message_id, forwarded_from_id, forwarded_from_name,
+              sent_at, edit_date, original_text, is_deleted, deleted_at, indexed_at
+       FROM messages WHERE id > $1 ORDER BY id LIMIT $2`,
       [lastId, batchSize],
     );
     if (rows.length === 0) break;
