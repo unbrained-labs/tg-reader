@@ -96,6 +96,8 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
 
   console.log(`[POST /ingest] account=${accountId} count=${messages.length}`);
 
+  // Single UNNEST INSERT — one round trip for up to 100 messages.
+  // $1 = account_id scalar; $2–$21 = per-column arrays in message order.
   const SQL = `
     INSERT INTO messages (
       account_id, tg_message_id, tg_chat_id, chat_name, chat_type,
@@ -103,7 +105,26 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
       direction, message_type, text, media_type, media_file_id,
       reply_to_message_id, forwarded_from_id, forwarded_from_name,
       sent_at, edit_date, is_deleted, deleted_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+    )
+    SELECT $1,
+      v.tg_message_id, v.tg_chat_id, v.chat_name, v.chat_type,
+      v.sender_id, v.sender_username, v.sender_first_name, v.sender_last_name,
+      v.direction, v.message_type, v.text, v.media_type, v.media_file_id,
+      v.reply_to_message_id, v.forwarded_from_id, v.forwarded_from_name,
+      v.sent_at, v.edit_date, v.is_deleted, v.deleted_at
+    FROM UNNEST(
+      $2::text[], $3::text[], $4::text[], $5::text[],
+      $6::text[], $7::text[], $8::text[], $9::text[],
+      $10::text[], $11::text[], $12::text[], $13::text[], $14::text[],
+      $15::bigint[], $16::text[], $17::text[],
+      $18::bigint[], $19::bigint[], $20::smallint[], $21::bigint[]
+    ) AS v(
+      tg_message_id, tg_chat_id, chat_name, chat_type,
+      sender_id, sender_username, sender_first_name, sender_last_name,
+      direction, message_type, text, media_type, media_file_id,
+      reply_to_message_id, forwarded_from_id, forwarded_from_name,
+      sent_at, edit_date, is_deleted, deleted_at
+    )
     ON CONFLICT(account_id, tg_chat_id, tg_message_id) DO UPDATE SET
       text = EXCLUDED.text,
       edit_date = EXCLUDED.edit_date,
@@ -131,52 +152,40 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
       END
   `.trim();
 
+  const msgs = messages as Message[];
   const pool = getPool(env);
-  const client = await pool.connect();
-  let written = 0;
-  let noop = 0;
-
+  let result;
   try {
-    await client.query('BEGIN');
-    for (const msg of messages as Message[]) {
-      const result = await client.query(SQL, [
-        accountId,
-        msg.tg_message_id,
-        msg.tg_chat_id,
-        msg.chat_name ?? null,
-        msg.chat_type ?? null,
-        msg.sender_id ?? null,
-        msg.sender_username ?? null,
-        msg.sender_first_name ?? null,
-        msg.sender_last_name ?? null,
-        msg.direction ?? null,
-        msg.message_type ?? null,
-        msg.text ?? null,
-        msg.media_type ?? null,
-        msg.media_file_id ?? null,
-        msg.reply_to_message_id ?? null,
-        msg.forwarded_from_id ?? null,
-        msg.forwarded_from_name ?? null,
-        msg.sent_at,
-        msg.edit_date ?? null,
-        msg.is_deleted ?? 0,
-        msg.deleted_at ?? null,
-      ]);
-      if ((result.rowCount ?? 0) > 0) {
-        written++;
-      } else {
-        noop++;
-      }
-    }
-    await client.query('COMMIT');
+    result = await pool.query(SQL, [
+      accountId,
+      msgs.map(m => m.tg_message_id),
+      msgs.map(m => m.tg_chat_id),
+      msgs.map(m => m.chat_name ?? null),
+      msgs.map(m => m.chat_type ?? null),
+      msgs.map(m => m.sender_id ?? null),
+      msgs.map(m => m.sender_username ?? null),
+      msgs.map(m => m.sender_first_name ?? null),
+      msgs.map(m => m.sender_last_name ?? null),
+      msgs.map(m => m.direction ?? null),
+      msgs.map(m => m.message_type ?? null),
+      msgs.map(m => m.text ?? null),
+      msgs.map(m => m.media_type ?? null),
+      msgs.map(m => m.media_file_id ?? null),
+      msgs.map(m => m.reply_to_message_id ?? null),
+      msgs.map(m => m.forwarded_from_id ?? null),
+      msgs.map(m => m.forwarded_from_name ?? null),
+      msgs.map(m => m.sent_at),
+      msgs.map(m => m.edit_date ?? null),
+      msgs.map(m => m.is_deleted ?? 0),
+      msgs.map(m => m.deleted_at ?? null),
+    ]);
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('[POST /ingest] DB transaction error', err);
+    console.error('[POST /ingest] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
-  } finally {
-    client.release();
   }
 
+  const written = result.rowCount ?? 0;
+  const noop = msgs.length - written;
   console.log(`[POST /ingest] written=${written} noop=${noop}`);
   return json({ written, noop });
 }
@@ -378,9 +387,13 @@ async function handlePostContacts(request: Request, env: Env, accountId: string)
 
   console.log(`[POST /contacts] account=${accountId} count=${contacts.length}`);
 
+  // Single UNNEST INSERT — one round trip for up to 500 contacts.
   const SQL = `
     INSERT INTO contacts (account_id, tg_user_id, phone, username, first_name, last_name, is_mutual, is_bot, updated_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, EXTRACT(EPOCH FROM NOW())::BIGINT)
+    SELECT $1, v.tg_user_id, v.phone, v.username, v.first_name, v.last_name, v.is_mutual, v.is_bot,
+           EXTRACT(EPOCH FROM NOW())::BIGINT
+    FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::smallint[], $8::smallint[])
+      AS v(tg_user_id, phone, username, first_name, last_name, is_mutual, is_bot)
     ON CONFLICT(account_id, tg_user_id) DO UPDATE SET
       phone       = COALESCE(EXCLUDED.phone, contacts.phone),
       username    = COALESCE(EXCLUDED.username, contacts.username),
@@ -391,34 +404,26 @@ async function handlePostContacts(request: Request, env: Env, accountId: string)
       updated_at  = EXTRACT(EPOCH FROM NOW())::BIGINT
   `.trim();
 
+  const cs = contacts as ContactPayload[];
   const pool = getPool(env);
-  const client = await pool.connect();
-  let upserted = 0;
-
+  let result;
   try {
-    await client.query('BEGIN');
-    for (const c of contacts as ContactPayload[]) {
-      const result = await client.query(SQL, [
-        accountId,
-        c.tg_user_id,
-        c.phone ?? null,
-        c.username ?? null,
-        c.first_name ?? null,
-        c.last_name ?? null,
-        c.is_mutual ?? null,
-        c.is_bot ?? null,
-      ]);
-      if ((result.rowCount ?? 0) > 0) upserted++;
-    }
-    await client.query('COMMIT');
+    result = await pool.query(SQL, [
+      accountId,
+      cs.map(c => c.tg_user_id),
+      cs.map(c => c.phone ?? null),
+      cs.map(c => c.username ?? null),
+      cs.map(c => c.first_name ?? null),
+      cs.map(c => c.last_name ?? null),
+      cs.map(c => c.is_mutual ?? null),
+      cs.map(c => c.is_bot ?? null),
+    ]);
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('[POST /contacts] DB transaction error', err);
+    console.error('[POST /contacts] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
-  } finally {
-    client.release();
   }
 
+  const upserted = result.rowCount ?? 0;
   console.log(`[POST /contacts] upserted=${upserted}`);
   return json({ upserted });
 }
@@ -676,31 +681,28 @@ async function handleDeleted(request: Request, env: Env, accountId: string): Pro
 
   console.log(`[POST /deleted] account=${accountId} count=${messages.length}`);
 
+  // Single UPDATE with UNNEST — one round trip for up to 500 deletions.
   const SQL = `
     UPDATE messages
     SET is_deleted = 1, deleted_at = EXTRACT(EPOCH FROM NOW())::BIGINT
-    WHERE account_id = $1 AND tg_chat_id = $2 AND tg_message_id = $3
+    WHERE account_id = $1
+      AND (tg_chat_id, tg_message_id) IN (SELECT * FROM UNNEST($2::text[], $3::text[]))
   `.trim();
 
   const pool = getPool(env);
-  const client = await pool.connect();
-  let marked = 0;
-
+  let result;
   try {
-    await client.query('BEGIN');
-    for (const m of messages) {
-      const result = await client.query(SQL, [accountId, m.tg_chat_id, m.tg_message_id]);
-      if ((result.rowCount ?? 0) > 0) marked++;
-    }
-    await client.query('COMMIT');
+    result = await pool.query(SQL, [
+      accountId,
+      messages.map(m => m.tg_chat_id),
+      messages.map(m => m.tg_message_id),
+    ]);
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('[POST /deleted] DB transaction error', err);
+    console.error('[POST /deleted] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
-  } finally {
-    client.release();
   }
 
+  const marked = result.rowCount ?? 0;
   console.log(`[POST /deleted] marked=${marked}`);
   return json({ marked });
 }
@@ -725,31 +727,29 @@ async function handleBackfillSeed(request: Request, env: Env, accountId: string)
 
   console.log(`[POST /backfill/seed] account=${accountId} count=${dialogs.length}`);
 
+  // Single UNNEST INSERT — one round trip for up to 500 dialogs.
   const SQL = `
     INSERT INTO backfill_state (account_id, tg_chat_id, chat_name, total_messages, status)
-    VALUES ($1, $2, $3, $4, 'pending')
+    SELECT $1, v.tg_chat_id, v.chat_name, v.total_messages, 'pending'
+    FROM UNNEST($2::text[], $3::text[], $4::bigint[]) AS v(tg_chat_id, chat_name, total_messages)
     ON CONFLICT DO NOTHING
   `.trim();
 
   const pool = getPool(env);
-  const client = await pool.connect();
-  let seeded = 0;
-
+  let result;
   try {
-    await client.query('BEGIN');
-    for (const d of dialogs) {
-      const result = await client.query(SQL, [accountId, d.tg_chat_id, d.chat_name ?? null, d.total_messages ?? null]);
-      if ((result.rowCount ?? 0) > 0) seeded++;
-    }
-    await client.query('COMMIT');
+    result = await pool.query(SQL, [
+      accountId,
+      dialogs.map(d => d.tg_chat_id),
+      dialogs.map(d => d.chat_name ?? null),
+      dialogs.map(d => d.total_messages ?? null),
+    ]);
   } catch (err) {
-    await client.query('ROLLBACK');
-    console.error('[POST /backfill/seed] DB transaction error', err);
+    console.error('[POST /backfill/seed] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
-  } finally {
-    client.release();
   }
 
+  const seeded = result.rowCount ?? 0;
   console.log(`[POST /backfill/seed] seeded=${seeded}`);
   return json({ seeded });
 }
@@ -1025,18 +1025,29 @@ async function dispatchMcpTool(
   }
 
   if (name === 'contacts') {
-    const req = new Request(`${baseUrl}/contacts`);
-    const res = await handleGetContacts(req, env, accountId);
-    const data = await res.json() as Array<Record<string, unknown>>;
-    if (typeof args.search === 'string' && args.search.trim() !== '') {
-      const term = args.search.toLowerCase();
-      return data.filter((c) => {
-        const name = String(c.first_name ?? '') + ' ' + String(c.last_name ?? '');
-        const username = String(c.username ?? '');
-        return name.toLowerCase().includes(term) || username.toLowerCase().includes(term);
-      });
-    }
-    return data;
+    const search = typeof args.search === 'string' && args.search.trim() !== ''
+      ? `%${args.search.trim()}%`
+      : null;
+    const SQL = `
+      SELECT
+        c.tg_user_id,
+        c.phone,
+        c.username,
+        c.first_name,
+        c.last_name,
+        c.is_mutual,
+        c.is_bot,
+        COUNT(m.id) AS message_count,
+        MAX(m.sent_at) AS last_seen
+      FROM contacts c
+      LEFT JOIN messages m ON m.account_id = c.account_id AND m.sender_id = c.tg_user_id
+      WHERE c.account_id = $1
+        AND ($2::text IS NULL OR c.first_name ILIKE $2 OR c.last_name ILIKE $2 OR c.username ILIKE $2)
+      GROUP BY c.tg_user_id, c.phone, c.username, c.first_name, c.last_name, c.is_mutual, c.is_bot
+      ORDER BY last_seen DESC NULLS LAST
+    `.trim();
+    const { rows } = await getPool(env).query(SQL, [accountId, search]);
+    return rows;
   }
 
   if (name === 'recent') {
