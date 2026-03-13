@@ -44,7 +44,6 @@ export interface Message {
   sender_username?: string;
   sender_first_name?: string;
   sender_last_name?: string;
-  direction?: 'in' | 'out';
   message_type?: string;
   text?: string;
   media_type?: string;

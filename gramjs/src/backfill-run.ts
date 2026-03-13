@@ -44,6 +44,7 @@ async function postProgress(accountId: string, body: {
   status?: string;
   oldest_message_id?: number;
   fetched_messages?: number;
+  total_messages?: number;
   last_error?: string;
 }): Promise<void> {
   try {
@@ -129,6 +130,7 @@ async function backfillDialog(
 
   let offsetId = Number(dialog.oldest_message_id ?? 0);
   let fetched = Number(dialog.fetched_messages ?? 0);
+  let totalReported = false; // only send total_messages once (from first page)
   const userMap = new Map<string, { username?: string; firstName?: string; lastName?: string }>();
 
   let inputPeer: Api.TypeInputPeer;
@@ -187,6 +189,13 @@ async function backfillDialog(
         (m): m is Api.Message => m instanceof Api.Message,
       );
 
+      // Capture total message count from first page (MessagesSlice / ChannelMessages expose .count).
+      // Write it once so backfill_state.total_messages is populated for completeness tracking.
+      if (!totalReported && 'count' in result && typeof result.count === 'number') {
+        await postProgress(accountId, { tg_chat_id, total_messages: result.count });
+        totalReported = true;
+      }
+
       // Build sender lookup from user entities included in the GetHistory response.
       // Telegram includes all referenced users in result.users — no extra API calls needed.
       userMap.clear();
@@ -227,11 +236,6 @@ async function backfillDialog(
     // and the ingest endpoint allows it to be undefined (ON CONFLICT preserves existing).
     const batch: Message[] = messages.map(raw => {
       const senderId = resolveSenderId(raw.fromId);
-      // B-4: channel posts have no real user sender — direction is meaningless for them.
-      // Detect by absence of a PeerUser fromId (fromId is either null or PeerChannel for broadcasts).
-      const direction: 'in' | 'out' | undefined = raw.out
-        ? 'out'
-        : (raw.fromId instanceof Api.PeerUser ? 'in' : undefined);
       return {
         tg_message_id: String(raw.id), // S-1: always string
         tg_chat_id,
@@ -241,7 +245,6 @@ async function backfillDialog(
         sender_username: senderId ? (userMap.get(senderId)?.username) : undefined,
         sender_first_name: senderId ? (userMap.get(senderId)?.firstName) : undefined,
         sender_last_name: senderId ? (userMap.get(senderId)?.lastName) : undefined,
-        direction,
         message_type: resolveMessageType(raw),
         text: raw.message || undefined,  // raw.message is the text field in GramJS
         media_type: resolveMediaType(raw.media ?? undefined),

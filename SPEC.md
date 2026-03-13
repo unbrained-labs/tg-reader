@@ -29,16 +29,20 @@ Primary archive table. `account_id` scopes all queries for multi-account support
 | Column | Type | Notes |
 |--------|------|-------|
 | `id` | BIGINT IDENTITY | internal PK |
-| `account_id` | TEXT | defaults to `'primary'` |
+| `account_id` | TEXT | Telegram user ID of the archive owner |
 | `tg_message_id` | TEXT | Telegram message ID — always TEXT (64-bit safe) |
 | `tg_chat_id` | TEXT | always TEXT — Telegram IDs are 64-bit |
-| `sender_id` | TEXT | always TEXT |
-| `direction` | TEXT | `'in'` or `'out'` |
+| `chat_name` | TEXT | display name at ingest time |
+| `chat_type` | TEXT | `'user'`, `'group'`, `'supergroup'`, `'channel'` |
+| `sender_id` | TEXT | always TEXT; equals `account_id` for outgoing messages |
+| `sender_username` | TEXT | nullable |
 | `sent_at` | BIGINT | Unix epoch seconds — Telegram's native format |
 | `edit_date` | BIGINT | Unix epoch seconds, NULL if never edited |
 | `original_text` | TEXT | pre-edit text, NULL if never edited |
 | `is_deleted` | SMALLINT | 0 or 1 |
 | `search_vector` | tsvector | generated column, GIN indexed |
+
+> Outgoing messages are identified by `sender_id = account_id`. There is no `direction` column.
 
 ### chat_config
 Per-chat sync overrides and labels.
@@ -74,7 +78,7 @@ See `schema.sql`.
 
 ## Sync Modes
 
-Stored in `global_config` as key `sync_mode`:
+Stored in `global_config` as key `sync_mode`. Supports per-account overrides: row with `account_id = <id>` takes precedence over `account_id = 'global'`.
 
 | Mode | Behaviour |
 |------|-----------|
@@ -149,7 +153,7 @@ For mass sends, `outbox_recipients` rows track per-chat status. Failed recipient
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET/POST /config` | Global `sync_mode` |
+| `GET/POST /config` | Global or per-account `sync_mode` |
 | `GET/POST /chats/config` | Per-chat `sync` + `label` |
 | `DELETE /chats/config/:id` | Remove chat override |
 
@@ -201,7 +205,9 @@ Response: { results: [...], total: N, limit: N, next_before_id: N|null, next_bef
 
 ## Auth
 
-Single token (`X-Ingest-Token`) for all endpoints. `X-Account-ID` identifies the account (defaults to `'primary'`). MCP also accepts `?token=` and `?account_id=` query params.
+Single token (`X-Ingest-Token`) for all endpoints. `X-Account-ID` identifies the account (numeric Telegram user ID). MCP also accepts `?token=` and `?account_id=` query params.
+
+Username-to-account-ID resolution: the `contacts` table stores the account owner as a self-entry (`account_id = tg_user_id`). The Worker resolves a username alias by querying `contacts WHERE username = $1 AND account_id = tg_user_id`.
 
 ---
 
@@ -217,3 +223,4 @@ Scheduled Worker cron (daily at 03:00 UTC) dumps `SELECT * FROM messages` to Clo
 - **Schema migrations**: `schema.sql` uses `IF NOT EXISTS` everywhere — safe to re-run on live DB.
 - **Stuck sends**: outbox items stuck in `sending` for >5 minutes are reset to `pending` on next `/outbox/due` poll. Failed recipients in mass sends are also reset.
 - **Edit archive consistency**: GramJS `EditedMessage` event fires after `editMessage()` call — archive is updated automatically with correct `sent_at`. No manual re-ingest needed.
+- **Outgoing message identification**: `sender_id = account_id`. No `direction` column exists — it was redundant and has been removed.

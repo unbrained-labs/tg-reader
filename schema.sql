@@ -19,7 +19,6 @@ CREATE TABLE IF NOT EXISTS messages (
   sender_username      TEXT,
   sender_first_name    TEXT,
   sender_last_name     TEXT,
-  direction            TEXT CHECK(direction IN ('in', 'out')),
   message_type         TEXT,                    -- text, sticker, poll, location, contact, dice, etc.
   text                 TEXT,
   media_type           TEXT,                    -- photo, video, document, voice, audio, sticker, etc.
@@ -55,8 +54,10 @@ CREATE TABLE IF NOT EXISTS chat_config (
 );
 
 CREATE TABLE IF NOT EXISTS global_config (
-  key   TEXT PRIMARY KEY,
-  value TEXT
+  account_id TEXT NOT NULL DEFAULT 'global',
+  key        TEXT NOT NULL,
+  value      TEXT,
+  PRIMARY KEY (account_id, key)
 );
 
 CREATE TABLE IF NOT EXISTS contacts (
@@ -183,5 +184,5 @@ CREATE INDEX IF NOT EXISTS idx_pending_actions_due ON pending_actions(account_id
 -- Seed data
 -- ---------------------------------------------------------------------------
 
-INSERT INTO global_config (key, value) VALUES ('sync_mode', 'all')
-  ON CONFLICT (key) DO NOTHING;
+INSERT INTO global_config (account_id, key, value) VALUES ('global', 'sync_mode', 'all')
+  ON CONFLICT (account_id, key) DO NOTHING;

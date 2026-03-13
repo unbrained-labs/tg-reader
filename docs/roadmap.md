@@ -2,19 +2,32 @@
 
 ## Overview
 
-tg-reader is currently a **read-only personal Telegram archive**: GramJS captures every message, Cloudflare Workers + D1 store and index them, and an MCP server lets Claude query the archive in natural language.
+tg-reader is a **personal Telegram archive with write access**: GramJS captures every message, Cloudflare Workers + Neon PostgreSQL store and index them, and an MCP server lets Claude query and write to the archive in natural language.
 
-This document proposes five features that turn it into a lightweight personal CRM — plus optional write access to Telegram — without changing the core architecture.
+Write access (outbox, actions, drafts, mass sends) is already shipped. This document proposes features that build on the existing foundation to turn tg-reader into a lightweight personal CRM.
+
+---
+
+## Current state (shipped)
+
+- Full message archive (51k+ messages, all chats)
+- Full-text search via PostgreSQL tsvector + GIN index
+- MCP server: `search`, `chats`, `history`, `contacts`, `recent`, `stats`, `digest`, `thread`
+- Write path: `send`, `draft`, `edit_message`, `delete_message`, `forward_message`
+- Mass sends with per-recipient template rendering
+- Outbox + actions polling (GramJS, every 30s)
+- Contacts table (synced from Telegram contacts)
+- Per-chat config: sync mode (include/exclude), labels
+- Global sync modes: `all` / `blacklist` / `whitelist` / `none`
+- Daily R2 backup
 
 ---
 
 ## Phase 1 — Intelligence on existing data (zero new ingestion)
 
-These features require no new Telegram API calls. The data is already in D1.
+These features require no new Telegram API calls. The data is already in Neon.
 
 ### 1.1 Unanswered filter
-
-> AI features (summaries, smart search, etc.) are tracked separately — see the `ai` feature branch.
 
 **What:** A smart filter that surfaces chats where the other person wrote last and you haven't replied.
 
@@ -28,7 +41,7 @@ New Worker endpoint:
 GET /chats?filter=unanswered&limit=50
 ```
 
-SQL (no schema changes):
+SQL (no schema changes needed — uses `sender_id` vs `account_id`):
 
 ```sql
 SELECT
@@ -37,13 +50,15 @@ SELECT
   MAX(sent_at) AS last_message_at,
   (SELECT text FROM messages m2
    WHERE m2.tg_chat_id = m.tg_chat_id
+     AND m2.account_id = $1
    ORDER BY sent_at DESC LIMIT 1) AS last_text
 FROM messages m
-GROUP BY tg_chat_id
-HAVING MAX(CASE WHEN direction = 'in' THEN sent_at ELSE 0 END)
-     > MAX(CASE WHEN direction = 'out' THEN sent_at ELSE 0 END)
+WHERE account_id = $1
+GROUP BY tg_chat_id, chat_name
+HAVING MAX(CASE WHEN sender_id != $1 THEN sent_at ELSE 0 END)
+     > MAX(CASE WHEN sender_id = $1 THEN sent_at ELSE 0 END)
 ORDER BY last_message_at DESC
-LIMIT ?;
+LIMIT 50;
 ```
 
 MCP tool addition: expose as `unanswered` tool so Claude can answer "who haven't I replied to this week?"
@@ -52,30 +67,29 @@ MCP tool addition: expose as `unanswered` tool so Claude can answer "who haven't
 
 ---
 
-## Phase 2 — User-added data (new D1 tables)
+## Phase 2 — User-added data (new tables)
 
 ### 2.1 Notes on conversations
 
 **What:** Free-text notes attached to a chat — observations, context, things to remember.
 
-**Why:** Makes tg-reader the single place to track everything about a relationship. Notes are queryable by Claude via FTS5.
+**Why:** Makes tg-reader the single place to track everything about a relationship. Notes are queryable by Claude via FTS.
 
 **Schema:**
 
 ```sql
 CREATE TABLE notes (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account_id  TEXT    NOT NULL,
   tg_chat_id  TEXT    NOT NULL,
   body        TEXT    NOT NULL,
-  created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
-  updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
+  search_vector tsvector GENERATED ALWAYS AS (to_tsvector('english', body)) STORED,
+  created_at  BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT,
+  updated_at  BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
 );
 
-CREATE INDEX idx_notes_chat ON notes (tg_chat_id, created_at DESC);
-
--- Include notes in FTS so Claude can search across messages AND notes
-INSERT INTO messages_fts (messages_fts) VALUES ('rebuild'); -- after adding notes_fts
-CREATE VIRTUAL TABLE notes_fts USING fts5(body, content='notes', content_rowid='id');
+CREATE INDEX idx_notes_chat ON notes (account_id, tg_chat_id, created_at DESC);
+CREATE INDEX idx_notes_fts  ON notes USING GIN (search_vector);
 ```
 
 **API:**
@@ -89,7 +103,7 @@ DELETE /notes/:id
 
 MCP tool addition: `add_note`, `get_notes` — Claude can store and retrieve notes mid-conversation.
 
-**Effort:** ~3 hours including FTS integration.
+**Effort:** ~3 hours.
 
 ---
 
@@ -104,10 +118,10 @@ MCP tool addition: `add_note`, `get_notes` — Claude can store and retrieve not
 Add columns to `chat_config` (already exists):
 
 ```sql
-ALTER TABLE chat_config ADD COLUMN status TEXT DEFAULT 'active'
+ALTER TABLE chat_config ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'
   CHECK (status IN ('active', 'follow_up', 'waiting', 'done', 'archived'));
-ALTER TABLE chat_config ADD COLUMN labels TEXT DEFAULT '[]'; -- JSON array of strings
-ALTER TABLE chat_config ADD COLUMN priority INTEGER DEFAULT 0; -- 0=normal, 1=high
+ALTER TABLE chat_config ADD COLUMN IF NOT EXISTS labels TEXT DEFAULT '[]'; -- JSON array of strings
+ALTER TABLE chat_config ADD COLUMN IF NOT EXISTS priority INTEGER DEFAULT 0; -- 0=normal, 1=high
 ```
 
 **API:**
@@ -120,7 +134,7 @@ GET   /chats?label=investor
 
 MCP tool addition: `set_status`, `set_label` — Claude can update pipeline state when you say "mark the Alpha deal as waiting".
 
-**Effort:** ~2 hours. ALTER TABLE is non-destructive.
+**Effort:** ~2 hours. `ALTER TABLE IF NOT EXISTS` is non-destructive.
 
 ---
 
@@ -134,15 +148,16 @@ MCP tool addition: `set_status`, `set_label` — Claude can update pipeline stat
 
 ```sql
 CREATE TABLE reminders (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account_id  TEXT    NOT NULL,
   tg_chat_id  TEXT    NOT NULL,
   note        TEXT,
-  remind_at   INTEGER NOT NULL, -- Unix epoch seconds
-  fired       INTEGER NOT NULL DEFAULT 0,
-  created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+  remind_at   BIGINT  NOT NULL, -- Unix epoch seconds
+  fired       SMALLINT NOT NULL DEFAULT 0,
+  created_at  BIGINT  NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
 );
 
-CREATE INDEX idx_reminders_due ON reminders (fired, remind_at);
+CREATE INDEX idx_reminders_due ON reminders (account_id, fired, remind_at);
 ```
 
 **API:**
@@ -157,8 +172,8 @@ POST /reminders/:id/dismiss
 
 | Option | Mechanism | Effort |
 |--------|-----------|--------|
+| Telegram DM | Use existing outbox: send to Saved Messages | Low — outbox already works |
 | Webhook | Worker cron hits a user-supplied `WEBHOOK_URL` | Low |
-| Telegram message | Write API (Phase 3) sends yourself a DM | Medium |
 | MCP poll | Claude checks `/reminders/due` at session start | Zero extra |
 
 Cron trigger (already supported by Cloudflare Workers):
@@ -169,101 +184,7 @@ Cron trigger (already supported by Cloudflare Workers):
 crons = ["*/15 * * * *"]  # every 15 minutes
 ```
 
-```ts
-// worker/src/cron.ts
-export async function handleCron(env: Env): Promise<void> {
-  const due = await getDueReminders(env.DB);
-  for (const r of due) {
-    await fireReminder(r, env);   // webhook or Telegram DM
-    await markFired(r.id, env.DB);
-  }
-}
-```
-
-**Effort:** ~4 hours including cron setup and webhook delivery.
-
----
-
-## Phase 3 — Optional write access to Telegram
-
-**What:** Allow tg-reader to *send* messages on your behalf — for reminders, quick replies, message templates.
-
-**Why requested:** Reminders delivered as Telegram DMs are far more actionable than webhooks. Templates eliminate repetitive copy-paste.
-
-### Architecture
-
-Write access is **opt-in** and handled exclusively by the GramJS layer — never by the Worker directly. The Worker queues outbound actions; GramJS executes them.
-
-```
-Worker ──POST /outbox──→ D1 outbox table
-GramJS ──polls /outbox──→ client.sendMessage() / client.forwardMessages()
-```
-
-This keeps Telegram credentials out of the Worker (which runs on Cloudflare's edge, outside your network).
-
-### Outbox schema
-
-```sql
-CREATE TABLE outbox (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  action      TEXT    NOT NULL,  -- 'send_message' | 'forward' | 'send_self'
-  payload     TEXT    NOT NULL,  -- JSON: { to, text } or { from_chat, msg_ids, to }
-  status      TEXT    NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending', 'sent', 'failed')),
-  error       TEXT,
-  created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
-  sent_at     INTEGER
-);
-```
-
-### Worker outbox API
-
-```
-POST /outbox   { action, payload }  → { id }   (authenticated with X-Ingest-Token)
-GET  /outbox/pending                → [{ id, action, payload }]
-POST /outbox/:id/ack   { status, error? }
-```
-
-### GramJS outbox poller
-
-```ts
-// Added to listener.ts startup
-setInterval(async () => {
-  const res = await fetch(`${WORKER_URL}/outbox/pending`, { headers });
-  const jobs = await res.json() as OutboxJob[];
-  for (const job of jobs) {
-    try {
-      await executeOutboxJob(client, job);
-      await ack(job.id, 'sent');
-    } catch (err) {
-      await ack(job.id, 'failed', String(err));
-    }
-    await sleep(Math.random() * 1000 + 500); // anti-ban between sends
-  }
-}, 30_000); // poll every 30s
-```
-
-### Supported actions (v1)
-
-| Action | Payload | Use case |
-|--------|---------|----------|
-| `send_self` | `{ text }` | Reminder DMs to Saved Messages |
-| `send_message` | `{ to: tg_chat_id, text }` | Quick reply from Claude/MCP |
-| `forward` | `{ from_chat, msg_ids: number[], to }` | Forward messages between chats |
-
-### MCP tools (with write)
-
-- `reply` — Claude drafts a reply, you approve, it sends
-- `send_reminder` — Claude schedules a Telegram DM to Saved Messages
-- `use_template` — fill a template and send to a contact
-
-### Anti-ban considerations for write
-
-- Never send more than 1 message/second to any single peer
-- Randomize inter-send delay: `500ms + random(0, 1000ms)`
-- `send_self` (Saved Messages) has no rate limit — safest for reminders
-- Respect `floodSleepThreshold: 300` already set on the client
-- **Never** expose `send_message` via a public API endpoint — only via authenticated MCP or outbox queue
+**Effort:** ~3 hours (schema + API + cron delivery via outbox).
 
 ---
 
@@ -274,10 +195,7 @@ setInterval(async () => {
 | 1 | Unanswered filter | 2h | High |
 | 2a | Notes | 3h | High |
 | 2b | Pipeline status | 2h | Medium |
-| 2c | Reminders (webhook) | 4h | High |
-| 3 | Write access + outbox | 8h | Medium |
-| 3b | Reminders via Telegram DM | 2h | High (needs Phase 3) |
-| — | AI integration | separate branch | — |
+| 2c | Reminders | 3h | High |
 
 **Recommended start:** Unanswered filter — pure SQL, no schema migration, immediate value.
 
@@ -289,7 +207,7 @@ After all phases, tg-reader is:
 
 - A **complete personal Telegram CRM** with full message history going back to whenever you started
 - AI-native: Claude can search, summarise, update pipeline status, set reminders, and draft replies in natural language
-- **$0 marginal cost** at personal scale (Cloudflare Workers free tier + occasional AI calls)
-- No per-seat pricing, no vendor lock-in, fully self-hosted
+- **Fully self-hosted** on Cloudflare Workers + Neon at minimal cost
+- No per-seat pricing, no vendor lock-in
 
-The key differentiator vs DISE: tg-reader has **years of history** and full message content. DISE starts from when you install it. For anyone using Telegram as their primary business communication channel, historical context is the whole game.
+The key differentiator: tg-reader has **years of history** and full message content from day one. Most CRM tools start from when you install them.

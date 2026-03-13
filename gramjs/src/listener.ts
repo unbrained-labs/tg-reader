@@ -193,7 +193,6 @@ function mapMessage(raw: Api.Message): Message {
     sender_username,
     sender_first_name,
     sender_last_name,
-    direction: raw.out ? 'out' : (raw.fromId instanceof Api.PeerUser ? 'in' : undefined),
     message_type: resolveMessageType(raw),
     text: raw.message || undefined,
     media_type: resolveMediaType(raw.media ?? undefined),
@@ -340,7 +339,6 @@ function buildGapMessage(raw: Api.Message, chats: Api.TypeChat[], users: Api.Typ
     sender_username: undefined,
     sender_first_name: undefined,
     sender_last_name: undefined,
-    direction: raw.out ? 'out' : (raw.fromId instanceof Api.PeerUser ? 'in' : undefined),
     message_type: resolveMessageType(raw),
     text: raw.message || undefined,
     media_type: resolveMediaType(raw.media ?? undefined),
@@ -655,17 +653,23 @@ async function main(): Promise<void> {
     const me = await client.getMe();
     if (!(me instanceof Api.User)) throw new Error('getMe() returned UserEmpty — session is invalid');
     ACCOUNT_ID = String(me.id);
-    // Register username alias so the worker can resolve e.g. "d4d0ch" → "7926042351"
-    if (me.username) {
-      try {
-        await fetch(`${WORKER_URL}/account/register`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
-          body: JSON.stringify({ username: me.username }),
-        });
-      } catch {
-        // Non-fatal — listener works without it
-      }
+    // Upsert self into contacts so the worker can resolve username → account_id
+    try {
+      await fetch(`${WORKER_URL}/contacts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
+        body: JSON.stringify({ contacts: [{
+          tg_user_id: ACCOUNT_ID,
+          username: me.username ?? undefined,
+          first_name: me.firstName ?? undefined,
+          last_name: me.lastName ?? undefined,
+          phone: me.phone ?? undefined,
+          is_mutual: 0,
+          is_bot: 0,
+        }] }),
+      });
+    } catch {
+      // Non-fatal
     }
   }
   console.log(`[listener] account_id=${ACCOUNT_ID}`);

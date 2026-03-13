@@ -7,6 +7,7 @@ Run these tests in order after deploying. All 5 must pass before starting full b
 ```bash
 export WORKER_URL=https://tg-reader.<account>.workers.dev
 export INGEST_TOKEN=<your-ingest-token>
+export DATABASE_URL=<your-neon-connection-string>
 ```
 
 ---
@@ -25,18 +26,18 @@ Expected: `All API tests passed.`
 
 ## Test 1 — Live capture
 
-Confirms the GramJS listener is running and messages land in D1.
+Confirms the GramJS listener is running and messages land in Neon.
 
 1. Send a message to **Saved Messages** (your own account) in Telegram
 2. Wait 10 seconds
-3. Query D1:
+3. Query Neon:
 
 ```bash
-wrangler d1 execute tg-archive --command \
-  "SELECT tg_message_id, tg_chat_id, direction, sent_at, text FROM messages ORDER BY indexed_at DESC LIMIT 5"
+psql "$DATABASE_URL" -c \
+  "SELECT tg_message_id, tg_chat_id, sender_id, sent_at, text FROM messages ORDER BY indexed_at DESC LIMIT 5"
 ```
 
-**Pass:** The message appears with `direction=out` and `sent_at` as an integer (Unix seconds, not a date string).
+**Pass:** The message appears with `sender_id` matching your Telegram user ID and `sent_at` as a large integer (Unix seconds, not a date string).
 
 **Troubleshoot if missing:**
 - Check Fly logs: `fly logs -a tg-reader`
@@ -45,7 +46,7 @@ wrangler d1 execute tg-archive --command \
 
 ---
 
-## Test 2 — FTS5 search
+## Test 2 — FTS search
 
 Confirms full-text search works end-to-end.
 
@@ -60,10 +61,10 @@ curl -s -H "X-Ingest-Token: $INGEST_TOKEN" \
 
 **Pass:** Response contains `"total": 1` and the message appears in `messages[]`.
 
-**Check FTS5 directly:**
+**Check tsvector directly:**
 ```bash
-wrangler d1 execute tg-archive --command \
-  "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'xqz9test'"
+psql "$DATABASE_URL" -c \
+  "SELECT id FROM messages WHERE search_vector @@ to_tsquery('english', 'xqz9test')"
 ```
 
 ---
@@ -95,11 +96,11 @@ Confirms missed messages are recovered after a restart.
 3. Restart: `fly scale count 1 -a tg-reader`
 4. Watch startup logs: `fly logs -a tg-reader`
    - You should see `[listener] gap recovery` lines
-5. After ~30 seconds, query D1:
+5. After ~30 seconds, query Neon:
 
 ```bash
-wrangler d1 execute tg-archive --command \
-  "SELECT tg_message_id, direction, sent_at FROM messages ORDER BY indexed_at DESC LIMIT 5"
+psql "$DATABASE_URL" -c \
+  "SELECT tg_message_id, sender_id, sent_at FROM messages ORDER BY indexed_at DESC LIMIT 5"
 ```
 
 **Pass:** All 3 messages appear with the correct `sent_at` timestamps from when they were sent (not from when the listener restarted).
@@ -112,11 +113,11 @@ wrangler d1 execute tg-archive --command \
 
 Confirms backfill works end-to-end on a small chat before running full history.
 
-1. Identify a small chat ID (< 200 messages). Find it in D1 from live capture:
+1. Identify a small chat ID (< 200 messages). Find it from live capture:
 
 ```bash
-wrangler d1 execute tg-archive --command \
-  "SELECT tg_chat_id, chat_name, COUNT(*) as msg_count FROM messages GROUP BY tg_chat_id ORDER BY msg_count ASC LIMIT 5"
+psql "$DATABASE_URL" -c \
+  "SELECT tg_chat_id, chat_name, COUNT(*) AS msg_count FROM messages GROUP BY tg_chat_id, chat_name ORDER BY msg_count ASC LIMIT 5"
 ```
 
 2. Seed that one chat manually:
@@ -133,14 +134,14 @@ curl -s -X POST -H "X-Ingest-Token: $INGEST_TOKEN" \
 ```bash
 cd gramjs
 GRAMJS_SESSION=<session> API_ID=<id> API_HASH=<hash> \
-  INGEST_TOKEN=<token> WORKER_URL=<url> \
+  INGEST_TOKEN=<token> WORKER_URL=<url> DATABASE_URL=<url> \
   npx ts-node src/backfill-run.ts
 ```
 
 4. Check completion:
 
 ```bash
-wrangler d1 execute tg-archive --command \
+psql "$DATABASE_URL" -c \
   "SELECT tg_chat_id, status, fetched_messages, total_messages FROM backfill_state"
 ```
 
@@ -155,16 +156,16 @@ You're ready for full backfill:
 ```bash
 # 1. Seed all dialogs
 cd gramjs
-GRAMJS_SESSION=... API_ID=... API_HASH=... INGEST_TOKEN=... WORKER_URL=... \
+GRAMJS_SESSION=... API_ID=... API_HASH=... INGEST_TOKEN=... WORKER_URL=... DATABASE_URL=... \
   npx ts-node src/backfill-seed.ts
 
 # 2. Run backfill (can take hours for large accounts — runs overnight)
-GRAMJS_SESSION=... API_ID=... API_HASH=... INGEST_TOKEN=... WORKER_URL=... \
+GRAMJS_SESSION=... API_ID=... API_HASH=... INGEST_TOKEN=... WORKER_URL=... DATABASE_URL=... \
   npx ts-node src/backfill-run.ts
 ```
 
 Monitor progress:
 ```bash
-wrangler d1 execute tg-archive --command \
+psql "$DATABASE_URL" -c \
   "SELECT status, COUNT(*) FROM backfill_state GROUP BY status"
 ```

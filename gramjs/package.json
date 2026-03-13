@@ -7,7 +7,8 @@
     "listener": "npx ts-node src/listener.ts",
     "backfill-seed": "npx ts-node src/backfill-seed.ts",
     "backfill-run": "npx ts-node src/backfill-run.ts",
-    "enrich-senders": "npx ts-node src/enrich-senders.ts"
+    "enrich-senders": "npx ts-node src/enrich-senders.ts",
+    "enrich-chat-type": "npx ts-node src/enrich-chat-type.ts"
   },
   "dependencies": {
     "input": "^1.0.1",

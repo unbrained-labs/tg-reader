@@ -102,26 +102,26 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
     INSERT INTO messages (
       account_id, tg_message_id, tg_chat_id, chat_name, chat_type,
       sender_id, sender_username, sender_first_name, sender_last_name,
-      direction, message_type, text, media_type, media_file_id,
+      message_type, text, media_type, media_file_id,
       reply_to_message_id, forwarded_from_id, forwarded_from_name,
       sent_at, edit_date, is_deleted, deleted_at
     )
     SELECT $1,
       v.tg_message_id, v.tg_chat_id, v.chat_name, v.chat_type,
       v.sender_id, v.sender_username, v.sender_first_name, v.sender_last_name,
-      v.direction, v.message_type, v.text, v.media_type, v.media_file_id,
+      v.message_type, v.text, v.media_type, v.media_file_id,
       v.reply_to_message_id, v.forwarded_from_id, v.forwarded_from_name,
       v.sent_at, v.edit_date, v.is_deleted, v.deleted_at
     FROM UNNEST(
       $2::text[], $3::text[], $4::text[], $5::text[],
       $6::text[], $7::text[], $8::text[], $9::text[],
-      $10::text[], $11::text[], $12::text[], $13::text[], $14::text[],
-      $15::bigint[], $16::text[], $17::text[],
-      $18::bigint[], $19::bigint[], $20::smallint[], $21::bigint[]
+      $10::text[], $11::text[], $12::text[], $13::text[],
+      $14::bigint[], $15::text[], $16::text[],
+      $17::bigint[], $18::bigint[], $19::smallint[], $20::bigint[]
     ) AS v(
       tg_message_id, tg_chat_id, chat_name, chat_type,
       sender_id, sender_username, sender_first_name, sender_last_name,
-      direction, message_type, text, media_type, media_file_id,
+      message_type, text, media_type, media_file_id,
       reply_to_message_id, forwarded_from_id, forwarded_from_name,
       sent_at, edit_date, is_deleted, deleted_at
     )
@@ -139,7 +139,6 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
       sender_username   = COALESCE(EXCLUDED.sender_username, messages.sender_username),
       sender_first_name = COALESCE(EXCLUDED.sender_first_name, messages.sender_first_name),
       sender_last_name  = COALESCE(EXCLUDED.sender_last_name, messages.sender_last_name),
-      direction         = COALESCE(EXCLUDED.direction, messages.direction),
       message_type      = COALESCE(EXCLUDED.message_type, messages.message_type),
       media_type        = COALESCE(EXCLUDED.media_type, messages.media_type),
       reply_to_message_id  = COALESCE(EXCLUDED.reply_to_message_id, messages.reply_to_message_id),
@@ -166,7 +165,6 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
       msgs.map(m => m.sender_username ?? null),
       msgs.map(m => m.sender_first_name ?? null),
       msgs.map(m => m.sender_last_name ?? null),
-      msgs.map(m => m.direction ?? null),
       msgs.map(m => m.message_type ?? null),
       msgs.map(m => m.text ?? null),
       msgs.map(m => m.media_type ?? null),
@@ -249,7 +247,7 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
       const DATA_SQL = `
         SELECT m.id, m.tg_message_id, m.tg_chat_id, m.chat_name, m.chat_type,
                m.sender_id, m.sender_username, m.sender_first_name, m.sender_last_name,
-               m.direction, m.message_type, m.text, m.media_type,
+               m.message_type, m.text, m.media_type,
                m.reply_to_message_id, m.forwarded_from_name, m.sent_at
         FROM messages m
         WHERE m.search_vector @@ to_tsquery('simple', $1)
@@ -297,7 +295,7 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
       const DATA_SQL = `
         SELECT id, tg_message_id, tg_chat_id, chat_name, chat_type,
                sender_id, sender_username, sender_first_name, sender_last_name,
-               direction, message_type, text, media_type,
+               message_type, text, media_type,
                reply_to_message_id, forwarded_from_name, sent_at
         FROM messages
         WHERE account_id = $1
@@ -529,9 +527,7 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
       MIN(sent_at) AS earliest_message_at,
       MAX(sent_at) AS latest_message_at,
       SUM(CASE WHEN is_deleted = 1 THEN 1 ELSE 0 END) AS deleted_count,
-      SUM(CASE WHEN edit_date IS NOT NULL THEN 1 ELSE 0 END) AS edited_count,
-      SUM(CASE WHEN direction = 'out' THEN 1 ELSE 0 END) AS sent_count,
-      SUM(CASE WHEN direction = 'in' THEN 1 ELSE 0 END) AS received_count
+      SUM(CASE WHEN edit_date IS NOT NULL THEN 1 ELSE 0 END) AS edited_count
     FROM messages
     WHERE account_id = $1
   `.trim();
@@ -548,8 +544,6 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
         latest_message_at: number | null;
         deleted_count: string;
         edited_count: string;
-        sent_count: string;
-        received_count: string;
       }>>,
       sql(CONTACT_SQL, [accountId]) as unknown as Promise<Array<{ total_contacts: string }>>,
     ]);
@@ -564,8 +558,6 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
       latest_message_at: stats.latest_message_at,
       deleted_count: parseInt(stats.deleted_count, 10),
       edited_count: parseInt(stats.edited_count, 10),
-      sent_count: parseInt(stats.sent_count, 10),
-      received_count: parseInt(stats.received_count, 10),
       total_contacts,
       my_user_id,
     });
@@ -575,30 +567,18 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
   }
 }
 
-// Stores username → numeric_id alias so users can reference accounts by name.
-// Called by listener on startup. Uses global_config KV: key = 'alias:<username>', value = numeric_id.
-async function handleAccountRegister(request: Request, env: Env, accountId: string): Promise<Response> {
-  let body: unknown;
-  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }, 400); }
-  const username = (body as Record<string, unknown>).username;
-  if (typeof username !== 'string' || !username) return json({ ok: false, error: 'username required' }, 400);
-  const sql = getSql(env);
-  try {
-    await sql(
-      `INSERT INTO global_config (key, value) VALUES ($1, $2) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value`,
-      [`alias:${username.toLowerCase()}`, accountId],
-    );
-    return json({ ok: true });
-  } catch (err) {
-    console.error('[POST /account/register] DB error', err);
-    return json({ ok: false, error: 'DB error' }, 500);
-  }
-}
 
-async function handleGetConfig(_request: Request, env: Env): Promise<Response> {
+async function handleGetConfig(_request: Request, env: Env, accountId: string): Promise<Response> {
   const sql = getSql(env);
   try {
-    const rows = await sql(`SELECT value FROM global_config WHERE key = 'sync_mode'`) as Array<{ value: string }>;
+    // Account-specific setting takes precedence over global default.
+    const rows = await sql(
+      `SELECT value FROM global_config
+       WHERE key = 'sync_mode' AND account_id IN ($1, 'global')
+       ORDER BY CASE WHEN account_id = $1 THEN 0 ELSE 1 END
+       LIMIT 1`,
+      [accountId],
+    ) as Array<{ value: string }>;
     return json({ sync_mode: rows[0]?.value ?? 'all' });
   } catch (err) {
     console.error('[GET /config] DB error', err);
@@ -606,7 +586,7 @@ async function handleGetConfig(_request: Request, env: Env): Promise<Response> {
   }
 }
 
-async function handlePostConfig(request: Request, env: Env): Promise<Response> {
+async function handlePostConfig(request: Request, env: Env, accountId: string): Promise<Response> {
   let body: unknown;
   try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
 
@@ -618,8 +598,8 @@ async function handlePostConfig(request: Request, env: Env): Promise<Response> {
   const sql = getSql(env);
   try {
     await sql(
-      `INSERT INTO global_config (key, value) VALUES ('sync_mode', $1) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value`,
-      [syncMode],
+      `INSERT INTO global_config (account_id, key, value) VALUES ($1, 'sync_mode', $2) ON CONFLICT(account_id, key) DO UPDATE SET value = EXCLUDED.value`,
+      [accountId, syncMode],
     );
     return json({ ok: true });
   } catch (err) {
@@ -859,6 +839,12 @@ async function handleBackfillProgress(request: Request, env: Env, accountId: str
       return json({ ok: false, error: 'fetched_messages must be an integer' }, 400);
     }
     sets.push(`fetched_messages = ${next()}`); binds.push(b.fetched_messages);
+  }
+  if (b.total_messages !== undefined) {
+    if (typeof b.total_messages !== 'number' || !Number.isInteger(b.total_messages)) {
+      return json({ ok: false, error: 'total_messages must be an integer' }, 400);
+    }
+    sets.push(`total_messages = COALESCE(total_messages, ${next()})`); binds.push(b.total_messages);
   }
   if (b.last_error !== undefined) {
     if (typeof b.last_error !== 'string') {
@@ -1288,7 +1274,7 @@ function mcpError(id: unknown, code: number, message: string): object {
 const MCP_TOOL_DEFINITIONS = [
   {
     name: 'search',
-    description: 'Full-text search across the complete Telegram message archive (100k+ messages going back to 2020). Results are ranked by relevance then recency. Use this for ANY question about past conversations, finding specific messages, amounts, names, or topics. Always use from/to when the user mentions a time period. For sender-specific searches, use sender_username. Paginate with next_before_id + next_before_sent_at from the previous response.',
+    description: 'Full-text search across the complete Telegram message archive (51k+ messages). Results are ranked by relevance then recency. Use this for ANY question about past conversations, finding specific messages, amounts, names, or topics. Always use from/to when the user mentions a time period. For sender-specific searches, use sender_username. Paginate with next_before_id + next_before_sent_at from the previous response.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1511,7 +1497,7 @@ async function dispatchMcpTool(
     const SQL = `
       SELECT id, tg_message_id, tg_chat_id, chat_name, chat_type,
              sender_id, sender_username, sender_first_name, sender_last_name,
-             direction, message_type, text, media_type,
+             message_type, text, media_type,
              reply_to_message_id, forwarded_from_name, sent_at
       FROM messages
       WHERE account_id = $1
@@ -1541,7 +1527,7 @@ async function dispatchMcpTool(
 
   if (name === 'contacts') {
     const search = typeof args.search === 'string' && args.search.trim() !== ''
-      ? `%${args.search.trim()}%`
+      ? `%${args.search.trim().replace(/[%_\\]/g, '\\$&')}%`
       : null;
     const SQL = `
       SELECT
@@ -1606,7 +1592,7 @@ async function dispatchMcpTool(
           MAX(m.chat_name) OVER (PARTITION BY m.tg_chat_id) AS chat_name,
           MAX(cc.label) OVER (PARTITION BY m.tg_chat_id) AS label,
           m.id, m.tg_message_id, m.sender_username, m.sender_first_name,
-          m.direction, m.text, m.media_type, m.sent_at,
+          m.text, m.media_type, m.sent_at,
           ROW_NUMBER() OVER (PARTITION BY m.tg_chat_id ORDER BY m.sent_at DESC, m.id DESC) AS rn
         FROM messages m
         LEFT JOIN chat_config cc ON cc.account_id = m.account_id AND cc.tg_chat_id = m.tg_chat_id
@@ -1616,7 +1602,7 @@ async function dispatchMcpTool(
           AND ($3::text IS NULL OR cc.label = $3)
       )
       SELECT tg_chat_id, chat_name, label, id, tg_message_id,
-             sender_username, sender_first_name, direction, text, media_type, sent_at
+             sender_username, sender_first_name, text, media_type, sent_at
       FROM ranked
       WHERE rn <= $4
       ORDER BY tg_chat_id, sent_at ASC, id ASC
@@ -1644,7 +1630,7 @@ async function dispatchMcpTool(
     const keysetClause = afterId !== null ? `AND id > $4` : ``;
 
     const SQL = `
-      SELECT id, tg_message_id, sender_username, sender_first_name, direction,
+      SELECT id, tg_message_id, sender_username, sender_first_name,
              text, media_type, reply_to_message_id, sent_at
       FROM messages
       WHERE account_id = $1
@@ -1909,16 +1895,12 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
     return handleChats(request, env, accountId);
   }
 
-  if (method === 'POST' && pathname === '/account/register') {
-    return handleAccountRegister(request, env, accountId);
-  }
-
   if (method === 'GET' && pathname === '/config') {
-    return handleGetConfig(request, env);
+    return handleGetConfig(request, env, accountId);
   }
 
   if (method === 'POST' && pathname === '/config') {
-    return handlePostConfig(request, env);
+    return handlePostConfig(request, env, accountId);
   }
 
   if (method === 'GET' && pathname === '/chats/config') {
@@ -2044,15 +2026,15 @@ async function fetch(request: Request, env: Env): Promise<Response> {
     return json({ ok: false, error: 'Invalid X-Account-ID' }, 400);
   }
 
-  // If account_id is non-numeric (e.g. "d4d0ch"), resolve to numeric_id via alias table
+  // If account_id is non-numeric (e.g. "d4d0ch"), resolve to numeric_id via contacts self-entry
   if (!/^\d+$/.test(accountId) && accountId !== 'primary') {
     const sql = getSql(env);
     try {
       const rows = await sql(
-        `SELECT value FROM global_config WHERE key = $1`,
-        [`alias:${accountId.toLowerCase()}`],
-      ) as Array<{ value: string }>;
-      if (rows.length > 0) accountId = rows[0].value;
+        `SELECT account_id FROM contacts WHERE username = $1 AND account_id = tg_user_id LIMIT 1`,
+        [accountId.toLowerCase()],
+      ) as Array<{ account_id: string }>;
+      if (rows.length > 0) accountId = rows[0].account_id;
     } catch {
       // Non-fatal — proceed with original value
     }
@@ -2073,7 +2055,7 @@ async function* streamMessages(sql: NeonQueryFunction<false, false>): AsyncGener
     const rows = await sql(
       `SELECT id, account_id, tg_message_id, tg_chat_id, chat_name, chat_type,
               sender_id, sender_username, sender_first_name, sender_last_name,
-              direction, message_type, text, media_type, media_file_id,
+              message_type, text, media_type, media_file_id,
               reply_to_message_id, forwarded_from_id, forwarded_from_name,
               sent_at, edit_date, original_text, is_deleted, deleted_at, indexed_at
        FROM messages WHERE id > $1 ORDER BY id LIMIT $2`,
