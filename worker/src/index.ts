@@ -1732,33 +1732,50 @@ async function handleMcpMessage(
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
         serverInfo: { name: 'tg-reader', version: '1.0.0' },
-        instructions: `You have full read/write access to a Telegram account via this archive. Use "stats" first if you need the date range or message count.
+        instructions: `You have full read/write access to a Telegram archive (51k+ messages, 205 chats). All timestamps are Unix epoch seconds.
 
-READ TOOLS:
-- "search" — primary. Use for ANY question about past conversations, content, people, amounts, events. Always set from/to when user mentions a time period. Use sender_username to filter by person.
-- "stats" — archive overview. Use when user asks about size or date range.
-- "chats" — lists all chats with counts. Pass label="work" or label="personal" to scope. Use to get chat_id before history.
-- "history" — one chat chronologically. Use only for browsing. For finding content use search with chat_id.
-- "contacts" — find people by name/username. Look up sender_username before filtering search.
-- "recent" — latest messages across all chats. Use only for "what's new" queries.
-- "digest" — recent messages per chat grouped. Use for morning briefings or catch-up. Pass label="work" to scope to work chats.
-- "thread" — message + parent + direct replies. Use when you need full context of a reply chain.
+TOOL SELECTION — pick the right tool first time:
+- User asks about a past conversation, event, person, amount, decision → "search" (always start here)
+- User wants a morning briefing or catch-up across chats → "digest" (grouped by chat, supports label filter)
+- User asks "what's new" or "latest messages" → "digest(hours=1)" not "recent" (digest groups by chat, recent is a flat dump)
+- User wants to browse one chat chronologically → "history" (get chat_id from "chats" first)
+- User mentions a specific reply chain or wants context around one message → "thread"
+- User asks about a person → "contacts" to find username, then "search" with sender_username
+- User asks about archive size or date range → "stats"
 
-WRITE TOOLS (GramJS picks up within 30 seconds):
-- "send" — queue a message for immediate or scheduled sending. Single chat or mass send with {first_name}/{user} placeholders.
-- "draft" — save a draft without sending. Returns outbox id for later review/edit/send.
-- "edit_message" — queue an edit to an already-sent message.
-- "delete_message" — queue a delete (revokes from both sides).
-- "forward_message" — queue a forward to another chat.
+SEARCH TIPS:
+- Multiple words are ANDed — use words likely to appear verbatim
+- Always set from/to when the user mentions a time period (ISO 8601 or Unix epoch)
+- Paginate with next_before_id + next_before_sent_at from previous response
+- If 0 results: try fewer/broader terms, remove date range, check spelling
 
-AGENTIC WORKFLOW EXAMPLE — "find today's work todos":
-1. digest(hours=24, label="work") — scan recent work chats
-2. search(query="todo action need", from=today) — look for task language
-3. For each actionable item found: optionally draft() a summary or send() a reminder
+HISTORY / THREAD PAGINATION:
+- history: next_after_id + next_after_sent_at (advances forward in time)
+- thread: next_after_id (advances through replies)
 
-PAGINATION: search → next_before_id + next_before_sent_at. history → next_after_id + next_after_sent_at.
+WRITE TOOLS (GramJS executes within 30 seconds):
+- "send" — single chat or mass send with {first_name}/{last_name}/{username} placeholders
+- "draft" — save without sending; returns outbox id to review or promote later
+- "edit_message" / "delete_message" / "forward_message" — queue actions on already-sent messages
+- Always confirm before sending or deleting unless the user explicitly said to proceed
 
-IMPORTANT: Archive is complete. Never say data is unavailable — try broader terms or wider date range first.`,
+AGENTIC WORKFLOWS:
+"Find today's action items":
+  1. digest(hours=24, label="work") — scan recent work chats
+  2. search(query="need action deadline", from=<today>) — surface task language
+  3. draft() a summary or send() a reminder if needed
+
+"Catch up on a person":
+  1. contacts(search="name") — find their username
+  2. search(query="", sender_username="their_username") — all their messages
+  3. digest to see recent context in shared chats
+
+"Prepare a mass send":
+  1. contacts() — get recipient list
+  2. draft(text="Hi {first_name}...", recipients=[...]) — save draft
+  3. Review, then POST /outbox/:id/send to promote
+
+IMPORTANT: The archive is complete — never say data is unavailable. Try broader search terms or a wider date range before giving up.`,
       },
     };
   }
