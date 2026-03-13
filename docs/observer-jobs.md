@@ -190,24 +190,51 @@ Revoke the token → job is effectively disabled without losing its definition.
 
 ## Execution detail
 
+The Worker runs the agent loop directly — no external MCP client, no protocol overhead. `dispatchMcpTool` is the same function used by the MCP endpoint, so RBAC enforcement and audit logging are identical regardless of whether the caller is a human-facing Claude session or a cron job.
+
 ```ts
-// Worker cron handler
+async function runAgentLoop(job: Job, context: string, env: Env): Promise<void> {
+  const messages = [{ role: 'user', content: buildPrompt(job, context) }];
+  const tools = MCP_TOOL_DEFINITIONS; // reuse existing definitions
+
+  while (true) {
+    const response = await callModel(job.model_config, messages, tools, env);
+
+    if (response.stop_reason === 'end_turn') break;
+
+    if (response.stop_reason === 'tool_use') {
+      for (const toolCall of response.tool_calls) {
+        const result = await dispatchMcpTool(
+          toolCall.name,
+          toolCall.args,
+          env,
+          job.account_id,
+          job.token_id,    // RBAC enforced — same path as any agent session
+        );
+        messages.push({ role: 'tool', content: result });
+      }
+      continue;
+    }
+
+    break;
+  }
+}
+
 async function runJobs(env: Env): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
   const dueJobs = await getDueJobs(env, now);
 
   for (const job of dueJobs) {
     const context = await buildContext(job, env);
-    const prompt = interpolate(job.task_prompt, context);
-    const apiKey = env[job.model_config.api_key_ref]; // Cloudflare secret
-
-    await callModel(job.model_config, prompt, job.token_id, env);
+    await runAgentLoop(job, context, env);
     await markJobRun(job.id, now, env);
   }
 }
 ```
 
-The model call includes the MCP endpoint URL + the job's token in the system prompt or tool config, so the agent can call back into the archive.
+**Why not go through the full MCP transport?** The Worker calling its own MCP endpoint over HTTP would add unnecessary JSON-RPC handshake overhead and a loopback network hop. Calling `dispatchMcpTool` directly is faster and simpler — the MCP protocol exists for external clients, not for internal use.
+
+**BYOM compatibility:** `callModel` normalises the request to OpenAI's chat completions format, which all major providers support. Tool definitions from `MCP_TOOL_DEFINITIONS` are passed as-is — the same descriptions that guide interactive agents guide cron agents.
 
 ---
 
