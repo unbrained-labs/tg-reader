@@ -184,7 +184,7 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  const written = parseInt(result.rowCount ?? '0', 10);
+  const written = result.rowCount ?? 0;
   const noop = msgs.length - written;
   console.log(`[POST /ingest] written=${written} noop=${noop}`);
   return json({ written, noop });
@@ -427,7 +427,7 @@ async function handlePostContacts(request: Request, env: Env, accountId: string)
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  const upserted = parseInt(result.rowCount ?? '0', 10);
+  const upserted = result.rowCount ?? 0;
   console.log(`[POST /contacts] upserted=${upserted}`);
   return json({ upserted });
 }
@@ -539,7 +539,7 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
   const sql = getSql(env);
   try {
     const [msgResult, contactResult] = await Promise.all([
-      sql(SQL, [accountId]) as Promise<Array<{
+      sql(SQL, [accountId]) as unknown as Promise<Array<{
         total_messages: string;
         total_chats: string;
         earliest_message_at: number | null;
@@ -549,7 +549,7 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
         sent_count: string;
         received_count: string;
       }>>,
-      sql(CONTACT_SQL, [accountId]) as Promise<Array<{ total_contacts: string }>>,
+      sql(CONTACT_SQL, [accountId]) as unknown as Promise<Array<{ total_contacts: string }>>,
     ]);
     const stats = msgResult[0];
     const total_contacts = parseInt(contactResult[0].total_contacts, 10);
@@ -730,7 +730,7 @@ async function handleDeleted(request: Request, env: Env, accountId: string): Pro
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  const marked = parseInt(result.rowCount ?? '0', 10);
+  const marked = result.rowCount ?? 0;
   console.log(`[POST /deleted] marked=${marked}`);
   return json({ marked });
 }
@@ -777,7 +777,7 @@ async function handleBackfillSeed(request: Request, env: Env, accountId: string)
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  const seeded = parseInt(result.rowCount ?? '0', 10);
+  const seeded = result.rowCount ?? 0;
   console.log(`[POST /backfill/seed] seeded=${seeded}`);
   return json({ seeded });
 }
