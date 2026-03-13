@@ -17,21 +17,23 @@ tg-reader captures every Telegram message you send and receive into a searchable
 │  GramJS listener  (Node.js)              │
 │  • Captures new messages in real-time    │
 │  • Gap recovery on restart               │
+│  • Polls outbox + actions every 30s      │
 │  • Backfill scripts (one-time)           │
 └───────────────┬──────────────────────────┘
-                │ POST /ingest (HTTPS)
+                │ REST API (HTTPS)
                 ▼
 ┌──────────────────────────────────────────┐
 │       Cloudflare Worker  ($5/mo)         │
 │                                          │
-│  REST API — ingest, search, config       │
+│  REST API — ingest, search, write,       │
+│  config, MCP server                      │
 └──────────┬───────────────────────────────┘
            │                     │
            ▼                     ▼
 ┌─────────────────┐   ┌──────────────────┐
-│  Cloudflare D1  │   │  Cloudflare R2   │
-│  SQLite + FTS5  │   │  Daily backups   │
-│  (included)     │   │  (~$0/mo)        │
+│  Neon PostgreSQL│   │  Cloudflare R2   │
+│  (serverless)   │   │  Daily backups   │
+│  $0–19/mo       │   │  (~$0/mo)        │
 └─────────────────┘   └──────────────────┘
 ```
 
@@ -44,6 +46,13 @@ tg-reader captures every Telegram message you send and receive into a searchable
 - Forwarded message metadata
 - Reply context
 
+## What you can send
+
+- Replies, scheduled messages, and drafts via the outbox
+- Mass messages to multiple chats with `{user}` / `{first_name}` placeholders
+- Edit, delete (revoke), and forward already-sent messages
+- All writes go through the Worker outbox — GramJS picks them up within 30 seconds
+
 ## What does NOT get stored
 
 - Media files (photos, videos, documents) — only the type and Telegram file ID are stored, not the binary
@@ -54,11 +63,12 @@ tg-reader captures every Telegram message you send and receive into a searchable
 
 | Component | Service | Cost |
 |-----------|---------|------|
-| Message listener | Fly.io (shared VM) | ~$4/mo |
-| API + database | Cloudflare Workers Paid + D1 | $5/mo |
+| Message listener + writer | Fly.io (shared VM) | ~$4/mo |
+| API + MCP server | Cloudflare Workers Paid | $5/mo |
+| Database | Neon PostgreSQL (serverless) | $0–19/mo |
 | Backups | Cloudflare R2 | ~$0/mo |
-| **Total** | | **~$9/mo** |
+| **Total** | | **~$9–28/mo** |
 
 ## Multi-account support
 
-Multiple Telegram accounts can be connected to the same Worker and D1 database. Each account's data is isolated by `account_id`.
+Multiple Telegram accounts can be connected to the same Worker and Neon database. Each account's data is isolated by `account_id`.

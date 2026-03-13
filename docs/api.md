@@ -1,4 +1,4 @@
-# Search API
+# REST API Reference
 
 > Machine-readable spec: [`openapi.yaml`](../openapi.yaml) — import into Postman, Insomnia, or view at [editor.swagger.io](https://editor.swagger.io).
 
@@ -11,86 +11,179 @@ X-Account-ID: <account-id>
 
 ---
 
-## GET /search
+## Read endpoints
+
+### GET /search
 
 Full-text search across all archived messages.
 
-### Parameters
+| Param | Type | Description |
+|-------|------|-------------|
+| `q` | string | Search query — words are ANDed |
+| `chat_id` | string | Filter to a specific chat |
+| `sender_username` | string | Filter by sender username |
+| `from` | string | Start date — ISO 8601 or Unix timestamp |
+| `to` | string | End date — ISO 8601 or Unix timestamp |
+| `limit` | number | Results per page, default 20, max 100 |
+| `before_id` | number | Pagination cursor from previous response |
+
+### GET /chats
+
+Lists all chats with message counts, last activity, and label.
 
 | Param | Type | Description |
 |-------|------|-------------|
-| `q` | string | Search query — words are ANDed, prefix matching enabled |
-| `chat_id` | string | Filter to a specific chat |
-| `sender_username` | string | Filter by sender username |
-| `from` | string | Start date — ISO 8601 (`2024-01-01`) or Unix timestamp |
-| `to` | string | End date — ISO 8601 or Unix timestamp |
-| `limit` | number | Results per page, default 20, max 100 |
-| `before_id` | number | Pagination cursor — pass `next_before_id` from previous response |
+| `name` | string | Filter by chat name (partial, case-insensitive) |
+| `label` | string | Filter by label (e.g. `work`, `personal`) |
 
-### Example
-
-```bash
-curl "https://<worker>/search?q=invoice+payment&from=2024-01-01&to=2024-06-30&limit=20" \
-  -H "X-Ingest-Token: <token>" \
-  -H "X-Account-ID: <account_id>"
-```
-
-### Response
-
-```json
-{
-  "results": [
-    {
-      "id": 12345,
-      "tg_message_id": 98765,
-      "tg_chat_id": "1234567890",
-      "chat_name": "John Smith",
-      "chat_type": "user",
-      "sender_id": "1234567890",
-      "sender_username": "johnsmith",
-      "sender_first_name": "John",
-      "sender_last_name": "Smith",
-      "direction": "in",
-      "message_type": "text",
-      "text": "I sent the invoice payment yesterday",
-      "media_type": null,
-      "reply_to_message_id": null,
-      "sent_at": 1704067200,
-      "edit_date": null,
-      "original_text": null,
-      "is_deleted": 0
-    }
-  ],
-  "total": 42,
-  "limit": 20,
-  "next_before_id": 12300
-}
-```
-
-Paginate by passing `next_before_id` as `before_id` in the next request. `next_before_id` is `null` when there are no more results.
-
----
-
-## GET /chats
-
-Lists all chats with message counts and last activity.
-
-```bash
-curl "https://<worker>/chats" \
-  -H "X-Ingest-Token: <token>" \
-  -H "X-Account-ID: <account_id>"
-```
-
----
-
-## GET /contacts
+### GET /contacts
 
 Lists contacts with names, usernames, and message counts.
 
-```bash
-curl "https://<worker>/contacts" \
-  -H "X-Ingest-Token: <token>" \
-  -H "X-Account-ID: <account_id>"
+| Param | Type | Description |
+|-------|------|-------------|
+| `search` | string | Filter by name or username |
+
+### GET /stats
+
+Archive statistics — total messages, chats, contacts, date range, `my_user_id`.
+
+---
+
+## Chat config
+
+### GET /chats/config
+
+Returns per-chat sync settings and labels.
+
+### POST /chats/config
+
+```json
+{
+  "tg_chat_id": "12345678",
+  "chat_name": "optional",
+  "sync": "include|exclude",
+  "label": "work"
+}
+```
+
+`sync` and `label` are both optional — omitting one preserves the existing value.
+
+### DELETE /chats/config/:tg_chat_id
+
+Remove a chat's config entry.
+
+---
+
+## Outbox (write)
+
+All outbox items are picked up by GramJS within 30 seconds.
+
+### POST /outbox
+
+Create a draft, pending send, scheduled send, or mass send.
+
+```json
+{
+  "tg_chat_id": "12345678",
+  "text": "Hello!",
+  "status": "pending",
+  "reply_to_message_id": 99999,
+  "scheduled_at": 1735689600
+}
+```
+
+For mass sends, omit `tg_chat_id` and provide `recipients`:
+
+```json
+{
+  "text": "Hi {first_name}!",
+  "status": "pending",
+  "recipients": [
+    { "tg_chat_id": "111", "first_name": "Alice", "username": "alice" }
+  ]
+}
+```
+
+**Status values:** `draft` · `pending` · `scheduled`
+
+### GET /outbox
+
+List outbox items. Filter with `?status=draft` etc.
+
+### GET /outbox/due
+
+GramJS polling endpoint — atomically claims pending/due items and marks them `sending`.
+
+### PATCH /outbox/:id
+
+Update a draft (only works while `status=draft`).
+
+```json
+{ "text": "Updated text", "scheduled_at": null }
+```
+
+### DELETE /outbox/:id
+
+Delete a draft (only works while `status=draft`).
+
+### POST /outbox/:id/send
+
+Promote a draft to `pending` (immediate) or `scheduled` (pass `scheduled_at`).
+
+```json
+{ "scheduled_at": 1735689600 }
+```
+
+### POST /outbox/:id/ack
+
+GramJS reports send result.
+
+```json
+{
+  "status": "sent|failed|partial",
+  "sent_at": 1704067200,
+  "error": "optional",
+  "results": [
+    { "id": 1, "status": "sent", "sent_at": 1704067200 }
+  ]
+}
+```
+
+---
+
+## Pending actions (write)
+
+Edit, delete, and forward already-sent messages. GramJS executes within 30 seconds.
+
+### POST /actions/edit
+
+```json
+{ "tg_chat_id": "12345678", "tg_message_id": "99999", "text": "New text" }
+```
+
+### POST /actions/delete
+
+```json
+{ "tg_chat_id": "12345678", "tg_message_id": "99999" }
+```
+
+### POST /actions/forward
+
+```json
+{ "tg_chat_id": "12345678", "tg_message_id": "99999", "to_chat_id": "87654321" }
+```
+
+### GET /actions/pending
+
+GramJS polling endpoint — returns all pending actions.
+
+### POST /actions/:id/ack
+
+GramJS reports action result.
+
+```json
+{ "status": "done|failed", "error": "optional" }
 ```
 
 ---
@@ -98,20 +191,20 @@ curl "https://<worker>/contacts" \
 ## Data reference
 
 ### `direction`
-- `"out"` — message sent by the account owner
-- `"in"` — message received
-
-### `message_type`
-`text`, `photo`, `video`, `audio`, `voice`, `document`, `sticker`, `video_note`, `service`
+- `"out"` — sent by the account owner
+- `"in"` — received
 
 ### `chat_type`
-`user` (DM), `group`, `supergroup`, `channel`, `bot`
+`user` (DM) · `group` · `supergroup` · `channel` · `bot`
 
 ### Timestamps
-All timestamps (`sent_at`, `edit_date`, `deleted_at`) are **Unix epoch seconds**.
+All timestamps (`sent_at`, `edit_date`, `deleted_at`, `scheduled_at`) are **Unix epoch seconds**.
 
 ### Deleted messages
-Soft-deleted — `is_deleted=1`, `deleted_at` set. Message content is preserved.
+Soft-deleted — `is_deleted=1`, `deleted_at` set. Content preserved.
 
 ### Edited messages
 `original_text` contains the pre-edit text. `text` is always the latest version.
+
+### Outbox status lifecycle
+`draft` → `pending` / `scheduled` → `sending` → `sent` / `failed` / `partial`
