@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Full archive of all Telegram messages (sent + received) stored in Cloudflare D1, searchable by contact, keyword, date range, and chat/group.
+Full archive of all Telegram messages (sent + received) stored in Neon PostgreSQL, searchable by contact, keyword, date range, and chat/group. Supports writing: replies, drafts, scheduled sends, mass sends, edit/delete/forward.
 
 ---
 
@@ -10,122 +10,65 @@ Full archive of all Telegram messages (sent + received) stored in Cloudflare D1,
 
 ```
 GramJS (Fly.io shared VM)
-  → Cloudflare Worker (/ingest, /search, /config endpoints)
-    → Cloudflare D1 (SQLite + FTS5)
+  → Cloudflare Worker (REST API + MCP server)
+    → Neon PostgreSQL (serverless HTTP)
+    → Cloudflare R2 (daily backup)
 ```
 
-**Infrastructure tier:** Cloudflare Workers Paid ($5/month) — required for backfill write throughput (free tier caps at 100k row writes/day).
+**Infrastructure tier:** Cloudflare Workers Paid ($5/month). Neon serverless PostgreSQL ($0–19/month).
 
 ---
 
 ## Data Model
 
-```sql
-CREATE TABLE messages (
-  id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-  tg_message_id        INTEGER NOT NULL,
-  tg_chat_id           TEXT NOT NULL,         -- stored as TEXT, Telegram IDs are 64-bit
-  chat_name            TEXT,
-  chat_type            TEXT CHECK(chat_type IN ('user', 'group', 'supergroup', 'channel', 'bot')),
-  sender_id            TEXT,
-  sender_username      TEXT,
-  sender_first_name    TEXT,
-  sender_last_name     TEXT,
-  direction            TEXT CHECK(direction IN ('in', 'out')),
-  message_type         TEXT,                  -- text, sticker, poll, location, contact, dice, etc.
-  text                 TEXT,
-  media_type           TEXT,                  -- photo, video, document, voice, audio, sticker, etc.
-  media_file_id        TEXT,                  -- reference only, no binary stored
-  reply_to_message_id  INTEGER,
-  forwarded_from_id    TEXT,
-  forwarded_from_name  TEXT,
-  sent_at              INTEGER NOT NULL,      -- Unix epoch seconds (Telegram native format)
-  edit_date            INTEGER,               -- Unix epoch seconds, NULL if never edited
-  is_deleted           INTEGER DEFAULT 0,     -- 1 if observed as deleted
-  deleted_at           INTEGER,               -- Unix epoch seconds, NULL if not deleted
-  indexed_at           INTEGER DEFAULT (unixepoch()),
-  UNIQUE(tg_chat_id, tg_message_id)
-);
+See `schema.sql` for the authoritative PostgreSQL schema. Key tables:
 
-CREATE TABLE chat_config (
-  tg_chat_id   TEXT PRIMARY KEY,
-  chat_name    TEXT,
-  sync         TEXT CHECK(sync IN ('include', 'exclude')) DEFAULT 'include',
-  updated_at   INTEGER DEFAULT (unixepoch())
-);
+### messages
+Primary archive table. `account_id` scopes all queries for multi-account support.
 
-CREATE TABLE global_config (
-  key   TEXT PRIMARY KEY,
-  value TEXT
-);
--- Seed: INSERT INTO global_config VALUES ('sync_mode', 'all');
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | BIGINT IDENTITY | internal PK |
+| `account_id` | TEXT | defaults to `'primary'` |
+| `tg_message_id` | TEXT | Telegram message ID — always TEXT (64-bit safe) |
+| `tg_chat_id` | TEXT | always TEXT — Telegram IDs are 64-bit |
+| `sender_id` | TEXT | always TEXT |
+| `direction` | TEXT | `'in'` or `'out'` |
+| `sent_at` | BIGINT | Unix epoch seconds — Telegram's native format |
+| `edit_date` | BIGINT | Unix epoch seconds, NULL if never edited |
+| `original_text` | TEXT | pre-edit text, NULL if never edited |
+| `is_deleted` | SMALLINT | 0 or 1 |
+| `search_vector` | tsvector | generated column, GIN indexed |
 
-CREATE TABLE contacts (
-  tg_user_id       TEXT PRIMARY KEY,       -- stored as TEXT, 64-bit
-  phone            TEXT,
-  username         TEXT,
-  first_name       TEXT,
-  last_name        TEXT,
-  is_mutual        INTEGER DEFAULT 0,      -- 1 if they have you saved too
-  is_bot           INTEGER DEFAULT 0,
-  updated_at       INTEGER DEFAULT (unixepoch())
-);
+### chat_config
+Per-chat sync overrides and labels.
 
-CREATE INDEX idx_contacts_username ON contacts(username);
+| Column | Notes |
+|--------|-------|
+| `sync` | `'include'` or `'exclude'` |
+| `label` | freeform tag e.g. `'work'`, `'personal'` |
 
-CREATE TABLE backfill_state (
-  tg_chat_id         TEXT PRIMARY KEY,
-  chat_name          TEXT,
-  total_messages     INTEGER,
-  fetched_messages   INTEGER DEFAULT 0,
-  oldest_message_id  INTEGER,               -- offsetId anchor for next page (not numeric offset)
-  status             TEXT CHECK(status IN ('pending', 'in_progress', 'complete', 'failed')) DEFAULT 'pending',
-  last_error         TEXT,
-  started_at         INTEGER,
-  completed_at       INTEGER
-);
-```
+### outbox
+Write queue — drafts, scheduled sends, single sends, mass sends.
 
-### Indexes
+| Status | Meaning |
+|--------|---------|
+| `draft` | not yet queued |
+| `scheduled` | queued, wait until `scheduled_at` |
+| `pending` | ready for immediate pickup |
+| `sending` | GramJS has claimed it |
+| `sent` | delivered |
+| `failed` | delivery failed |
+| `partial` | mass send with some failures |
 
-```sql
--- Composite: covers chat timeline queries (most common pattern)
-CREATE INDEX idx_chat_time ON messages(tg_chat_id, sent_at DESC);
+### outbox_recipients
+Per-recipient rows for mass sends. Each has its own `status` (`pending` → `sent`/`failed`).
 
--- Individual: for cross-chat time queries and sender lookups
-CREATE INDEX idx_sent_at   ON messages(sent_at);
-CREATE INDEX idx_sender_id ON messages(sender_id);
+### pending_actions
+Edit / delete / forward on already-sent messages. Status: `pending` → `done`/`failed`.
 
--- FTS5 virtual table for full-text search (replaces useless B-tree text index)
-CREATE VIRTUAL TABLE messages_fts USING fts5(
-  text,
-  sender_username,
-  sender_first_name,
-  chat_name,
-  content='messages',
-  content_rowid='id'
-);
-
--- Triggers to keep FTS5 in sync
-CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
-  INSERT INTO messages_fts(rowid, text, sender_username, sender_first_name, chat_name)
-  VALUES (new.id, new.text, new.sender_username, new.sender_first_name, new.chat_name);
-END;
-
-CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
-  INSERT INTO messages_fts(messages_fts, rowid, text, sender_username, sender_first_name, chat_name)
-  VALUES ('delete', old.id, old.text, old.sender_username, old.sender_first_name, old.chat_name);
-END;
-
-CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
-  INSERT INTO messages_fts(messages_fts, rowid, text, sender_username, sender_first_name, chat_name)
-  VALUES ('delete', old.id, old.text, old.sender_username, old.sender_first_name, old.chat_name);
-  INSERT INTO messages_fts(rowid, text, sender_username, sender_first_name, chat_name)
-  VALUES (new.id, new.text, new.sender_username, new.sender_first_name, new.chat_name);
-END;
-```
-
-> **D1/FTS5 backup caveat:** `wrangler d1 export` cannot export databases with FTS5 virtual tables. Use a scheduled Worker cron that dumps to R2 as JSON — do not rely on wrangler export for backups.
+### contacts, backfill_state, global_config
+See `schema.sql`.
 
 ---
 
@@ -146,206 +89,131 @@ Default: `all`
 
 ## GramJS Listener (Fly.io)
 
-- Persistent Node.js process running in a Fly.io shared VM (~$2-4/mo)
-- Deployed via `fly deploy` (Dockerfile); Fly handles restarts and health checks — no PM2 needed
-- Authenticates once via phone + 2FA; session string stored as **Fly secret** (`fly secrets set GRAMJS_SESSION=...`)
-- Listens to all `NewMessage` events
-- On each message: evaluates sync rules → if allowed, POSTs batch to Worker `/ingest`
-- Authenticates to Worker via `X-Ingest-Token` shared secret (stored as Fly secret + Cloudflare Worker secret)
+- Persistent Node.js process in a Fly.io shared VM
+- Authenticates once; session string stored as Fly secret
+- Handles `NewMessage`, `EditedMessage`, `DeletedMessage` events
+- **Outbox polling**: every 30s calls `GET /outbox/due` → sends claimed items → `POST /outbox/:id/ack`
+- **Actions polling**: every 30s calls `GET /actions/pending` → executes edit/delete/forward → `POST /actions/:id/ack`
 
-### Gap Recovery on Restart
+### Gap Recovery
 
-GramJS's `NewMessage` events are not replayed after a process restart — messages received during downtime are silently lost without recovery.
-
-On every startup, before entering the live listener loop:
+On every startup:
 1. Read `last_pts` from `/data/state.json` (Fly persistent volume)
-2. Call `client.invoke(new GetDifferenceRequest(...))` with the saved pts
-3. Process any missed updates
-4. Enter live listener loop, persisting pts on each update
+2. Call `getDifference()` with saved pts
+3. Process missed updates
+4. Enter live listener loop, persisting pts every 60s
 
-This recovers gaps caused by Fly restarts or deploys.
+### Template rendering (mass send)
 
-**Fly persistent volume:** `fly volumes create tg_state --size 1` mounted at `/data`. Survives restarts and deploys — only lost if volume is explicitly deleted.
+Placeholders replaced per recipient: `{user}` (first name → @username → "there"), `{first_name}`, `{last_name}`, `{username}`.
 
 ---
 
-## Write Path
+## Write Path (outbox)
 
 ```
-GramJS NewMessage event
-  → evaluate sync rules (sync_mode + chat_config)
-  → if allowed: buffer messages into batch (up to 100)
-  → POST /ingest { messages: [...] }
-  → Worker validates token, iterates batch
-  → D1 db.batch() with prepared INSERT statements (UNIQUE constraint deduplicates)
+POST /outbox  →  insert row (status=draft|pending|scheduled)
+                  ↓
+GET /outbox/due (GramJS polls every 30s)
+  → atomic CTE: reset stuck 'sending' items, claim due items
+  → return items with status='sending'
+                  ↓
+GramJS sends via Telegram API
+  → POST /outbox/:id/ack  { status: sent|failed|partial }
 ```
 
-**Batch size:** up to 100 messages per POST (D1 bound parameter limit: 100 per statement × 1 statement per message in a batch call — do not use multi-row INSERT VALUES syntax).
+For mass sends, `outbox_recipients` rows track per-chat status. Failed recipients are reset and retried on stuck-item recovery.
 
 ---
 
 ## Worker Endpoints
 
-### Ingest (internal, token-protected)
+### Read
 
-```
-POST /ingest
-  Header: X-Ingest-Token: <secret>
-  Body: { messages: Message[] }   -- array, 1–100 items
-  Response: { inserted: N, skipped: N }
-```
+| Endpoint | Description |
+|----------|-------------|
+| `GET /search` | Full-text search — `q`, `chat_id`, `sender_username`, `from`, `to`, `limit`, `before_id`, `before_sent_at` |
+| `GET /chats` | All chats — `name` filter, `label` filter |
+| `GET /contacts` | Contacts with message counts — `search` filter |
+| `GET /stats` | Archive statistics + `my_user_id` |
 
-Request validation: check array length (1–100), reject with 400 otherwise. No timestamp-based replay guard — it would reject backfill messages with historical sent_at values.
+### Ingest
 
-### Search
-
-```
-GET /search?q=keyword
-GET /search?chat_id=xxx
-GET /search?sender_username=xxx
-GET /search?from=1704067200&to=1719792000   -- Unix epoch seconds
-GET /search?q=keyword&chat_id=xxx&from=...&to=...
-
-Query params:
-  q             keyword (FTS5 MATCH)
-  chat_id       tg_chat_id exact match
-  sender_username  exact match
-  from / to     Unix epoch seconds (inclusive)
-  limit         default 50, max 200
-  offset        default 0
-
-Response:
-{
-  "results": [{ ...message row }],
-  "total": N,     -- COUNT(*) for the same filters (for pagination UI)
-  "limit": 50,
-  "offset": 0
-}
-```
-
-Search query uses FTS5 when `q` is present:
-
-```sql
-SELECT m.*
-FROM messages m
-JOIN messages_fts ON messages_fts.rowid = m.id
-WHERE messages_fts MATCH ?
-  AND (m.tg_chat_id = ? OR ? IS NULL)
-  AND m.sent_at BETWEEN ? AND ?
-ORDER BY m.sent_at DESC
-LIMIT ? OFFSET ?;
-```
-
-### Contacts & Chats
-
-```
-GET /contacts
-  -- Joins contacts table with message counts from messages table
-  Response: [{ tg_user_id, phone, username, first_name, last_name, is_mutual, is_bot, message_count, last_seen }]
-
-GET /chats
-  -- Distinct chats from messages table, joined with chat_config for sync status
-  Response: [{ tg_chat_id, chat_name, chat_type, message_count, last_message_at, sync_status }]
-  -- sync_status: 'include' | 'exclude' | 'default' (no chat_config entry)
-```
-
-Both endpoints: no pagination (cardinality is bounded by number of distinct chats/contacts — not expected to be large).
+| Endpoint | Description |
+|----------|-------------|
+| `POST /ingest` | Batch upsert messages (1–100) |
+| `POST /contacts` | Batch upsert contacts |
+| `POST /deleted` | Mark messages as deleted |
 
 ### Config
 
-```
-GET  /config
-  Response: { sync_mode: 'all'|'blacklist'|'whitelist'|'none' }
+| Endpoint | Description |
+|----------|-------------|
+| `GET/POST /config` | Global `sync_mode` |
+| `GET/POST /chats/config` | Per-chat `sync` + `label` |
+| `DELETE /chats/config/:id` | Remove chat override |
 
-POST /config
-  Body: { sync_mode: 'all'|'blacklist'|'whitelist'|'none' }
+### Outbox
 
-GET  /chats/config
-  Response: [{ tg_chat_id, chat_name, sync, updated_at }]
+| Endpoint | Description |
+|----------|-------------|
+| `POST /outbox` | Create draft/pending/scheduled/mass send |
+| `GET /outbox` | List items, filter by `status` |
+| `GET /outbox/due` | GramJS: atomically claim due items |
+| `PATCH /outbox/:id` | Edit draft |
+| `DELETE /outbox/:id` | Delete draft |
+| `POST /outbox/:id/send` | Promote draft to pending/scheduled |
+| `POST /outbox/:id/ack` | GramJS: report send result |
 
-POST /chats/config
-  Body: { tg_chat_id, chat_name, sync: 'include'|'exclude' }
+### Actions
 
-DELETE /chats/config/:tg_chat_id
-  -- Removes override, chat reverts to default behaviour
-```
+| Endpoint | Description |
+|----------|-------------|
+| `POST /actions/edit` | Queue message edit |
+| `POST /actions/delete` | Queue message delete (revoke) |
+| `POST /actions/forward` | Queue message forward |
+| `GET /actions/pending` | GramJS: fetch pending actions |
+| `POST /actions/:id/ack` | GramJS: report action result |
+
+### Backfill
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /backfill/seed` | Register dialogs in backfill_state |
+| `GET /backfill/pending` | Get pending/in_progress dialogs |
+| `POST /backfill/progress` | Update backfill progress |
+
+### MCP
+
+`POST /mcp` — JSON-RPC 2.0 MCP server. Tools: `search`, `chats`, `history`, `contacts`, `recent`, `stats`, `digest`, `thread`, `send`, `draft`, `edit_message`, `delete_message`, `forward_message`.
 
 ---
 
-## Backfill
+## Search
 
-One-time historical import using GramJS `getHistory()` per dialog.
-
-### Design
-
-- Uses `backfill_state` table to track progress — fully resumable
-- Processes one dialog at a time (serial, not parallel)
-- Paginated using `offsetId` (the `tg_message_id` of the oldest message seen in the previous batch) — **not numeric offsets**, which break if messages are deleted between calls
-- Same `/ingest` batch endpoint as live listener
-- Respects same sync config
-
-### Rate limiting
-
-- GramJS `floodSleepThreshold`: set to `300` during backfill (auto-sleep on FLOOD_WAIT up to 5 minutes)
-- Batch size: 100 messages per `getHistory()` call
-- Sleep 1–2 seconds between batches
-- At ~30 API calls/minute (Telegram soft limit), expect 3–5 hours for a large account
-
-### Process
+PostgreSQL FTS using `tsvector` generated column + GIN index. Query uses prefix matching (`token:*`) with `&` operator. Keyset pagination via `before_id` + `before_sent_at` (not offset).
 
 ```
-1. Enumerate all dialogs via getDialogs()
-2. For each dialog: INSERT OR IGNORE into backfill_state (status='pending')
-3. Loop over pending dialogs:
-   a. Set status = 'in_progress', started_at = now
-   b. Fetch page using getHistory(offsetId=oldest_message_id, limit=100)
-   c. POST batch to /ingest
-   d. Update backfill_state.oldest_message_id, fetched_messages
-   e. If page < 100 messages: set status = 'complete', completed_at = now
-   f. Sleep 1s, repeat from (b)
-4. On crash/restart: resume from in_progress or pending dialogs
+Response: { results: [...], total: N, limit: N, next_before_id: N|null, next_before_sent_at: N|null }
 ```
 
 ---
 
 ## Auth
 
-Single token (`X-Ingest-Token`) for all endpoints — ingest, search, and config.
-
-| Location | How |
-|----------|-----|
-| Cloudflare Worker | `wrangler secret put INGEST_TOKEN` |
-| GramJS on Fly.io | `fly secrets set INGEST_TOKEN=...` |
-
-Token rotation: update CF Worker secret → `fly secrets set INGEST_TOKEN=...` (triggers auto-restart). No redeployment needed on either side.
-
-**Note:** GramJS fetches sync config from Worker on startup (`GET /config`, `GET /chats/config`) — these requests must include the `X-Ingest-Token` header.
+Single token (`X-Ingest-Token`) for all endpoints. `X-Account-ID` identifies the account (defaults to `'primary'`). MCP also accepts `?token=` and `?account_id=` query params.
 
 ---
 
-## D1 Operational Notes
+## Backup
 
-- **Storage limit:** 10 GB hard ceiling per D1 database. At ~1 KB effective per message (with FTS5 overhead), capacity is ~5–10 million messages. Add a health check cron that alerts when usage crosses 7 GB.
-- **Backup:** Scheduled Worker cron (daily) dumps `SELECT * FROM messages` to Cloudflare R2 as newline-delimited JSON. Do not use `wrangler d1 export` (incompatible with FTS5).
-- **Write throughput:** D1 batch API handles backfill comfortably on Workers Paid tier.
+Scheduled Worker cron (daily at 03:00 UTC) dumps `SELECT * FROM messages` to Cloudflare R2 as newline-delimited JSON. 30-day TTL on R2 objects.
 
 ---
 
-## Out of Scope (v1)
+## Operational Notes
 
-- Media file storage (file_id reference stored only)
-- UI (API only)
-- Encryption at rest
-- Message edit history (edit_date column present, diff tracking deferred)
-- Full deletion tracking (is_deleted/deleted_at columns present, active monitoring deferred)
-
----
-
-## Build Order
-
-1. D1 schema (messages, chat_config, global_config, backfill_state, FTS5, indexes, triggers)
-2. Cloudflare Worker (ingest + search + config endpoints)
-3. GramJS listener on Fly.io + gap recovery on startup
-4. Backfill script
-5. End-to-end test
-6. D1 → R2 backup cron
+- **Database**: Neon serverless HTTP (`@neondatabase/serverless`). No connection pooling needed — each Worker request gets a fresh HTTP connection.
+- **Schema migrations**: `schema.sql` uses `IF NOT EXISTS` everywhere — safe to re-run on live DB.
+- **Stuck sends**: outbox items stuck in `sending` for >5 minutes are reset to `pending` on next `/outbox/due` poll. Failed recipients in mass sends are also reset.
+- **Edit archive consistency**: GramJS `EditedMessage` event fires after `editMessage()` call — archive is updated automatically with correct `sent_at`. No manual re-ingest needed.
