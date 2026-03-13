@@ -61,7 +61,7 @@ CREATE TABLE agent_tokens (
   token_hash   TEXT NOT NULL UNIQUE,  -- SHA-256 of the raw token, never plaintext
   label        TEXT,                  -- "work claude", "read-only scout"
   expires_at   BIGINT,                -- Unix epoch seconds, NULL = no expiry
-  last_used_at BIGINT,                -- NULL until first use; updated at most once per 5 min
+  last_used_at BIGINT,                -- NULL until first use; updated at most once per day
   created_at   BIGINT NOT NULL
 );
 
