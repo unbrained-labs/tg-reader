@@ -243,7 +243,7 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
     if (q !== null) {
       // FTS path: search_vector @@ to_tsquery, sort by recency
       const keysetClause = beforeSentAt !== null && beforeId !== null
-        ? `AND (m.sent_at < $9 OR (m.sent_at = $9 AND m.id < $10))`
+        ? `AND (m.sent_at < $7 OR (m.sent_at = $7 AND m.id < $8))`
         : ``;
 
       const DATA_SQL = `
@@ -255,13 +255,13 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
         WHERE m.search_vector @@ to_tsquery('simple', $1)
           AND m.account_id = $2
           AND m.is_deleted = 0
-          AND (m.tg_chat_id = $3 OR $4 IS NULL)
-          AND (m.sender_username = $5 OR $6 IS NULL)
-          AND m.sent_at >= $7
-          AND m.sent_at <= $8
+          AND ($3::text IS NULL OR m.tg_chat_id = $3)
+          AND ($4::text IS NULL OR m.sender_username = $4)
+          AND m.sent_at >= $5
+          AND m.sent_at <= $6
           ${keysetClause}
         ORDER BY m.sent_at DESC, m.id DESC
-        LIMIT $${beforeSentAt !== null && beforeId !== null ? 11 : 9}
+        LIMIT $${beforeSentAt !== null && beforeId !== null ? 9 : 7}
       `.trim();
 
       const COUNT_SQL = `
@@ -270,14 +270,14 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
         WHERE m.search_vector @@ to_tsquery('simple', $1)
           AND m.account_id = $2
           AND m.is_deleted = 0
-          AND (m.tg_chat_id = $3 OR $4 IS NULL)
-          AND (m.sender_username = $5 OR $6 IS NULL)
-          AND m.sent_at >= $7
-          AND m.sent_at <= $8
+          AND ($3::text IS NULL OR m.tg_chat_id = $3)
+          AND ($4::text IS NULL OR m.sender_username = $4)
+          AND m.sent_at >= $5
+          AND m.sent_at <= $6
           ${keysetClause}
       `.trim();
 
-      const baseBinds: unknown[] = [q, accountId, chatId, chatId, senderUsername, senderUsername, from, to];
+      const baseBinds: unknown[] = [q, accountId, chatId, senderUsername, from, to];
       const keysetBinds: unknown[] = beforeSentAt !== null && beforeId !== null
         ? [beforeSentAt, beforeId]
         : [];
@@ -291,7 +291,7 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
     } else {
       // B-tree path: no query, sort by recency
       const keysetClause = beforeSentAt !== null && beforeId !== null
-        ? `AND (sent_at < $8 OR (sent_at = $8 AND id < $9))`
+        ? `AND (sent_at < $6 OR (sent_at = $6 AND id < $7))`
         : ``;
 
       const DATA_SQL = `
@@ -302,13 +302,13 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
         FROM messages
         WHERE account_id = $1
           AND is_deleted = 0
-          AND (tg_chat_id = $2 OR $3 IS NULL)
-          AND (sender_username = $4 OR $5 IS NULL)
-          AND sent_at >= $6
-          AND sent_at <= $7
+          AND ($2::text IS NULL OR tg_chat_id = $2)
+          AND ($3::text IS NULL OR sender_username = $3)
+          AND sent_at >= $4
+          AND sent_at <= $5
           ${keysetClause}
         ORDER BY sent_at DESC, id DESC
-        LIMIT $${beforeSentAt !== null && beforeId !== null ? 10 : 8}
+        LIMIT $${beforeSentAt !== null && beforeId !== null ? 8 : 6}
       `.trim();
 
       const COUNT_SQL = `
@@ -316,14 +316,14 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
         FROM messages
         WHERE account_id = $1
           AND is_deleted = 0
-          AND (tg_chat_id = $2 OR $3 IS NULL)
-          AND (sender_username = $4 OR $5 IS NULL)
-          AND sent_at >= $6
-          AND sent_at <= $7
+          AND ($2::text IS NULL OR tg_chat_id = $2)
+          AND ($3::text IS NULL OR sender_username = $3)
+          AND sent_at >= $4
+          AND sent_at <= $5
           ${keysetClause}
       `.trim();
 
-      const baseBinds: unknown[] = [accountId, chatId, chatId, senderUsername, senderUsername, from, to];
+      const baseBinds: unknown[] = [accountId, chatId, senderUsername, from, to];
       const keysetBinds: unknown[] = beforeSentAt !== null && beforeId !== null
         ? [beforeSentAt, beforeId]
         : [];
@@ -1346,12 +1346,14 @@ const MCP_TOOL_DEFINITIONS = [
   },
   {
     name: 'thread',
-    description: 'Get a message and its reply thread (parent + all direct replies). Use when you want to see the full context of a conversation around a specific message.',
+    description: 'Get a message and its reply thread (parent + all direct replies). Use when you want to see the full context of a conversation around a specific message. Paginate with next_after_id from the previous response.',
     inputSchema: {
       type: 'object',
       properties: {
         chat_id: { type: 'string', description: 'Chat ID containing the message.' },
         message_id: { type: 'string', description: 'The tg_message_id of the message to reconstruct the thread around.' },
+        limit: { type: 'number', description: 'Max replies to return (default 50, max 200).' },
+        after_id: { type: 'number', description: 'Pagination: pass next_after_id from the previous response.' },
       },
       required: ['chat_id', 'message_id'],
     },
@@ -1612,6 +1614,10 @@ async function dispatchMcpTool(
   if (name === 'thread') {
     if (typeof args.chat_id !== 'string') throw new Error('chat_id is required');
     if (typeof args.message_id !== 'string') throw new Error('message_id is required');
+    const limit = Math.min(typeof args.limit === 'number' ? args.limit : 50, 200);
+    const afterId = typeof args.after_id === 'number' ? args.after_id : null;
+
+    const keysetClause = afterId !== null ? `AND id > $4` : ``;
 
     const SQL = `
       SELECT id, tg_message_id, sender_username, sender_first_name, direction,
@@ -1622,14 +1628,26 @@ async function dispatchMcpTool(
         AND is_deleted = 0
         AND (
           tg_message_id = $3
-          OR id = (SELECT reply_to_message_id FROM messages WHERE account_id = $1 AND tg_chat_id = $2 AND tg_message_id = $3 LIMIT 1)
-          OR reply_to_message_id = (SELECT id FROM messages WHERE account_id = $1 AND tg_chat_id = $2 AND tg_message_id = $3 LIMIT 1)
+          OR tg_message_id = (SELECT reply_to_message_id::text FROM messages WHERE account_id = $1 AND tg_chat_id = $2 AND tg_message_id = $3 LIMIT 1)
+          OR reply_to_message_id = $3::bigint
         )
+        ${keysetClause}
       ORDER BY sent_at ASC, id ASC
+      LIMIT $${afterId !== null ? 5 : 4}
     `.trim();
 
-    const rows = await getSql(env)(SQL, [accountId, args.chat_id, args.message_id]) as Array<Record<string, unknown>>;
-    return { chat_id: args.chat_id, message_id: args.message_id, messages: rows.map(truncateText) };
+    const binds: unknown[] = afterId !== null
+      ? [accountId, args.chat_id, args.message_id, afterId, limit]
+      : [accountId, args.chat_id, args.message_id, limit];
+
+    const rows = await getSql(env)(SQL, binds) as Array<Record<string, unknown> & { id: number }>;
+    const lastRow = rows.length === limit ? rows[rows.length - 1] : null;
+    return {
+      chat_id: args.chat_id,
+      message_id: args.message_id,
+      messages: rows.map(truncateText),
+      next_after_id: lastRow?.id ?? null,
+    };
   }
 
   if (name === 'send' || name === 'draft') {
