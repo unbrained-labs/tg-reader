@@ -129,6 +129,7 @@ async function backfillDialog(
 
   let offsetId = Number(dialog.oldest_message_id ?? 0);
   let fetched = Number(dialog.fetched_messages ?? 0);
+  const userMap = new Map<string, { username?: string; firstName?: string; lastName?: string }>();
 
   let inputPeer: Api.TypeInputPeer;
   try {
@@ -185,6 +186,21 @@ async function backfillDialog(
       messages = result.messages.filter(
         (m): m is Api.Message => m instanceof Api.Message,
       );
+
+      // Build sender lookup from user entities included in the GetHistory response.
+      // Telegram includes all referenced users in result.users — no extra API calls needed.
+      userMap.clear();
+      if ('users' in result && Array.isArray(result.users)) {
+        for (const u of result.users) {
+          if (u instanceof Api.User) {
+            userMap.set(String(u.id), {
+              username: u.username ?? undefined,
+              firstName: u.firstName ?? undefined,
+              lastName: u.lastName ?? undefined,
+            });
+          }
+        }
+      }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       console.error(`[backfill] getHistory error for dialog ${index + 1}:`, errMsg);
@@ -222,9 +238,9 @@ async function backfillDialog(
         chat_name: dialog.chat_name ?? undefined,
         chat_type: undefined,
         sender_id: senderId,
-        sender_username: undefined,
-        sender_first_name: undefined,
-        sender_last_name: undefined,
+        sender_username: senderId ? (userMap.get(senderId)?.username) : undefined,
+        sender_first_name: senderId ? (userMap.get(senderId)?.firstName) : undefined,
+        sender_last_name: senderId ? (userMap.get(senderId)?.lastName) : undefined,
         direction,
         message_type: resolveMessageType(raw),
         text: raw.message || undefined,  // raw.message is the text field in GramJS

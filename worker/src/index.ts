@@ -475,6 +475,8 @@ async function handleChats(request: Request, env: Env, accountId: string): Promi
   const url = new URL(request.url);
   const nameFilter = url.searchParams.get('name') ?? null;
   const labelFilter = url.searchParams.get('label') ?? null;
+  const sortBy = url.searchParams.get('sort_by') ?? 'last_activity';
+  const orderClause = sortBy === 'message_count' ? 'message_count DESC' : 'last_message_at DESC';
 
   // GROUP BY tg_chat_id only — avoids duplicate rows if chat_name/type changed over time.
   // MAX(chat_name)/MAX(chat_type) picks a deterministic canonical value per chat.
@@ -493,7 +495,7 @@ async function handleChats(request: Request, env: Env, accountId: string): Promi
       AND ($2::text IS NULL OR m.chat_name ILIKE $2)
       AND ($3::text IS NULL OR cc.label = $3)
     GROUP BY m.tg_chat_id
-    ORDER BY last_message_at DESC
+    ORDER BY ${orderClause}
   `.trim();
 
   // W-6: escape LIKE metacharacters so % and _ in nameFilter are treated as literals
@@ -1290,6 +1292,7 @@ const MCP_TOOL_DEFINITIONS = [
       properties: {
         name: { type: 'string', description: 'Optional. Filter chats by name (case-insensitive partial match). Example: "DevOps" matches "DevOps Team" and "devops-general".' },
         label: { type: 'string', description: 'Optional. Filter by label (e.g. "work", "personal"). Only returns chats that have that label set in chat_config.' },
+        sort_by: { type: 'string', enum: ['last_activity', 'message_count'], description: 'Optional. Sort order: "last_activity" (default, newest message first) or "message_count" (most messages first, use for "most active chats").' },
       },
     },
   },
@@ -1467,6 +1470,7 @@ async function dispatchMcpTool(
     const params = new URLSearchParams();
     if (typeof args.name === 'string') params.set('name', args.name);
     if (typeof args.label === 'string') params.set('label', args.label);
+    if (typeof args.sort_by === 'string') params.set('sort_by', args.sort_by);
     const req = new Request(`${baseUrl}/chats?${params.toString()}`);
     const res = await handleChats(req, env, accountId);
     return await res.json();
