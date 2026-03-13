@@ -473,6 +473,8 @@ async function handleChats(request: Request, env: Env, accountId: string): Promi
   const url = new URL(request.url);
   const nameFilter = url.searchParams.get('name') ?? null;
   const labelFilter = url.searchParams.get('label') ?? null;
+  const chatTypeFilter = url.searchParams.get('chat_type') ?? null;
+  const unansweredOnly = url.searchParams.get('filter') === 'unanswered';
   const sortBy = url.searchParams.get('sort_by') ?? 'last_activity';
   const orderClause = sortBy === 'message_count' ? 'message_count DESC' : 'last_message_at DESC';
 
@@ -492,7 +494,12 @@ async function handleChats(request: Request, env: Env, accountId: string): Promi
     WHERE m.account_id = $1
       AND ($2::text IS NULL OR m.chat_name ILIKE $2)
       AND ($3::text IS NULL OR cc.label = $3)
+      AND ($4::text IS NULL OR m.chat_type = $4)
     GROUP BY m.tg_chat_id
+    HAVING ($5::boolean IS NOT TRUE OR (
+      MAX(CASE WHEN m.sender_id != $1 THEN m.sent_at ELSE 0 END) >
+      MAX(CASE WHEN m.sender_id = $1 THEN m.sent_at ELSE 0 END)
+    ))
     ORDER BY ${orderClause}
   `.trim();
 
@@ -503,7 +510,7 @@ async function handleChats(request: Request, env: Env, accountId: string): Promi
 
   const sql = getSql(env);
   try {
-    const rows = await sql(SQL, [accountId, namePattern, labelFilter]) as Array<{
+    const rows = await sql(SQL, [accountId, namePattern, labelFilter, chatTypeFilter, unansweredOnly || null]) as Array<{
       tg_chat_id: string; chat_name: string | null; chat_type: string | null;
       message_count: string; last_message_at: string | null; sync_status: string; label: string | null;
     }>;
@@ -1292,12 +1299,14 @@ const MCP_TOOL_DEFINITIONS = [
   },
   {
     name: 'chats',
-    description: 'List all Telegram chats (groups, channels, DMs) with message counts and last activity. Use to discover chat IDs before calling history, or to find which chat a conversation happened in. Optionally filter by chat name or label.',
+    description: 'List all Telegram chats (groups, channels, DMs) with message counts and last activity. Use to discover chat IDs before calling history, or to find which chat a conversation happened in. Optionally filter by name, label, chat type, or who wrote last.',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: 'Optional. Filter chats by name (case-insensitive partial match). Example: "DevOps" matches "DevOps Team" and "devops-general".' },
         label: { type: 'string', description: 'Optional. Filter by label (e.g. "work", "personal"). Only returns chats that have that label set in chat_config.' },
+        chat_type: { type: 'string', enum: ['user', 'group', 'supergroup', 'channel'], description: 'Optional. Filter by chat type: "user" for DMs, "group" for basic groups, "supergroup" for large groups, "channel" for broadcast channels.' },
+        filter: { type: 'string', enum: ['unanswered'], description: 'Optional. "unanswered" returns only chats where someone else wrote the last message (you haven\'t replied). Useful for CRM-style follow-up queries.' },
         sort_by: { type: 'string', enum: ['last_activity', 'message_count'], description: 'Optional. Sort order: "last_activity" (default, newest message first) or "message_count" (most messages first, use for "most active chats").' },
       },
     },
@@ -1434,6 +1443,17 @@ const MCP_TOOL_DEFINITIONS = [
       required: ['tg_chat_id', 'tg_message_id', 'to_chat_id'],
     },
   },
+  {
+    name: 'outbox_status',
+    description: 'Check the delivery status of a sent or scheduled message by its outbox id. Returns status (pending/sending/sent/failed/scheduled/partial), sent_at, and any error. Use after send to confirm delivery, or to check if a scheduled message is still queued.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'number', description: 'Outbox id returned by the send or draft tool.' },
+      },
+      required: ['id'],
+    },
+  },
 ];
 
 const TEXT_SNIPPET_LEN = 500;
@@ -1476,6 +1496,8 @@ async function dispatchMcpTool(
     const params = new URLSearchParams();
     if (typeof args.name === 'string') params.set('name', args.name);
     if (typeof args.label === 'string') params.set('label', args.label);
+    if (typeof args.chat_type === 'string') params.set('chat_type', args.chat_type);
+    if (typeof args.filter === 'string') params.set('filter', args.filter);
     if (typeof args.sort_by === 'string') params.set('sort_by', args.sort_by);
     const req = new Request(`${baseUrl}/chats?${params.toString()}`);
     const res = await handleChats(req, env, accountId);
@@ -1662,7 +1684,14 @@ async function dispatchMcpTool(
 
   if (name === 'send' || name === 'draft') {
     if (typeof args.text !== 'string' || !args.text.trim()) throw new Error('text is required');
-    const requestedStatus = name === 'send' ? 'pending' : 'draft';
+    let requestedStatus: string;
+    if (name === 'draft') {
+      requestedStatus = 'draft';
+    } else if (typeof args.scheduled_at === 'number') {
+      requestedStatus = 'scheduled';
+    } else {
+      requestedStatus = 'pending';
+    }
     const req = new Request(`${baseUrl}/outbox`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1671,12 +1700,12 @@ async function dispatchMcpTool(
     const res = await handlePostOutbox(req, env, accountId);
     const data = await res.json() as Record<string, unknown>;
     if (res.status !== 200) throw new Error(String(data.error ?? 'Failed to queue message'));
-    return {
-      ...data,
-      note: name === 'send'
-        ? 'Message queued. GramJS will send it within 30 seconds.'
-        : 'Saved as draft. Use POST /outbox/:id/send to queue it for sending.',
-    };
+    const note = name === 'draft'
+      ? 'Saved as draft. Use POST /outbox/:id/send to queue it for sending.'
+      : requestedStatus === 'scheduled'
+        ? `Scheduled. GramJS will send it at the specified time.`
+        : 'Message queued. GramJS will send it within 30 seconds.';
+    return { ...data, note };
   }
 
   if (name === 'edit_message') {
@@ -1713,6 +1742,18 @@ async function dispatchMcpTool(
     const data = await res.json() as Record<string, unknown>;
     if (res.status !== 200) throw new Error(String(data.error ?? 'Failed to queue forward'));
     return { ...data, note: 'Forward queued. GramJS will apply it within 30 seconds.' };
+  }
+
+  if (name === 'outbox_status') {
+    if (typeof args.id !== 'number') throw new Error('id is required');
+    const sql = getSql(env);
+    const rows = await sql(
+      `SELECT id, tg_chat_id, text, status, scheduled_at, error, created_at, updated_at, sent_at
+       FROM outbox WHERE account_id = $1 AND id = $2`,
+      [accountId, args.id],
+    ) as Array<Record<string, unknown>>;
+    if (rows.length === 0) throw new Error(`No outbox item with id ${args.id}`);
+    return rows[0];
   }
 
   throw new Error(`Unknown tool: ${name}`);
