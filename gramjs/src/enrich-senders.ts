@@ -96,7 +96,7 @@ async function main(): Promise<void> {
 
   const me = await tgClient.getMe();
   if (!(me instanceof Api.User)) throw new Error('getMe() returned UserEmpty — invalid session');
-  const accountId = me.username ? me.username : String(me.id);
+  const accountId = String(me.id);
   console.log(`[enrich] account_id=${accountId}`);
 
   const chats = await getChatsWithUnresolved(pool, accountId);

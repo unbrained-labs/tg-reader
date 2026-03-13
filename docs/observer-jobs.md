@@ -276,3 +276,20 @@ Update prompt, schedule, trigger, model config, or cooldown.
 - **Audit log** — all actions the job's agent takes are logged via the standard write audit (token_id tracked).
 - **Model failures** — if the model call fails (timeout, API error), log the error and continue. Do not retry in the same cron tick.
 - **Cost awareness** — each job invocation = one model API call. For high-frequency triggers on active chats, set a long cooldown or the costs add up.
+
+---
+
+## Future: real-time ingest hook
+
+The cron approach polls for conditions every N minutes (minimum 1 min on Cloudflare Workers Paid). This is sufficient for digest, summary, and unanswered-alert jobs.
+
+For sub-minute response (e.g. an AI auto-responder that replies within seconds), a real-time hook can be added later with no new infrastructure. `/ingest` already receives every incoming message — add a non-blocking trigger check there:
+
+```ts
+// inside handleIngest(), after inserting messages:
+ctx.waitUntil(checkRealtimeTriggers(messages, accountId, env));
+```
+
+`checkRealtimeTriggers` evaluates jobs with `trigger_type = 'new_message'` or `'keyword'` against the just-ingested batch, respects cooldown, and calls `runAgentLoop()` for any that match. The ingest response is not blocked.
+
+This is an optimization — implement only if 1-minute cron latency proves insufficient for a specific use case.
