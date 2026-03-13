@@ -29,10 +29,11 @@ Permissions are resolved per `(token, account_id)` pair — a single token can a
 ## Schema
 
 ```sql
+-- Roles are account-agnostic templates — reusable across any number of accounts.
+-- The account context comes from token_account_roles, not from the role itself.
 CREATE TABLE roles (
   id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  account_id    TEXT NOT NULL,
-  name          TEXT NOT NULL,
+  name          TEXT NOT NULL UNIQUE,   -- "work-reader", "dm-assistant", "full"
 
   -- Read scope
   read_mode     TEXT NOT NULL DEFAULT 'all',
@@ -49,9 +50,7 @@ CREATE TABLE roles (
   -- Write scope (null = inherit read scope)
   write_chat_types TEXT,   -- JSON array: ["user","group","supergroup","channel"]
   write_labels     TEXT,   -- JSON array of labels
-  write_chat_ids   TEXT,   -- JSON array of tg_chat_ids
-
-  UNIQUE (account_id, name)
+  write_chat_ids   TEXT    -- JSON array of tg_chat_ids
 );
 
 CREATE TABLE agent_tokens (
