@@ -20,7 +20,6 @@ import { runBackfill } from './backfill-run';
 const GRAMJS_SESSION = requireEnv('GRAMJS_SESSION');
 const API_ID = parseInt(requireEnv('API_ID'), 10);
 const API_HASH = requireEnv('API_HASH');
-let ACCOUNT_ID = process.env['ACCOUNT_ID'] ?? '';
 
 if (isNaN(API_ID)) throw new Error(`API_ID must be a valid integer`);
 
@@ -47,12 +46,10 @@ async function main(): Promise<void> {
   }
   console.log('[backfill] connected to Telegram');
 
-  // Derive account ID
-  if (!ACCOUNT_ID) {
-    const me = await client.getMe();
-    if (!(me instanceof Api.User)) throw new Error('getMe() returned UserEmpty — session is invalid');
-    ACCOUNT_ID = String(me.id);
-  }
+  // Derive account ID from the session — username if set, otherwise numeric ID
+  const me = await client.getMe();
+  if (!(me instanceof Api.User)) throw new Error('getMe() returned UserEmpty — session is invalid');
+  const ACCOUNT_ID = me.username ? me.username : String(me.id);
   console.log(`[backfill] account_id=${ACCOUNT_ID}`);
 
   // Step 1 — Seed: enumerate dialogs and register in D1
