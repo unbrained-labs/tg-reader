@@ -575,18 +575,16 @@ async function processAction(client: TelegramClient, action: PendingAction): Pro
   const msgId = parseInt(action.tg_message_id, 10);
   try {
     if (action.action === 'edit') {
-      await client.invoke(new Api.messages.EditMessage({
-        peer: action.tg_chat_id,
-        id: msgId,
-        message: action.text ?? '',
-      }));
+      // High-level editMessage resolves the entity string internally
+      await client.editMessage(action.tg_chat_id, {
+        message: msgId,
+        text: action.text ?? '',
+      });
       // EditedMessage event fires naturally → archive updated with correct sent_at
       console.log(`[actions] edited msg=${msgId} chat=${action.tg_chat_id}`);
     } else if (action.action === 'delete') {
-      await client.invoke(new Api.messages.DeleteMessages({
-        id: [msgId],
-        revoke: true,
-      }));
+      // High-level deleteMessages handles both regular chats and channels
+      await client.deleteMessages(action.tg_chat_id, [msgId], { revoke: true });
       // Notify worker to mark as deleted
       await fetch(`${WORKER_URL}/deleted`, {
         method: 'POST',
@@ -595,10 +593,13 @@ async function processAction(client: TelegramClient, action: PendingAction): Pro
       });
       console.log(`[actions] deleted msg=${msgId} chat=${action.tg_chat_id}`);
     } else if (action.action === 'forward') {
+      // Low-level ForwardMessages requires InputPeer — resolve via getInputEntity first
+      const fromPeer = await client.getInputEntity(action.tg_chat_id);
+      const toPeer = await client.getInputEntity(action.to_chat_id!);
       await client.invoke(new Api.messages.ForwardMessages({
-        fromPeer: action.tg_chat_id,
+        fromPeer,
         id: [msgId],
-        toPeer: action.to_chat_id!,
+        toPeer,
         randomId: [bigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER))],
       }));
       console.log(`[actions] forwarded msg=${msgId} from=${action.tg_chat_id} to=${action.to_chat_id}`);

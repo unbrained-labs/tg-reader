@@ -973,7 +973,8 @@ async function handleGetOutboxDue(_request: Request, env: Env, accountId: string
   const now = Math.floor(Date.now() / 1000);
   const sql = getSql(env);
   try {
-    // Single atomic CTE: reset stuck 'sending' items (>5 min) then claim due items
+    // Single atomic CTE: reset stuck 'sending' items (>5 min) then claim due items.
+    // Also reset recipients of stuck mass sends so they can be retried.
     const rows = await sql(
       `WITH reset_stuck AS (
          UPDATE outbox
@@ -982,6 +983,13 @@ async function handleGetOutboxDue(_request: Request, env: Env, accountId: string
            AND status = 'sending'
            AND updated_at < $1 - 300
          RETURNING id
+       ),
+       reset_stuck_recipients AS (
+         -- Reset failed recipients so they are retried; leave 'sent' ones alone (no double-send)
+         UPDATE outbox_recipients
+         SET status = 'pending'
+         WHERE outbox_id IN (SELECT id FROM reset_stuck)
+           AND status = 'failed'
        ),
        claimed AS (
          UPDATE outbox
