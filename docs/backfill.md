@@ -4,9 +4,8 @@ Backfill imports your complete message history into the archive. It's a one-time
 
 ## When to run
 
-- **Wait 1–2 days** after first deploying the listener before running backfill
-- Running too soon (new session + immediate mass fetching) looks suspicious to Telegram
 - The listener must be **scaled down** before running backfill — both cannot use the same session simultaneously
+- Can be run immediately after first login — the built-in sleep randomization and serial fetch pattern are sufficient
 
 ## Anti-ban measures (built-in)
 

@@ -43,7 +43,6 @@ const client = new TelegramClient(session, apiId, apiHash, {
 - `WORKER_URL` — full URL of deployed Worker (no trailing slash)
 
 ## Backfill anti-ban rules
-- Do NOT run backfill immediately after first login — let the session run live for 1-2 days first
 - Randomize sleep between pages: `Math.random() * 2500 + 1500` ms (1.5–4s) — fixed intervals look mechanical
 - Never run parallel getHistory calls — always serial, one dialog at a time
 - If FLOOD_WAIT exceeds 300s, stop the script and resume the next day
