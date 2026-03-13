@@ -126,10 +126,10 @@ Agent tokens are sent via `Authorization: Bearer <token>` header, not query para
 
 ```
 MCP endpoint: https://tg-reader.ddohne.workers.dev/mcp?account_id=7926042351
-Token: sent as Authorization: Bearer header in every request
+Authorization: Bearer <raw_token>
 ```
 
-`MASTER_TOKEN` and `INGEST_TOKEN` remain as Cloudflare secrets (env vars), never in URLs.
+`account_id` in the URL is not sensitive — it's a Telegram numeric ID, not a credential. Only the token is secret, and it travels in the header. `MASTER_TOKEN` and `INGEST_TOKEN` remain as Cloudflare secrets (env vars), never in URLs.
 
 ### 3. Token expiry
 
@@ -141,10 +141,12 @@ No complexity on renewal — just revoke and issue a new token.
 
 Write operations (send/edit/delete/forward) are logged to `audit_log` with token, account, action, and target chat. No message content — only metadata (chat_id, message_id, action type).
 
+Audit log only records write operations (send/edit/delete/forward) — not reads. Volume is tiny: even 100 writes/day for a year is ~36k rows. No meaningful storage concern.
+
 Retention configured via `global_config`:
 ```sql
 INSERT INTO global_config (account_id, key, value)
-VALUES ('global', 'audit_log_retention_days', '30');
+VALUES ('global', 'audit_log_retention_days', '90');
 ```
 
 The existing daily cron (already runs at 03:00 UTC) deletes old audit rows:
@@ -153,7 +155,7 @@ DELETE FROM audit_log
 WHERE created_at < EXTRACT(EPOCH FROM NOW())::BIGINT - (retention_days * 86400)
 ```
 
-Set to 0 to disable logging. Default: 30 days.
+Set to 0 to disable logging entirely. Default: 90 days.
 
 ### 5. MASTER_TOKEN separation
 
