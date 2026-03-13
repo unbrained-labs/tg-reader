@@ -443,6 +443,193 @@ async function persistPts(client: TelegramClient): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Outbox polling — send queued messages
+// ---------------------------------------------------------------------------
+
+interface OutboxRecipient {
+  id: number;
+  tg_chat_id: string;
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+  status: string;
+}
+
+interface OutboxItem {
+  id: number;
+  tg_chat_id?: string;
+  reply_to_message_id?: number;
+  text: string;
+  status: string;
+  recipients?: OutboxRecipient[];
+}
+
+function renderTemplate(text: string, ctx: { first_name?: string; last_name?: string; username?: string }): string {
+  const user = ctx.first_name ?? (ctx.username ? `@${ctx.username}` : 'there');
+  return text
+    .replace(/\{user\}/g, user)
+    .replace(/\{first_name\}/g, ctx.first_name ?? '')
+    .replace(/\{last_name\}/g, ctx.last_name ?? '')
+    .replace(/\{username\}/g, ctx.username ?? '');
+}
+
+async function ackOutbox(
+  id: number,
+  status: 'sent' | 'failed' | 'partial',
+  sentAt: number,
+  error?: string,
+  recipientResults?: Array<{ id: number; status: string; sent_at?: number; error?: string }>,
+): Promise<void> {
+  await fetch(`${WORKER_URL}/outbox/${id}/ack`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
+    body: JSON.stringify({ status, sent_at: sentAt, error: error ?? null, results: recipientResults ?? null }),
+  });
+}
+
+async function sendOutboxItem(client: TelegramClient, item: OutboxItem): Promise<void> {
+  const sentAt = Math.floor(Date.now() / 1000);
+  const replyTo = item.reply_to_message_id ? { replyToMsgId: item.reply_to_message_id } : {};
+
+  // Single-chat send
+  if (item.tg_chat_id) {
+    try {
+      await client.sendMessage(item.tg_chat_id, { message: item.text, ...replyTo });
+      await ackOutbox(item.id, 'sent', sentAt);
+      console.log(`[outbox] sent id=${item.id} chat=${item.tg_chat_id}`);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[outbox] failed id=${item.id}:`, errMsg);
+      await ackOutbox(item.id, 'failed', sentAt, errMsg);
+    }
+    return;
+  }
+
+  // Mass send
+  const recipients = item.recipients ?? [];
+  const results: Array<{ id: number; status: string; sent_at?: number; error?: string }> = [];
+  let failCount = 0;
+
+  for (let i = 0; i < recipients.length; i++) {
+    const r = recipients[i];
+    const text = renderTemplate(item.text, { first_name: r.first_name, last_name: r.last_name, username: r.username });
+    try {
+      await client.sendMessage(r.tg_chat_id, { message: text });
+      results.push({ id: r.id, status: 'sent', sent_at: Math.floor(Date.now() / 1000) });
+      console.log(`[outbox] mass id=${item.id} sent to ${r.tg_chat_id}`);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[outbox] mass id=${item.id} failed for ${r.tg_chat_id}:`, errMsg);
+      results.push({ id: r.id, status: 'failed', error: errMsg });
+      failCount++;
+    }
+    // 2–5s jitter between recipients to avoid flood
+    if (i < recipients.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, Math.random() * 3000 + 2000));
+    }
+  }
+
+  const finalStatus = failCount === 0 ? 'sent' : failCount === recipients.length ? 'failed' : 'partial';
+  await ackOutbox(item.id, finalStatus, sentAt, undefined, results);
+}
+
+async function pollOutbox(client: TelegramClient): Promise<void> {
+  try {
+    const res = await fetch(`${WORKER_URL}/outbox/due`, {
+      headers: { 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
+    });
+    if (!res.ok) { console.error(`[outbox] poll failed: HTTP ${res.status}`); return; }
+    const items = (await res.json()) as OutboxItem[];
+    if (items.length === 0) return;
+    console.log(`[outbox] claimed ${items.length} item(s)`);
+    for (const item of items) {
+      await sendOutboxItem(client, item);
+    }
+  } catch (err) {
+    console.error('[outbox] poll error:', err instanceof Error ? err.message : String(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pending actions — edit / delete / forward
+// ---------------------------------------------------------------------------
+
+interface PendingAction {
+  id: number;
+  action: 'edit' | 'delete' | 'forward';
+  tg_chat_id: string;
+  tg_message_id: string;
+  text?: string;
+  to_chat_id?: string;
+}
+
+async function ackAction(id: number, status: 'done' | 'failed', error?: string): Promise<void> {
+  await fetch(`${WORKER_URL}/actions/${id}/ack`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
+    body: JSON.stringify({ status, error: error ?? null }),
+  });
+}
+
+async function processAction(client: TelegramClient, action: PendingAction): Promise<void> {
+  const msgId = parseInt(action.tg_message_id, 10);
+  try {
+    if (action.action === 'edit') {
+      // High-level editMessage resolves the entity string internally
+      await client.editMessage(action.tg_chat_id, {
+        message: msgId,
+        text: action.text ?? '',
+      });
+      // EditedMessage event fires naturally → archive updated with correct sent_at
+      console.log(`[actions] edited msg=${msgId} chat=${action.tg_chat_id}`);
+    } else if (action.action === 'delete') {
+      // High-level deleteMessages handles both regular chats and channels
+      await client.deleteMessages(action.tg_chat_id, [msgId], { revoke: true });
+      // Notify worker to mark as deleted
+      await fetch(`${WORKER_URL}/deleted`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
+        body: JSON.stringify({ messages: [{ tg_chat_id: action.tg_chat_id, tg_message_id: action.tg_message_id }] }),
+      });
+      console.log(`[actions] deleted msg=${msgId} chat=${action.tg_chat_id}`);
+    } else if (action.action === 'forward') {
+      // Low-level ForwardMessages requires InputPeer — resolve via getInputEntity first
+      const fromPeer = await client.getInputEntity(action.tg_chat_id);
+      const toPeer = await client.getInputEntity(action.to_chat_id!);
+      await client.invoke(new Api.messages.ForwardMessages({
+        fromPeer,
+        id: [msgId],
+        toPeer,
+        randomId: [bigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER))],
+      }));
+      console.log(`[actions] forwarded msg=${msgId} from=${action.tg_chat_id} to=${action.to_chat_id}`);
+    }
+    await ackAction(action.id, 'done');
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[actions] ${action.action} failed id=${action.id}:`, errMsg);
+    await ackAction(action.id, 'failed', errMsg);
+  }
+}
+
+async function pollActions(client: TelegramClient): Promise<void> {
+  try {
+    const res = await fetch(`${WORKER_URL}/actions/pending`, {
+      headers: { 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
+    });
+    if (!res.ok) { console.error(`[actions] poll failed: HTTP ${res.status}`); return; }
+    const actions = (await res.json()) as PendingAction[];
+    if (actions.length === 0) return;
+    console.log(`[actions] processing ${actions.length} pending action(s)`);
+    for (const action of actions) {
+      await processAction(client, action);
+    }
+  } catch (err) {
+    console.error('[actions] poll error:', err instanceof Error ? err.message : String(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -564,12 +751,20 @@ async function main(): Promise<void> {
       );
   }, 5 * 60 * 1000);
 
+  // Poll outbox (pending/scheduled) every 30 seconds
+  const outboxInterval = setInterval(() => { void pollOutbox(client); }, 30_000);
+
+  // Poll pending actions (edit/delete/forward) every 30 seconds
+  const actionsInterval = setInterval(() => { void pollActions(client); }, 30_000);
+
   // 6. Graceful shutdown on SIGTERM (Fly sends this before killing the container)
   process.on('SIGTERM', () => {
     console.log('[listener] SIGTERM received, flushing buffer and exiting');
     if (flushTimer) clearTimeout(flushTimer);
     clearInterval(ptsInterval);
     clearInterval(configInterval);
+    clearInterval(outboxInterval);
+    clearInterval(actionsInterval);
     // Drain entire buffer (flushBuffer only takes 100 at a time), with a 4s deadline
     const drainAndExit = async () => {
       const deadline = new Promise<void>(resolve => setTimeout(resolve, 4000));

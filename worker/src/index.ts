@@ -1,5 +1,5 @@
 import { neon, NeonQueryFunction } from '@neondatabase/serverless';
-import type { Env, Message } from './types';
+import type { Env, Message, OutboxItem, OutboxRecipient } from './types';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -184,7 +184,7 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  const written = parseInt(result.rowCount ?? '0', 10);
+  const written = result.rowCount ?? 0;
   const noop = msgs.length - written;
   console.log(`[POST /ingest] written=${written} noop=${noop}`);
   return json({ written, noop });
@@ -427,7 +427,7 @@ async function handlePostContacts(request: Request, env: Env, accountId: string)
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  const upserted = parseInt(result.rowCount ?? '0', 10);
+  const upserted = result.rowCount ?? 0;
   console.log(`[POST /contacts] upserted=${upserted}`);
   return json({ upserted });
 }
@@ -474,6 +474,7 @@ async function handleGetContacts(_request: Request, env: Env, accountId: string)
 async function handleChats(request: Request, env: Env, accountId: string): Promise<Response> {
   const url = new URL(request.url);
   const nameFilter = url.searchParams.get('name') ?? null;
+  const labelFilter = url.searchParams.get('label') ?? null;
 
   // GROUP BY tg_chat_id only — avoids duplicate rows if chat_name/type changed over time.
   // MAX(chat_name)/MAX(chat_type) picks a deterministic canonical value per chat.
@@ -484,11 +485,13 @@ async function handleChats(request: Request, env: Env, accountId: string): Promi
       MAX(m.chat_type) AS chat_type,
       COUNT(m.id) AS message_count,
       MAX(m.sent_at) AS last_message_at,
-      COALESCE(MAX(cc.sync), 'default') AS sync_status
+      COALESCE(MAX(cc.sync), 'default') AS sync_status,
+      MAX(cc.label) AS label
     FROM messages m
     LEFT JOIN chat_config cc ON cc.account_id = m.account_id AND cc.tg_chat_id = m.tg_chat_id
     WHERE m.account_id = $1
-      AND (m.chat_name ILIKE $2 OR $3 IS NULL)
+      AND ($2::text IS NULL OR m.chat_name ILIKE $2)
+      AND ($3::text IS NULL OR cc.label = $3)
     GROUP BY m.tg_chat_id
     ORDER BY last_message_at DESC
   `.trim();
@@ -500,9 +503,9 @@ async function handleChats(request: Request, env: Env, accountId: string): Promi
 
   const sql = getSql(env);
   try {
-    const rows = await sql(SQL, [accountId, namePattern, namePattern]) as Array<{
+    const rows = await sql(SQL, [accountId, namePattern, labelFilter]) as Array<{
       tg_chat_id: string; chat_name: string | null; chat_type: string | null;
-      message_count: string; last_message_at: string | null; sync_status: string;
+      message_count: string; last_message_at: string | null; sync_status: string; label: string | null;
     }>;
     console.log(`[GET /chats] account=${accountId} count=${rows.length}`);
     return json(rows.map(r => ({
@@ -536,7 +539,7 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
   const sql = getSql(env);
   try {
     const [msgResult, contactResult] = await Promise.all([
-      sql(SQL, [accountId]) as Promise<Array<{
+      sql(SQL, [accountId]) as unknown as Promise<Array<{
         total_messages: string;
         total_chats: string;
         earliest_message_at: number | null;
@@ -546,10 +549,12 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
         sent_count: string;
         received_count: string;
       }>>,
-      sql(CONTACT_SQL, [accountId]) as Promise<Array<{ total_contacts: string }>>,
+      sql(CONTACT_SQL, [accountId]) as unknown as Promise<Array<{ total_contacts: string }>>,
     ]);
     const stats = msgResult[0];
     const total_contacts = parseInt(contactResult[0].total_contacts, 10);
+    // my_user_id: if accountId is numeric (the user's own TG ID), expose it for MCP consumers
+    const my_user_id = /^\d+$/.test(accountId) ? accountId : null;
     return json({
       total_messages: parseInt(stats.total_messages, 10),
       total_chats: parseInt(stats.total_chats, 10),
@@ -560,6 +565,7 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
       sent_count: parseInt(stats.sent_count, 10),
       received_count: parseInt(stats.received_count, 10),
       total_contacts,
+      my_user_id,
     });
   } catch (err) {
     console.error('[GET /stats] DB error', err);
@@ -604,7 +610,7 @@ async function handleGetChatsConfig(_request: Request, env: Env, accountId: stri
   const sql = getSql(env);
   try {
     const rows = await sql(
-      `SELECT tg_chat_id, chat_name, sync, updated_at FROM chat_config WHERE account_id = $1 ORDER BY updated_at DESC`,
+      `SELECT tg_chat_id, chat_name, sync, label, updated_at FROM chat_config WHERE account_id = $1 ORDER BY updated_at DESC`,
       [accountId],
     );
     return json(rows);
@@ -622,20 +628,23 @@ async function handlePostChatsConfig(request: Request, env: Env, accountId: stri
   if (!b.tg_chat_id || typeof b.tg_chat_id !== 'string') {
     return json({ ok: false, error: 'tg_chat_id is required' }, 400);
   }
-  if (!VALID_CHAT_SYNC_VALUES.includes(b.sync as typeof VALID_CHAT_SYNC_VALUES[number])) {
+  if (b.sync !== undefined && !VALID_CHAT_SYNC_VALUES.includes(b.sync as typeof VALID_CHAT_SYNC_VALUES[number])) {
     return json({ ok: false, error: `sync must be 'include' or 'exclude'` }, 400);
   }
+  const syncVal = b.sync ?? null;
+  const labelVal = typeof b.label === 'string' ? b.label : null;
 
   const sql = getSql(env);
   try {
     await sql(
-      `INSERT INTO chat_config (account_id, tg_chat_id, chat_name, sync, updated_at)
-       VALUES ($1, $2, $3, $4, EXTRACT(EPOCH FROM NOW())::BIGINT)
+      `INSERT INTO chat_config (account_id, tg_chat_id, chat_name, sync, label, updated_at)
+       VALUES ($1, $2, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT)
        ON CONFLICT(account_id, tg_chat_id) DO UPDATE SET
          chat_name = EXCLUDED.chat_name,
-         sync = EXCLUDED.sync,
+         sync = COALESCE(EXCLUDED.sync, chat_config.sync),
+         label = COALESCE(EXCLUDED.label, chat_config.label),
          updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT`,
-      [accountId, b.tg_chat_id, b.chat_name ?? null, b.sync],
+      [accountId, b.tg_chat_id, b.chat_name ?? null, syncVal, labelVal],
     );
     return json({ ok: true });
   } catch (err) {
@@ -721,7 +730,7 @@ async function handleDeleted(request: Request, env: Env, accountId: string): Pro
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  const marked = parseInt(result.rowCount ?? '0', 10);
+  const marked = result.rowCount ?? 0;
   console.log(`[POST /deleted] marked=${marked}`);
   return json({ marked });
 }
@@ -768,7 +777,7 @@ async function handleBackfillSeed(request: Request, env: Env, accountId: string)
     return json({ ok: false, error: 'DB error' }, 500);
   }
 
-  const seeded = parseInt(result.rowCount ?? '0', 10);
+  const seeded = result.rowCount ?? 0;
   console.log(`[POST /backfill/seed] seeded=${seeded}`);
   return json({ seeded });
 }
@@ -866,6 +875,374 @@ async function handleBackfillProgress(request: Request, env: Env, accountId: str
 }
 
 // ---------------------------------------------------------------------------
+// Outbox — drafts, scheduled sends, replies, mass sends
+// ---------------------------------------------------------------------------
+
+const VALID_OUTBOX_STATUSES = ['draft', 'scheduled', 'pending', 'sending', 'sent', 'failed', 'partial'] as const;
+
+async function handlePostOutbox(request: Request, env: Env, accountId: string): Promise<Response> {
+  let body: unknown;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
+
+  const b = body as Record<string, unknown>;
+  if (typeof b.text !== 'string' || b.text.trim() === '') {
+    return json({ ok: false, error: 'text is required' }, 400);
+  }
+
+  const recipients = Array.isArray(b.recipients) ? (b.recipients as Array<Record<string, unknown>>) : null;
+  const isMass = recipients !== null && recipients.length > 0;
+  if (!isMass && (typeof b.tg_chat_id !== 'string' || !b.tg_chat_id)) {
+    return json({ ok: false, error: 'tg_chat_id is required for single sends' }, 400);
+  }
+
+  const requestedStatus = (b.status as string) ?? 'draft';
+  if (!VALID_OUTBOX_STATUSES.includes(requestedStatus as typeof VALID_OUTBOX_STATUSES[number])) {
+    return json({ ok: false, error: `status must be one of: ${VALID_OUTBOX_STATUSES.join(', ')}` }, 400);
+  }
+  const scheduledAt = typeof b.scheduled_at === 'number' ? b.scheduled_at : null;
+  if (requestedStatus === 'scheduled' && scheduledAt === null) {
+    return json({ ok: false, error: 'scheduled_at (unix epoch seconds) is required when status is "scheduled"' }, 400);
+  }
+
+  const replyTo = typeof b.reply_to_message_id === 'number' ? b.reply_to_message_id : null;
+  const tgChatId = !isMass ? (b.tg_chat_id as string) : null;
+  const now = Math.floor(Date.now() / 1000);
+
+  const sql = getSql(env);
+  try {
+    const outboxRows = await sql(
+      `INSERT INTO outbox (account_id, tg_chat_id, reply_to_message_id, text, status, scheduled_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+       RETURNING id`,
+      [accountId, tgChatId, replyTo, b.text as string, requestedStatus, scheduledAt, now],
+    ) as Array<{ id: number }>;
+    const outboxId = outboxRows[0].id;
+
+    if (isMass && recipients!.length > 0) {
+      await sql(
+        `INSERT INTO outbox_recipients (outbox_id, tg_chat_id, first_name, username, last_name)
+         SELECT $1, v.tg_chat_id, v.first_name, v.username, v.last_name
+         FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[]) AS v(tg_chat_id, first_name, username, last_name)`,
+        [
+          outboxId,
+          recipients!.map(r => r.tg_chat_id as string),
+          recipients!.map(r => (r.first_name as string) ?? null),
+          recipients!.map(r => (r.username as string) ?? null),
+          recipients!.map(r => (r.last_name as string) ?? null),
+        ],
+      );
+    }
+
+    console.log(`[POST /outbox] account=${accountId} id=${outboxId} status=${requestedStatus} mass=${isMass} recipients=${recipients?.length ?? 0}`);
+    return json({ id: outboxId, status: requestedStatus });
+  } catch (err) {
+    console.error('[POST /outbox] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+async function handleGetOutbox(request: Request, env: Env, accountId: string): Promise<Response> {
+  const url = new URL(request.url);
+  const statusFilter = url.searchParams.get('status') ?? null;
+  if (statusFilter !== null && !VALID_OUTBOX_STATUSES.includes(statusFilter as typeof VALID_OUTBOX_STATUSES[number])) {
+    return json({ ok: false, error: `status must be one of: ${VALID_OUTBOX_STATUSES.join(', ')}` }, 400);
+  }
+  const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') ?? '50', 10) || 50, 1), 200);
+  const offset = Math.max(parseInt(url.searchParams.get('offset') ?? '0', 10) || 0, 0);
+
+  const sql = getSql(env);
+  try {
+    const rows = await sql(
+      `SELECT id, tg_chat_id, reply_to_message_id, text, status, scheduled_at, error, created_at, updated_at, sent_at
+       FROM outbox
+       WHERE account_id = $1 AND ($2::text IS NULL OR status = $2)
+       ORDER BY created_at DESC
+       LIMIT $3 OFFSET $4`,
+      [accountId, statusFilter, limit, offset],
+    );
+    return json(rows);
+  } catch (err) {
+    console.error('[GET /outbox] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+// GET /outbox/due — atomically claims pending/due-scheduled items for GramJS to process.
+// Uses a single CTE statement (atomic in PostgreSQL) to reset stuck + claim due items.
+async function handleGetOutboxDue(_request: Request, env: Env, accountId: string): Promise<Response> {
+  const now = Math.floor(Date.now() / 1000);
+  const sql = getSql(env);
+  try {
+    // Single atomic CTE: reset stuck 'sending' items (>5 min) then claim due items.
+    // Also reset recipients of stuck mass sends so they can be retried.
+    const rows = await sql(
+      `WITH reset_stuck AS (
+         UPDATE outbox
+         SET status = 'pending', updated_at = $1
+         WHERE account_id = $2
+           AND status = 'sending'
+           AND updated_at < $1 - 300
+         RETURNING id
+       ),
+       reset_stuck_recipients AS (
+         -- Reset failed recipients so they are retried; leave 'sent' ones alone (no double-send)
+         UPDATE outbox_recipients
+         SET status = 'pending'
+         WHERE outbox_id IN (SELECT id FROM reset_stuck)
+           AND status = 'failed'
+       ),
+       claimed AS (
+         UPDATE outbox
+         SET status = 'sending', updated_at = $1
+         WHERE id IN (
+           SELECT id FROM outbox
+           WHERE account_id = $2
+             AND (
+               (status = 'pending' AND (scheduled_at IS NULL OR scheduled_at <= $1))
+               OR (status = 'scheduled' AND scheduled_at <= $1)
+             )
+           ORDER BY id
+           LIMIT 10
+         )
+         RETURNING id, tg_chat_id, reply_to_message_id, text, scheduled_at, sent_at, created_at, updated_at
+       )
+       SELECT c.*, 'sending' AS status FROM claimed c`,
+      [now, accountId],
+    ) as Array<OutboxItem>;
+
+    if (rows.length === 0) return json([]);
+
+    // Fetch recipients for mass sends
+    const massIds = rows.filter(r => r.tg_chat_id === null).map(r => r.id);
+    let recipientMap: Map<number, OutboxRecipient[]> = new Map();
+    if (massIds.length > 0) {
+      const recpRows = await sql(
+        `SELECT id, outbox_id, tg_chat_id, first_name, username, last_name, status, sent_at, error
+         FROM outbox_recipients
+         WHERE outbox_id = ANY($1::bigint[]) AND status = 'pending'`,
+        [massIds],
+      ) as Array<OutboxRecipient & { outbox_id: number }>;
+      for (const r of recpRows) {
+        if (!recipientMap.has(r.outbox_id)) recipientMap.set(r.outbox_id, []);
+        recipientMap.get(r.outbox_id)!.push(r);
+      }
+    }
+
+    const items = rows.map(r => ({
+      ...r,
+      recipients: recipientMap.get(r.id) ?? undefined,
+    }));
+
+    console.log(`[GET /outbox/due] account=${accountId} claimed=${rows.length}`);
+    return json(items);
+  } catch (err) {
+    console.error('[GET /outbox/due] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+async function handlePatchOutbox(outboxId: number, request: Request, env: Env, accountId: string): Promise<Response> {
+  let body: unknown;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
+
+  const b = body as Record<string, unknown>;
+  const now = Math.floor(Date.now() / 1000);
+  const sets: string[] = ['updated_at = $1'];
+  const binds: unknown[] = [now];
+  let p = 1;
+
+  if (typeof b.text === 'string') { p++; sets.push(`text = $${p}`); binds.push(b.text); }
+  if (typeof b.scheduled_at === 'number' || b.scheduled_at === null) { p++; sets.push(`scheduled_at = $${p}`); binds.push(b.scheduled_at ?? null); }
+  if (typeof b.tg_chat_id === 'string') { p++; sets.push(`tg_chat_id = $${p}`); binds.push(b.tg_chat_id); }
+
+  if (sets.length === 1) return json({ ok: false, error: 'nothing to update' }, 400);
+
+  p++; binds.push(accountId);
+  p++; binds.push(outboxId);
+
+  const sql = getSql(env);
+  try {
+    const rows = await sql(
+      `UPDATE outbox SET ${sets.join(', ')} WHERE account_id = $${p - 1} AND id = $${p} AND status = 'draft' RETURNING id`,
+      binds,
+    ) as Array<{ id: number }>;
+    if (rows.length === 0) return json({ ok: false, error: 'draft not found or not in draft status' }, 404);
+    return json({ ok: true });
+  } catch (err) {
+    console.error('[PATCH /outbox/:id] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+async function handleDeleteOutbox(outboxId: number, env: Env, accountId: string): Promise<Response> {
+  const sql = getSql(env);
+  try {
+    const rows = await sql(
+      `DELETE FROM outbox WHERE account_id = $1 AND id = $2 AND status = 'draft' RETURNING id`,
+      [accountId, outboxId],
+    ) as Array<{ id: number }>;
+    if (rows.length === 0) return json({ ok: false, error: 'draft not found or not in draft status' }, 404);
+    return json({ ok: true });
+  } catch (err) {
+    console.error('[DELETE /outbox/:id] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+async function handleSendOutbox(outboxId: number, request: Request, env: Env, accountId: string): Promise<Response> {
+  let body: Record<string, unknown> = {};
+  try { body = (await request.json()) as Record<string, unknown>; } catch { /* empty body ok */ }
+
+  const scheduledAt = typeof body.scheduled_at === 'number' ? body.scheduled_at : null;
+  const newStatus = scheduledAt !== null ? 'scheduled' : 'pending';
+
+  const sql = getSql(env);
+  try {
+    const rows = await sql(
+      `UPDATE outbox SET status = $1, scheduled_at = $2, updated_at = $3
+       WHERE account_id = $4 AND id = $5 AND status = 'draft'
+       RETURNING id`,
+      [newStatus, scheduledAt, Math.floor(Date.now() / 1000), accountId, outboxId],
+    ) as Array<{ id: number }>;
+    if (rows.length === 0) return json({ ok: false, error: 'draft not found or not in draft status' }, 404);
+    return json({ ok: true, status: newStatus });
+  } catch (err) {
+    console.error('[POST /outbox/:id/send] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+async function handleAckOutbox(outboxId: number, request: Request, env: Env, accountId: string): Promise<Response> {
+  let body: unknown;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
+
+  const b = body as Record<string, unknown>;
+  const status = b.status as string;
+  if (!['sent', 'failed', 'partial'].includes(status)) {
+    return json({ ok: false, error: 'status must be sent, failed, or partial' }, 400);
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const sentAt = typeof b.sent_at === 'number' ? b.sent_at : now;
+  const error = typeof b.error === 'string' ? b.error : null;
+
+  const sql = getSql(env);
+  try {
+    await sql(
+      `UPDATE outbox SET status = $1, sent_at = $2, error = $3, updated_at = $4
+       WHERE account_id = $5 AND id = $6`,
+      [status, sentAt, error, now, accountId, outboxId],
+    );
+
+    // Update per-recipient results if provided
+    const results = Array.isArray(b.results) ? (b.results as Array<Record<string, unknown>>) : null;
+    if (results && results.length > 0) {
+      for (const r of results) {
+        if (typeof r.id !== 'number') continue;
+        await sql(
+          `UPDATE outbox_recipients SET status = $1, sent_at = $2, error = $3
+           WHERE id = $4 AND outbox_id = $5`,
+          [r.status ?? 'sent', r.sent_at ?? now, r.error ?? null, r.id, outboxId],
+        );
+      }
+    }
+
+    console.log(`[POST /outbox/${outboxId}/ack] account=${accountId} status=${status}`);
+    return json({ ok: true });
+  } catch (err) {
+    console.error('[POST /outbox/:id/ack] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pending actions — edit / delete / forward on already-sent messages
+// ---------------------------------------------------------------------------
+
+async function handlePostAction(request: Request, env: Env, accountId: string, action: 'edit' | 'delete' | 'forward'): Promise<Response> {
+  let body: unknown;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
+
+  const b = body as Record<string, unknown>;
+  if (typeof b.tg_chat_id !== 'string' || !b.tg_chat_id) {
+    return json({ ok: false, error: 'tg_chat_id is required' }, 400);
+  }
+  if (typeof b.tg_message_id !== 'string' || !b.tg_message_id) {
+    return json({ ok: false, error: 'tg_message_id is required' }, 400);
+  }
+  if (action === 'edit' && (typeof b.text !== 'string' || !b.text)) {
+    return json({ ok: false, error: 'text is required for edit' }, 400);
+  }
+  if (action === 'forward' && (typeof b.to_chat_id !== 'string' || !b.to_chat_id)) {
+    return json({ ok: false, error: 'to_chat_id is required for forward' }, 400);
+  }
+
+  const sql = getSql(env);
+  try {
+    const rows = await sql(
+      `INSERT INTO pending_actions (account_id, action, tg_chat_id, tg_message_id, text, to_chat_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id`,
+      [
+        accountId,
+        action,
+        b.tg_chat_id,
+        b.tg_message_id,
+        action === 'edit' ? b.text : null,
+        action === 'forward' ? b.to_chat_id : null,
+        Math.floor(Date.now() / 1000),
+      ],
+    ) as Array<{ id: number }>;
+    console.log(`[POST /actions/${action}] account=${accountId} id=${rows[0].id} chat=${b.tg_chat_id} msg=${b.tg_message_id}`);
+    return json({ id: rows[0].id, action, status: 'pending' });
+  } catch (err) {
+    console.error(`[POST /actions/${action}] DB error`, err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+async function handleGetActionsPending(_request: Request, env: Env, accountId: string): Promise<Response> {
+  const sql = getSql(env);
+  try {
+    const rows = await sql(
+      `SELECT id, action, tg_chat_id, tg_message_id, text, to_chat_id, created_at
+       FROM pending_actions
+       WHERE account_id = $1 AND status = 'pending'
+       ORDER BY created_at ASC`,
+      [accountId],
+    );
+    return json(rows);
+  } catch (err) {
+    console.error('[GET /actions/pending] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+async function handleAckAction(actionId: number, request: Request, env: Env, accountId: string): Promise<Response> {
+  let body: unknown;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
+
+  const b = body as Record<string, unknown>;
+  const status = b.status as string;
+  if (!['done', 'failed'].includes(status)) {
+    return json({ ok: false, error: 'status must be done or failed' }, 400);
+  }
+
+  const sql = getSql(env);
+  try {
+    await sql(
+      `UPDATE pending_actions SET status = $1, error = $2 WHERE account_id = $3 AND id = $4`,
+      [status, typeof b.error === 'string' ? b.error : null, accountId, actionId],
+    );
+    console.log(`[POST /actions/${actionId}/ack] account=${accountId} status=${status}`);
+    return json({ ok: true });
+  } catch (err) {
+    console.error('[POST /actions/:id/ack] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // MCP (Model Context Protocol) — Streamable HTTP transport, spec 2024-11-05
 // ---------------------------------------------------------------------------
 
@@ -907,11 +1284,12 @@ const MCP_TOOL_DEFINITIONS = [
   },
   {
     name: 'chats',
-    description: 'List all Telegram chats (groups, channels, DMs) with message counts and last activity. Use to discover chat IDs before calling history, or to find which chat a conversation happened in. Optionally filter by chat name.',
+    description: 'List all Telegram chats (groups, channels, DMs) with message counts and last activity. Use to discover chat IDs before calling history, or to find which chat a conversation happened in. Optionally filter by chat name or label.',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: 'Optional. Filter chats by name (case-insensitive partial match). Example: "DevOps" matches "DevOps Team" and "devops-general".' },
+        label: { type: 'string', description: 'Optional. Filter by label (e.g. "work", "personal"). Only returns chats that have that label set in chat_config.' },
       },
     },
   },
@@ -954,6 +1332,97 @@ const MCP_TOOL_DEFINITIONS = [
     description: 'Get archive statistics: total message count, date range, number of chats and contacts, sent vs received breakdown. Use this first when the user asks about the archive, or to discover what date range is available before searching.',
     inputSchema: { type: 'object', properties: {} },
   },
+  {
+    name: 'digest',
+    description: 'Get a digest of recent messages grouped by chat, showing the latest N messages per active chat. Use this for "what happened today/this week", morning briefings, or to catch up on activity across all chats. Each chat entry includes its label (work/personal) when set.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        hours: { type: 'number', description: 'Look-back window in hours (default 24). Use 168 for a weekly digest.' },
+        per_chat: { type: 'number', description: 'Max messages per chat to return (default 5, max 20).' },
+        label: { type: 'string', description: 'Optional. Filter to chats with this label (e.g. "work").' },
+      },
+    },
+  },
+  {
+    name: 'thread',
+    description: 'Get a message and its reply thread (parent + all direct replies). Use when you want to see the full context of a conversation around a specific message.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string', description: 'Chat ID containing the message.' },
+        message_id: { type: 'string', description: 'The tg_message_id of the message to reconstruct the thread around.' },
+      },
+      required: ['chat_id', 'message_id'],
+    },
+  },
+  {
+    name: 'send',
+    description: 'Queue a Telegram message for immediate sending (or schedule it). For single-chat sends, provide tg_chat_id. For mass sends, provide a recipients array. GramJS picks it up within 30 seconds. Returns the outbox id.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tg_chat_id: { type: 'string', description: 'Target chat ID for a single send. Omit for mass send.' },
+        text: { type: 'string', description: 'Message text. Supports {first_name}, {last_name}, {username}, {user} placeholders for mass sends.' },
+        reply_to_message_id: { type: 'number', description: 'Optional. Reply to this message ID.' },
+        scheduled_at: { type: 'number', description: 'Optional. Unix epoch seconds to send at. Omit to send immediately.' },
+        recipients: { type: 'array', description: 'For mass send: array of {tg_chat_id, first_name?, last_name?, username?} objects.', items: { type: 'object' } },
+      },
+      required: ['text'],
+    },
+  },
+  {
+    name: 'draft',
+    description: 'Save a message as a draft (not queued for sending yet). Returns the outbox id. Use send tool or POST /outbox/:id/send to promote to pending/scheduled later.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tg_chat_id: { type: 'string', description: 'Target chat ID for a single send.' },
+        text: { type: 'string', description: 'Message text. Supports {first_name}, {last_name}, {username}, {user} placeholders.' },
+        reply_to_message_id: { type: 'number', description: 'Optional. Reply to this message ID.' },
+        recipients: { type: 'array', description: 'For mass send drafts.', items: { type: 'object' } },
+      },
+      required: ['text'],
+    },
+  },
+  {
+    name: 'edit_message',
+    description: 'Edit an already-sent Telegram message. Queues an edit action; GramJS executes it within 30 seconds and the archive is updated automatically.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tg_chat_id: { type: 'string', description: 'Chat ID of the message to edit.' },
+        tg_message_id: { type: 'string', description: 'Message ID to edit.' },
+        text: { type: 'string', description: 'New text for the message.' },
+      },
+      required: ['tg_chat_id', 'tg_message_id', 'text'],
+    },
+  },
+  {
+    name: 'delete_message',
+    description: 'Delete an already-sent Telegram message (revokes from both sides). Queues a delete action; GramJS executes it within 30 seconds.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tg_chat_id: { type: 'string', description: 'Chat ID of the message to delete.' },
+        tg_message_id: { type: 'string', description: 'Message ID to delete.' },
+      },
+      required: ['tg_chat_id', 'tg_message_id'],
+    },
+  },
+  {
+    name: 'forward_message',
+    description: 'Forward an existing Telegram message to another chat. Queues a forward action; GramJS executes it within 30 seconds.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tg_chat_id: { type: 'string', description: 'Source chat ID.' },
+        tg_message_id: { type: 'string', description: 'Message ID to forward.' },
+        to_chat_id: { type: 'string', description: 'Destination chat ID.' },
+      },
+      required: ['tg_chat_id', 'tg_message_id', 'to_chat_id'],
+    },
+  },
 ];
 
 const TEXT_SNIPPET_LEN = 500;
@@ -995,6 +1464,7 @@ async function dispatchMcpTool(
   if (name === 'chats') {
     const params = new URLSearchParams();
     if (typeof args.name === 'string') params.set('name', args.name);
+    if (typeof args.label === 'string') params.set('label', args.label);
     const req = new Request(`${baseUrl}/chats?${params.toString()}`);
     const res = await handleChats(req, env, accountId);
     return await res.json();
@@ -1097,6 +1567,126 @@ async function dispatchMcpTool(
     return await res.json();
   }
 
+  if (name === 'digest') {
+    const hours = typeof args.hours === 'number' ? Math.min(Math.max(args.hours, 1), 720) : 24;
+    const perChat = Math.min(typeof args.per_chat === 'number' ? args.per_chat : 5, 20);
+    const labelFilter = typeof args.label === 'string' ? args.label : null;
+    const since = Math.floor(Date.now() / 1000) - hours * 3600;
+
+    const SQL = `
+      WITH ranked AS (
+        SELECT
+          m.tg_chat_id,
+          MAX(m.chat_name) OVER (PARTITION BY m.tg_chat_id) AS chat_name,
+          MAX(cc.label) OVER (PARTITION BY m.tg_chat_id) AS label,
+          m.id, m.tg_message_id, m.sender_username, m.sender_first_name,
+          m.direction, m.text, m.media_type, m.sent_at,
+          ROW_NUMBER() OVER (PARTITION BY m.tg_chat_id ORDER BY m.sent_at DESC, m.id DESC) AS rn
+        FROM messages m
+        LEFT JOIN chat_config cc ON cc.account_id = m.account_id AND cc.tg_chat_id = m.tg_chat_id
+        WHERE m.account_id = $1
+          AND m.sent_at >= $2
+          AND m.is_deleted = 0
+          AND ($3::text IS NULL OR cc.label = $3)
+      )
+      SELECT tg_chat_id, chat_name, label, id, tg_message_id,
+             sender_username, sender_first_name, direction, text, media_type, sent_at
+      FROM ranked
+      WHERE rn <= $4
+      ORDER BY tg_chat_id, sent_at ASC, id ASC
+    `.trim();
+
+    const rows = await getSql(env)(SQL, [accountId, since, labelFilter, perChat]) as Array<Record<string, unknown>>;
+
+    // Group by chat
+    const chats: Record<string, { chat_name: unknown; label: unknown; messages: Array<Record<string, unknown>> }> = {};
+    for (const row of rows) {
+      const cid = row.tg_chat_id as string;
+      if (!chats[cid]) chats[cid] = { chat_name: row.chat_name, label: row.label, messages: [] };
+      const { tg_chat_id: _c, chat_name: _n, label: _l, ...msg } = row;
+      chats[cid].messages.push(truncateText(msg));
+    }
+    return { hours, per_chat: perChat, chats };
+  }
+
+  if (name === 'thread') {
+    if (typeof args.chat_id !== 'string') throw new Error('chat_id is required');
+    if (typeof args.message_id !== 'string') throw new Error('message_id is required');
+
+    const SQL = `
+      SELECT id, tg_message_id, sender_username, sender_first_name, direction,
+             text, media_type, reply_to_message_id, sent_at
+      FROM messages
+      WHERE account_id = $1
+        AND tg_chat_id = $2
+        AND is_deleted = 0
+        AND (
+          tg_message_id = $3
+          OR id = (SELECT reply_to_message_id FROM messages WHERE account_id = $1 AND tg_chat_id = $2 AND tg_message_id = $3 LIMIT 1)
+          OR reply_to_message_id = (SELECT id FROM messages WHERE account_id = $1 AND tg_chat_id = $2 AND tg_message_id = $3 LIMIT 1)
+        )
+      ORDER BY sent_at ASC, id ASC
+    `.trim();
+
+    const rows = await getSql(env)(SQL, [accountId, args.chat_id, args.message_id]) as Array<Record<string, unknown>>;
+    return { chat_id: args.chat_id, message_id: args.message_id, messages: rows.map(truncateText) };
+  }
+
+  if (name === 'send' || name === 'draft') {
+    if (typeof args.text !== 'string' || !args.text.trim()) throw new Error('text is required');
+    const requestedStatus = name === 'send' ? 'pending' : 'draft';
+    const req = new Request(`${baseUrl}/outbox`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...args, status: requestedStatus }),
+    });
+    const res = await handlePostOutbox(req, env, accountId);
+    const data = await res.json() as Record<string, unknown>;
+    if (res.status !== 200) throw new Error(String(data.error ?? 'Failed to queue message'));
+    return {
+      ...data,
+      note: name === 'send'
+        ? 'Message queued. GramJS will send it within 30 seconds.'
+        : 'Saved as draft. Use POST /outbox/:id/send to queue it for sending.',
+    };
+  }
+
+  if (name === 'edit_message') {
+    const req = new Request(`${baseUrl}/actions/edit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const res = await handlePostAction(req, env, accountId, 'edit');
+    const data = await res.json() as Record<string, unknown>;
+    if (res.status !== 200) throw new Error(String(data.error ?? 'Failed to queue edit'));
+    return { ...data, note: 'Edit queued. GramJS will apply it within 30 seconds.' };
+  }
+
+  if (name === 'delete_message') {
+    const req = new Request(`${baseUrl}/actions/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const res = await handlePostAction(req, env, accountId, 'delete');
+    const data = await res.json() as Record<string, unknown>;
+    if (res.status !== 200) throw new Error(String(data.error ?? 'Failed to queue delete'));
+    return { ...data, note: 'Delete queued. GramJS will apply it within 30 seconds.' };
+  }
+
+  if (name === 'forward_message') {
+    const req = new Request(`${baseUrl}/actions/forward`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(args),
+    });
+    const res = await handlePostAction(req, env, accountId, 'forward');
+    const data = await res.json() as Record<string, unknown>;
+    if (res.status !== 200) throw new Error(String(data.error ?? 'Failed to queue forward'));
+    return { ...data, note: 'Forward queued. GramJS will apply it within 30 seconds.' };
+  }
+
   throw new Error(`Unknown tool: ${name}`);
 }
 
@@ -1124,19 +1714,33 @@ async function handleMcpMessage(
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
         serverInfo: { name: 'tg-reader', version: '1.0.0' },
-        instructions: `You have access to a complete Telegram message archive. Use the "stats" tool first if you need to know the date range or message count.
+        instructions: `You have full read/write access to a Telegram account via this archive. Use "stats" first if you need the date range or message count.
 
-TOOL SELECTION GUIDE:
-- "search" — primary tool. Use for ANY question about past conversations, specific content, people, amounts, topics, or events. Results ranked by relevance then recency. Always set from/to when user mentions a time period. Use sender_username to filter by person.
-- "stats" — archive overview: total messages, date range, chats, contacts. Use when user asks about the archive size, or before searching to confirm data exists.
-- "chats" — lists all chats with message counts. Filter by name param. Use to get chat_id before calling history, or to find which chat something happened in.
-- "history" — reads one chat chronologically. Use only for browsing a thread. For finding content, use search with chat_id filter.
-- "contacts" — find people by name/username. Use to look up sender_username before filtering search.
+READ TOOLS:
+- "search" — primary. Use for ANY question about past conversations, content, people, amounts, events. Always set from/to when user mentions a time period. Use sender_username to filter by person.
+- "stats" — archive overview. Use when user asks about size or date range.
+- "chats" — lists all chats with counts. Pass label="work" or label="personal" to scope. Use to get chat_id before history.
+- "history" — one chat chronologically. Use only for browsing. For finding content use search with chat_id.
+- "contacts" — find people by name/username. Look up sender_username before filtering search.
 - "recent" — latest messages across all chats. Use only for "what's new" queries.
+- "digest" — recent messages per chat grouped. Use for morning briefings or catch-up. Pass label="work" to scope to work chats.
+- "thread" — message + parent + direct replies. Use when you need full context of a reply chain.
 
-PAGINATION: search returns next_before_id + next_before_sent_at (pass to next call to go to older results). history returns next_after_id + next_after_sent_at (pass to next call to go to newer/later messages).
+WRITE TOOLS (GramJS picks up within 30 seconds):
+- "send" — queue a message for immediate or scheduled sending. Single chat or mass send with {first_name}/{user} placeholders.
+- "draft" — save a draft without sending. Returns outbox id for later review/edit/send.
+- "edit_message" — queue an edit to an already-sent message.
+- "delete_message" — queue a delete (revokes from both sides).
+- "forward_message" — queue a forward to another chat.
 
-IMPORTANT: The archive is complete and historical. Never tell the user data is unavailable — search with broader terms or a wider date range. If a search returns nothing, try synonyms or remove filters before giving up.`,
+AGENTIC WORKFLOW EXAMPLE — "find today's work todos":
+1. digest(hours=24, label="work") — scan recent work chats
+2. search(query="todo action need", from=today) — look for task language
+3. For each actionable item found: optionally draft() a summary or send() a reminder
+
+PAGINATION: search → next_before_id + next_before_sent_at. history → next_after_id + next_after_sent_at.
+
+IMPORTANT: Archive is complete. Never say data is unavailable — try broader terms or wider date range first.`,
       },
     };
   }
@@ -1287,6 +1891,49 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
 
   if (method === 'POST' && pathname === '/mcp') {
     return handleMcp(request, env, accountId);
+  }
+
+  // Outbox
+  if (method === 'POST' && pathname === '/outbox') {
+    return handlePostOutbox(request, env, accountId);
+  }
+  if (method === 'GET' && pathname === '/outbox') {
+    return handleGetOutbox(request, env, accountId);
+  }
+  if (method === 'GET' && pathname === '/outbox/due') {
+    return handleGetOutboxDue(request, env, accountId);
+  }
+  const outboxItemMatch = pathname.match(/^\/outbox\/(\d+)$/);
+  if (outboxItemMatch) {
+    const outboxId = parseInt(outboxItemMatch[1], 10);
+    if (method === 'PATCH') return handlePatchOutbox(outboxId, request, env, accountId);
+    if (method === 'DELETE') return handleDeleteOutbox(outboxId, env, accountId);
+  }
+  const outboxSendMatch = pathname.match(/^\/outbox\/(\d+)\/send$/);
+  if (method === 'POST' && outboxSendMatch) {
+    return handleSendOutbox(parseInt(outboxSendMatch[1], 10), request, env, accountId);
+  }
+  const outboxAckMatch = pathname.match(/^\/outbox\/(\d+)\/ack$/);
+  if (method === 'POST' && outboxAckMatch) {
+    return handleAckOutbox(parseInt(outboxAckMatch[1], 10), request, env, accountId);
+  }
+
+  // Pending actions
+  if (method === 'POST' && pathname === '/actions/edit') {
+    return handlePostAction(request, env, accountId, 'edit');
+  }
+  if (method === 'POST' && pathname === '/actions/delete') {
+    return handlePostAction(request, env, accountId, 'delete');
+  }
+  if (method === 'POST' && pathname === '/actions/forward') {
+    return handlePostAction(request, env, accountId, 'forward');
+  }
+  if (method === 'GET' && pathname === '/actions/pending') {
+    return handleGetActionsPending(request, env, accountId);
+  }
+  const actionAckMatch = pathname.match(/^\/actions\/(\d+)\/ack$/);
+  if (method === 'POST' && actionAckMatch) {
+    return handleAckAction(parseInt(actionAckMatch[1], 10), request, env, accountId);
   }
 
   return json({ ok: false, error: 'Not Found' }, 404);
