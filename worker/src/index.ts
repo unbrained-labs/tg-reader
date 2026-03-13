@@ -254,7 +254,8 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
           AND m.account_id = $2
           AND m.is_deleted = 0
           AND ($3::text IS NULL OR m.tg_chat_id = $3)
-          AND ($4::text IS NULL OR m.sender_username = $4)
+          AND ($4::text IS NULL OR m.sender_username = $4
+            OR m.sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $2 AND username = $4))
           AND m.sent_at >= $5
           AND m.sent_at <= $6
           ${keysetClause}
@@ -269,7 +270,8 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
           AND m.account_id = $2
           AND m.is_deleted = 0
           AND ($3::text IS NULL OR m.tg_chat_id = $3)
-          AND ($4::text IS NULL OR m.sender_username = $4)
+          AND ($4::text IS NULL OR m.sender_username = $4
+            OR m.sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $2 AND username = $4))
           AND m.sent_at >= $5
           AND m.sent_at <= $6
           ${keysetClause}
@@ -301,7 +303,8 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
         WHERE account_id = $1
           AND is_deleted = 0
           AND ($2::text IS NULL OR tg_chat_id = $2)
-          AND ($3::text IS NULL OR sender_username = $3)
+          AND ($3::text IS NULL OR sender_username = $3
+            OR sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $1 AND username = $3))
           AND sent_at >= $4
           AND sent_at <= $5
           ${keysetClause}
@@ -315,7 +318,8 @@ async function handleSearch(request: Request, env: Env, accountId: string): Prom
         WHERE account_id = $1
           AND is_deleted = 0
           AND ($2::text IS NULL OR tg_chat_id = $2)
-          AND ($3::text IS NULL OR sender_username = $3)
+          AND ($3::text IS NULL OR sender_username = $3
+            OR sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $1 AND username = $3))
           AND sent_at >= $4
           AND sent_at <= $5
           ${keysetClause}
@@ -430,7 +434,9 @@ async function handlePostContacts(request: Request, env: Env, accountId: string)
   return json({ upserted });
 }
 
-async function handleGetContacts(_request: Request, env: Env, accountId: string): Promise<Response> {
+async function handleGetContacts(request: Request, env: Env, accountId: string): Promise<Response> {
+  const url = new URL(request.url);
+  const hasMessages = url.searchParams.get('has_messages') === 'true';
   const SQL = `
     SELECT
       c.tg_user_id,
@@ -446,12 +452,13 @@ async function handleGetContacts(_request: Request, env: Env, accountId: string)
     LEFT JOIN messages m ON m.account_id = c.account_id AND m.sender_id = c.tg_user_id
     WHERE c.account_id = $1
     GROUP BY c.tg_user_id, c.phone, c.username, c.first_name, c.last_name, c.is_mutual, c.is_bot
+    HAVING ($2::boolean IS NOT TRUE OR COUNT(m.id) > 0)
     ORDER BY last_seen DESC NULLS LAST
   `.trim();
 
   const sql = getSql(env);
   try {
-    const rows = await sql(SQL, [accountId]) as Array<{
+    const rows = await sql(SQL, [accountId, hasMessages || null]) as Array<{
       tg_user_id: string; phone: string | null; username: string | null;
       first_name: string | null; last_name: string | null;
       is_mutual: number; is_bot: number;
@@ -1281,7 +1288,7 @@ function mcpError(id: unknown, code: number, message: string): object {
 const MCP_TOOL_DEFINITIONS = [
   {
     name: 'search',
-    description: 'Full-text search across the complete Telegram message archive (51k+ messages). Results are ranked by relevance then recency. Use this for ANY question about past conversations, finding specific messages, amounts, names, or topics. Always use from/to when the user mentions a time period. For sender-specific searches, use sender_username. Paginate with next_before_id + next_before_sent_at from the previous response.',
+    description: 'Full-text search across the complete Telegram message archive (51k+ messages). Results are ranked by recency. Use for any question about past conversations, finding specific messages, amounts, names, or topics. Always use from/to when the user mentions a time period. IMPORTANT: multiple words are ANDed — every word must appear in the message. If a broad search returns 0 results, retry with a single shorter token (e.g. "blackbox" instead of "blackbox network"). For sender-specific searches, use sender_username (resolved via contacts if needed). Paginate with next_before_id + next_before_sent_at from the previous response.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1327,11 +1334,12 @@ const MCP_TOOL_DEFINITIONS = [
   },
   {
     name: 'contacts',
-    description: 'List Telegram contacts with username, name, and message count. Use to find someone\'s username before searching their messages, or to see who you talk to most. Note: contacts are people saved in your phone — group members without saved contact may not appear here.',
+    description: 'List Telegram contacts with username, name, and message count. Use to find someone\'s tg_user_id or username before searching their messages, or to see who you talk to most. Note: contacts are people saved in your phone — group members without a saved contact may not appear here. Use has_messages: true to filter out phone contacts who never messaged on Telegram.',
     inputSchema: {
       type: 'object',
       properties: {
         search: { type: 'string', description: 'Optional. Filter by name or username (case-insensitive partial match).' },
+        has_messages: { type: 'boolean', description: 'Optional. If true, only return contacts who have at least one message in the archive. Filters out phone contacts with no Telegram message history.' },
       },
     },
   },
@@ -1551,6 +1559,7 @@ async function dispatchMcpTool(
     const search = typeof args.search === 'string' && args.search.trim() !== ''
       ? `%${args.search.trim().replace(/[%_\\]/g, '\\$&')}%`
       : null;
+    const hasMessages = args.has_messages === true;
     const SQL = `
       SELECT
         c.tg_user_id,
@@ -1567,9 +1576,10 @@ async function dispatchMcpTool(
       WHERE c.account_id = $1
         AND ($2::text IS NULL OR c.first_name ILIKE $2 OR c.last_name ILIKE $2 OR c.username ILIKE $2)
       GROUP BY c.tg_user_id, c.phone, c.username, c.first_name, c.last_name, c.is_mutual, c.is_bot
+      HAVING ($3::boolean IS NOT TRUE OR COUNT(m.id) > 0)
       ORDER BY last_seen DESC NULLS LAST
     `.trim();
-    const rows = await getSql(env)(SQL, [accountId, search]) as Array<{
+    const rows = await getSql(env)(SQL, [accountId, search, hasMessages || null]) as Array<{
       tg_user_id: string; phone: string | null; username: string | null;
       first_name: string | null; last_name: string | null;
       is_mutual: number; is_bot: number;
