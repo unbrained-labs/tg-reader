@@ -57,11 +57,12 @@ CREATE TABLE roles (
 );
 
 CREATE TABLE agent_tokens (
-  id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  token_hash  TEXT NOT NULL UNIQUE,  -- SHA-256 of the raw token, never plaintext
-  label       TEXT,                  -- "work claude", "read-only scout"
-  expires_at  BIGINT,                -- Unix epoch seconds, NULL = no expiry
-  created_at  BIGINT NOT NULL
+  id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  token_hash   TEXT NOT NULL UNIQUE,  -- SHA-256 of the raw token, never plaintext
+  label        TEXT,                  -- "work claude", "read-only scout"
+  expires_at   BIGINT,                -- Unix epoch seconds, NULL = no expiry
+  last_used_at BIGINT,                -- NULL until first use; updated at most once per 5 min
+  created_at   BIGINT NOT NULL
 );
 
 -- Many-to-many: one token can access multiple accounts, each with its own role.
@@ -273,7 +274,7 @@ expires_at?: number -- optional Unix epoch seconds
 Returns raw token once. Not stored.
 
 ### `list_tokens`
-All tokens with label, role, accounts, expires_at. Never the raw token or hash.
+All tokens with label, role, accounts, expires_at, last_used_at. Never the raw token or hash.
 
 ### `revoke_token`
 Hard delete. Audit log rows retained with token_id set to null.
