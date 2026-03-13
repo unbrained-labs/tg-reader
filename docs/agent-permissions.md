@@ -22,6 +22,8 @@ Agent Token (AI agents)
 
 Master token (full access, stored as Cloudflare secret) bypasses role checks. Used by the owner to manage roles and tokens via Claude.
 
+Permissions are resolved per `(token, account_id)` pair — a single token can access multiple accounts, each with a different role. Passing an account_id the token has no mapping for returns 403.
+
 ---
 
 ## Schema
@@ -54,11 +56,18 @@ CREATE TABLE roles (
 
 CREATE TABLE agent_tokens (
   id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  account_id  TEXT NOT NULL,
   token       TEXT NOT NULL UNIQUE,
-  role_id     BIGINT NOT NULL REFERENCES roles(id) ON DELETE RESTRICT,
   label       TEXT,        -- human-readable: "work claude", "read-only scout"
   created_at  BIGINT NOT NULL
+);
+
+-- Many-to-many: one token can access multiple accounts, each with its own role.
+-- Single-account tokens just have one row here.
+CREATE TABLE token_account_roles (
+  token_id    BIGINT NOT NULL REFERENCES agent_tokens(id) ON DELETE CASCADE,
+  account_id  TEXT NOT NULL,
+  role_id     BIGINT NOT NULL REFERENCES roles(id) ON DELETE RESTRICT,
+  PRIMARY KEY (token_id, account_id)
 );
 ```
 
