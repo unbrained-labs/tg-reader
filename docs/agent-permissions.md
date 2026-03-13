@@ -275,6 +275,7 @@ Returns raw token once. Not stored.
 
 ### `list_tokens`
 All tokens with label, role, accounts, expires_at, last_used_at. Never the raw token or hash.
+Timestamps returned as ISO 8601 strings (stored as Unix integers, converted on the way out).
 
 ### `revoke_token`
 Hard delete. Audit log rows retained with token_id set to null.
