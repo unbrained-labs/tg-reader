@@ -6,14 +6,17 @@
     "auth": "npx ts-node src/auth.ts",
     "listener": "npx ts-node src/listener.ts",
     "backfill-seed": "npx ts-node src/backfill-seed.ts",
-    "backfill-run": "npx ts-node src/backfill-run.ts"
+    "backfill-run": "npx ts-node src/backfill-run.ts",
+    "enrich-senders": "npx ts-node src/enrich-senders.ts"
   },
   "dependencies": {
-    "telegram": "^2.26.22",
-    "input": "^1.0.1"
+    "input": "^1.0.1",
+    "telegram": "^2.26.22"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "@types/pg": "^8.18.0",
+    "pg": "^8.20.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.4.0"
   }

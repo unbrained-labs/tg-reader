@@ -650,11 +650,23 @@ async function main(): Promise<void> {
   await client.connect();
   console.log('[listener] connected to Telegram');
 
-  // 2b. Derive account ID from the authenticated user if not set via env
+  // 2b. Derive account ID — always numeric Telegram user ID, never username
   if (!ACCOUNT_ID) {
     const me = await client.getMe();
     if (!(me instanceof Api.User)) throw new Error('getMe() returned UserEmpty — session is invalid');
     ACCOUNT_ID = String(me.id);
+    // Register username alias so the worker can resolve e.g. "d4d0ch" → "7926042351"
+    if (me.username) {
+      try {
+        await fetch(`${WORKER_URL}/account/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Ingest-Token': INGEST_TOKEN, 'X-Account-ID': ACCOUNT_ID },
+          body: JSON.stringify({ username: me.username }),
+        });
+      } catch {
+        // Non-fatal — listener works without it
+      }
+    }
   }
   console.log(`[listener] account_id=${ACCOUNT_ID}`);
 

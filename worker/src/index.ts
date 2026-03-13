@@ -575,6 +575,26 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
   }
 }
 
+// Stores username → numeric_id alias so users can reference accounts by name.
+// Called by listener on startup. Uses global_config KV: key = 'alias:<username>', value = numeric_id.
+async function handleAccountRegister(request: Request, env: Env, accountId: string): Promise<Response> {
+  let body: unknown;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON' }, 400); }
+  const username = (body as Record<string, unknown>).username;
+  if (typeof username !== 'string' || !username) return json({ ok: false, error: 'username required' }, 400);
+  const sql = getSql(env);
+  try {
+    await sql(
+      `INSERT INTO global_config (key, value) VALUES ($1, $2) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value`,
+      [`alias:${username.toLowerCase()}`, accountId],
+    );
+    return json({ ok: true });
+  } catch (err) {
+    console.error('[POST /account/register] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
 async function handleGetConfig(_request: Request, env: Env): Promise<Response> {
   const sql = getSql(env);
   try {
@@ -1889,6 +1909,10 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
     return handleChats(request, env, accountId);
   }
 
+  if (method === 'POST' && pathname === '/account/register') {
+    return handleAccountRegister(request, env, accountId);
+  }
+
   if (method === 'GET' && pathname === '/config') {
     return handleGetConfig(request, env);
   }
@@ -1927,6 +1951,7 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
   if (method === 'POST' && pathname === '/backfill/progress') {
     return handleBackfillProgress(request, env, accountId);
   }
+
 
   if (method === 'POST' && pathname === '/mcp') {
     return handleMcp(request, env, accountId);
@@ -2014,9 +2039,23 @@ async function fetch(request: Request, env: Env): Promise<Response> {
   }
 
   // W-2: account ID from header; query-string fallback for /mcp connector URLs only
-  const accountId = request.headers.get('X-Account-ID') ?? accountIdOverride ?? 'primary';
+  let accountId = request.headers.get('X-Account-ID') ?? accountIdOverride ?? 'primary';
   if (!isValidAccountId(accountId)) {
-    return json({ ok: false, error: 'Invalid X-Account-ID: must be "primary" or a numeric Telegram user ID' }, 400);
+    return json({ ok: false, error: 'Invalid X-Account-ID' }, 400);
+  }
+
+  // If account_id is non-numeric (e.g. "d4d0ch"), resolve to numeric_id via alias table
+  if (!/^\d+$/.test(accountId) && accountId !== 'primary') {
+    const sql = getSql(env);
+    try {
+      const rows = await sql(
+        `SELECT value FROM global_config WHERE key = $1`,
+        [`alias:${accountId.toLowerCase()}`],
+      ) as Array<{ value: string }>;
+      if (rows.length > 0) accountId = rows[0].value;
+    } catch {
+      // Non-fatal — proceed with original value
+    }
   }
 
   return route(request, env, accountId);

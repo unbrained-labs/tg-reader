@@ -46,11 +46,11 @@ async function main(): Promise<void> {
   }
   console.log('[backfill] connected to Telegram');
 
-  // Derive account ID from the session — username if set, otherwise numeric ID
+  // Always use numeric Telegram user ID as account_id — stable, never changes.
   const me = await client.getMe();
   if (!(me instanceof Api.User)) throw new Error('getMe() returned UserEmpty — session is invalid');
-  const ACCOUNT_ID = me.username ? me.username : String(me.id);
-  console.log(`[backfill] account_id=${ACCOUNT_ID}`);
+  const ACCOUNT_ID = String(me.id);
+  console.log(`[backfill] account_id=${ACCOUNT_ID} username=${me.username ?? '(none)'}`);
 
   // Step 1 — Seed: enumerate dialogs and register in D1
   // runSeed disconnects the client after enumerating (before hitting the Worker)
