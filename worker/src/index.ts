@@ -3453,7 +3453,10 @@ async function runAgentLoop(job: JobRow, context: string, env: Env): Promise<voi
       tool_calls: response.tool_calls.length > 0 ? response.tool_calls : undefined,
     });
 
-    if (response.stop_reason !== 'tool_use' || response.tool_calls.length === 0) break;
+    // Drive the loop from actual tool calls, not stop_reason — more robust across
+    // providers and handles edge cases like Anthropic returning max_tokens with
+    // complete tool_use blocks already in the content array.
+    if (response.tool_calls.length === 0) break;
 
     for (const tc of response.tool_calls) {
       let result: unknown;
