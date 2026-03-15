@@ -12,6 +12,7 @@ Backfill imports your complete message history into the archive. It's a one-time
 - 1.5–4s randomized sleep between each page of 100 messages
 - Serial processing — one chat at a time, never parallel
 - Auto-sleep on FLOOD_WAIT up to 5 minutes (`floodSleepThreshold: 300`)
+- Automatic exit if FLOOD_WAIT exceeds 300s — the script stops immediately and prints "Resume tomorrow."
 - Fully resumable — if interrupted, picks up exactly where it left off
 
 ## Running backfill
@@ -64,4 +65,31 @@ psql $DATABASE_URL -c \
 
 - Backfill only needs to run once — the live listener captures everything going forward
 - Scale the listener back up immediately after backfill completes
-- If FLOOD_WAIT exceeds 5 minutes, stop and resume the next day
+- If FLOOD_WAIT exceeds 5 minutes the script exits automatically — re-run the next day to resume
+
+---
+
+## One-time migration scripts
+
+These scripts fix data gaps from earlier backfills and are safe to re-run (idempotent):
+
+### Enrich chat types
+
+Populates missing `chat_type` values using `GetDialogs`:
+
+```bash
+cd gramjs
+npx ts-node src/enrich-chat-type.ts
+```
+
+Requires `GRAMJS_SESSION`, `API_ID`, `API_HASH`, `DATABASE_URL`.
+
+### Enrich sender info
+
+Fills `sender_username` / `sender_first_name` / `sender_last_name` using `GetParticipants` for group chats:
+
+```bash
+npx ts-node src/enrich-senders.ts
+```
+
+Requires the same env vars as above. Only updates rows where sender info is still NULL.

@@ -6,7 +6,7 @@ All endpoints require:
 
 ```
 X-Ingest-Token: <your-token>
-X-Account-ID: <account-id>   # defaults to 'primary' if omitted
+X-Account-ID: <account-id>   # numeric Telegram user ID, username (e.g. 'john'), or 'primary'
 ```
 
 ---

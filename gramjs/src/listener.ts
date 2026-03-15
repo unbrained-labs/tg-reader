@@ -51,6 +51,16 @@ function resolvePeer(peerId: Api.TypePeer): { tg_chat_id: string; chat_type: str
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// floodSleepThreshold:300 makes the SDK auto-sleep for FLOOD_WAIT ≤ 300s.
+// Any FloodWait error that escapes to our catch blocks is necessarily >300s.
+function isFloodWait(errMsg: string): boolean {
+  return errMsg.toUpperCase().includes('FLOOD_WAIT') || errMsg.includes('seconds is required');
+}
+
+// ---------------------------------------------------------------------------
 // Sync config
 // ---------------------------------------------------------------------------
 
@@ -497,6 +507,10 @@ async function sendOutboxItem(client: TelegramClient, item: OutboxItem): Promise
       console.log(`[outbox] sent id=${item.id} chat=${item.tg_chat_id}`);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
+      if (isFloodWait(errMsg)) {
+        console.error('[outbox] FLOOD_WAIT >300s — stopping. Item will retry after stuck-sends recovery.');
+        process.exit(1);
+      }
       console.error(`[outbox] failed id=${item.id}:`, errMsg);
       await ackOutbox(item.id, 'failed', sentAt, errMsg);
     }
@@ -517,6 +531,10 @@ async function sendOutboxItem(client: TelegramClient, item: OutboxItem): Promise
       console.log(`[outbox] mass id=${item.id} sent to ${r.tg_chat_id}`);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
+      if (isFloodWait(errMsg)) {
+        console.error('[outbox] FLOOD_WAIT >300s during mass send — stopping. Item will retry after stuck-sends recovery.');
+        process.exit(1);
+      }
       console.error(`[outbox] mass id=${item.id} failed for ${r.tg_chat_id}:`, errMsg);
       results.push({ id: r.id, status: 'failed', error: errMsg });
       failCount++;
@@ -605,6 +623,10 @@ async function processAction(client: TelegramClient, action: PendingAction): Pro
     await ackAction(action.id, 'done');
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
+    if (isFloodWait(errMsg)) {
+      console.error('[actions] FLOOD_WAIT >300s — stopping. Action will be retried on restart.');
+      process.exit(1);
+    }
     console.error(`[actions] ${action.action} failed id=${action.id}:`, errMsg);
     await ackAction(action.id, 'failed', errMsg);
   }

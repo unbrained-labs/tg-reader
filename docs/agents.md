@@ -10,8 +10,10 @@ tg-reader exposes an MCP (Model Context Protocol) server that lets Claude and ot
 2. Enter the URL with your credentials embedded:
 
 ```
-https://<worker>/mcp?token=<ingest-token>&account_id=<account-id>
+https://<worker>/mcp?token=<ingest-token>&account_id=<username-or-id>
 ```
+
+Use your Telegram **username** (e.g. `john`) or numeric user ID for `account_id`. The worker resolves usernames automatically via the contacts table self-entry populated on first listener startup.
 
 3. Leave OAuth fields empty. Click **Add**.
 
