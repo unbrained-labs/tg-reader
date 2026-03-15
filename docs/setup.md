@@ -112,6 +112,43 @@ See [Backfill](backfill.md). Wait 1–2 days before running backfill.
 
 ---
 
+## Dashboard (optional) {#dashboard}
+
+A lightweight browser dashboard ships in `frontend/`. It connects directly to your Worker and provides five screens: overview stats, message search, chats, contacts, and backfill progress.
+
+**Stack:** Preact + Vite — ~29KB JS, ~9KB CSS. No extra backend or hosting needed.
+
+### Build and deploy
+
+```bash
+cd frontend
+npm install
+npm run build      # outputs built assets to worker/public/
+cd ../worker
+wrangler deploy    # redeploy Worker — static assets are included automatically
+```
+
+The Worker's `wrangler.toml` already has `[assets] directory = "./public"` configured. Static files are served before the Worker script runs, so they bypass auth entirely — only the API routes remain protected.
+
+### Access
+
+Open your Worker URL in a browser (`https://<name>.workers.dev`). You'll see a login screen — enter:
+
+- **Worker URL** — your Worker's full URL
+- **Ingest Token** — your `INGEST_TOKEN` secret
+- **Account ID** — optional, defaults to `primary`
+
+Credentials are saved to `localStorage`; click **out** in the sidebar to clear them.
+
+### Local development
+
+```bash
+cd frontend
+npm run dev    # http://localhost:5173 — point login form at your deployed Worker
+```
+
+---
+
 ## GitHub Actions (auto-deploy)
 
 Add these secrets to your GitHub repo (`Settings → Secrets → Actions`):
