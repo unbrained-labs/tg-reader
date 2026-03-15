@@ -4,3 +4,5 @@ node_modules/
 *.ndjson
 .wrangler/
 dist/
+worker/public/
+.playwright-mcp/

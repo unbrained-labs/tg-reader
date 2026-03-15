@@ -2,6 +2,9 @@ name = "tg-reader"
 main = "src/index.ts"
 compatibility_date = "2025-03-01"
 
+[assets]
+directory = "./public"
+
 [[r2_buckets]]
 binding = "BACKUP_BUCKET"
 bucket_name = "tg-reader-backup"
