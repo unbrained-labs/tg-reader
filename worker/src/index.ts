@@ -3064,6 +3064,16 @@ async function runBackup(env: Env): Promise<void> {
     });
     console.log(`[backup] uploaded key=${key} rows=${rowCount}`);
 
+    // Delete R2 backup objects older than 30 days.
+    // Keys are backup-YYYY-MM-DD.ndjson — lexicographic order == date order.
+    const cutoffKey = `backup-${new Date(Date.now() - 30 * 86400 * 1000).toISOString().slice(0, 10)}.ndjson`;
+    const listed = await env.BACKUP_BUCKET.list({ prefix: 'backup-' });
+    const toDelete = listed.objects.filter(o => o.key < cutoffKey).map(o => o.key);
+    for (const oldKey of toDelete) {
+      await env.BACKUP_BUCKET.delete(oldKey);
+      console.log(`[backup] deleted old backup key=${oldKey}`);
+    }
+
     // Prune old audit_log rows per configured retention policy
     const now = Math.floor(Date.now() / 1000);
     const retentionRows = await sql(
