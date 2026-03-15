@@ -167,6 +167,45 @@ function checkWritePermission(
 }
 
 // ---------------------------------------------------------------------------
+// Write permission + audit log helper
+// ---------------------------------------------------------------------------
+
+// Shared by send / edit_message / delete_message / forward_message MCP tools.
+// Looks up chat_type + label for the target chat, calls checkWritePermission,
+// and fires a fire-and-forget audit_log INSERT on success.
+// Returns a permission-denied error object, or null if the write is allowed.
+async function checkAndAuditWrite(
+  action: 'send' | 'edit' | 'delete' | 'forward',
+  chatId: string,
+  detail: Record<string, unknown>,
+  ctx: TokenContext,
+  accountId: string,
+  env: Env,
+): Promise<{ error: string; message: string; action: string; target_chat_type: string | null } | null> {
+  if (!ctx.role) return null; // MASTER_TOKEN — bypass
+  const sql = getSql(env);
+  const chatRows = await sql(
+    `SELECT MAX(m.chat_type) AS chat_type, MAX(cc.label) AS label
+     FROM messages m
+     LEFT JOIN chat_config cc ON cc.account_id = m.account_id AND cc.tg_chat_id = m.tg_chat_id
+     WHERE m.account_id = $1 AND m.tg_chat_id = $2`,
+    [accountId, chatId],
+  ) as Array<{ chat_type: string | null; label: string | null }>;
+  const { chat_type, label } = chatRows[0] ?? { chat_type: null, label: null };
+  const permErr = checkWritePermission(ctx.role, action, chat_type, label, chatId);
+  if (permErr) return permErr;
+  if (ctx.token_id !== null) {
+    const now = Math.floor(Date.now() / 1000);
+    sql(
+      `INSERT INTO audit_log (token_id, account_id, action, target_chat_id, detail, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [ctx.token_id, accountId, action, chatId, JSON.stringify(detail), now],
+    ).catch(() => { /* non-fatal */ });
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Auth middleware
 // ---------------------------------------------------------------------------
 
@@ -2142,28 +2181,11 @@ async function dispatchMcpTool(
     if (typeof args.text !== 'string' || !args.text.trim()) throw new Error('text is required');
 
     // Write permission check (send only — drafts are not writes until promoted)
-    if (name === 'send' && ctx.role) {
+    if (name === 'send') {
       const targetChatId = typeof args.tg_chat_id === 'string' ? args.tg_chat_id : null;
       if (targetChatId) {
-        const chatRows = await getSql(env)(
-          `SELECT MAX(m.chat_type) AS chat_type, MAX(cc.label) AS label
-           FROM messages m
-           LEFT JOIN chat_config cc ON cc.account_id = m.account_id AND cc.tg_chat_id = m.tg_chat_id
-           WHERE m.account_id = $1 AND m.tg_chat_id = $2`,
-          [accountId, targetChatId],
-        ) as Array<{ chat_type: string | null; label: string | null }>;
-        const { chat_type, label } = chatRows[0] ?? { chat_type: null, label: null };
-        const permErr = checkWritePermission(ctx.role, 'send', chat_type, label, targetChatId);
+        const permErr = await checkAndAuditWrite('send', targetChatId, { queued: true }, ctx, accountId, env);
         if (permErr) return permErr;
-        // Log successful send to audit_log (fire-and-forget)
-        if (ctx.token_id !== null) {
-          const now = Math.floor(Date.now() / 1000);
-          getSql(env)(
-            `INSERT INTO audit_log (token_id, account_id, action, target_chat_id, detail, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6)`,
-            [ctx.token_id, accountId, 'send', targetChatId, JSON.stringify({ queued: true }), now],
-          ).catch(() => { /* non-fatal */ });
-        }
       }
     }
 
@@ -2192,27 +2214,11 @@ async function dispatchMcpTool(
   }
 
   if (name === 'edit_message') {
-    if (ctx.role) {
+    {
       const targetChatId = typeof args.tg_chat_id === 'string' ? args.tg_chat_id : null;
       if (targetChatId) {
-        const chatRows = await getSql(env)(
-          `SELECT MAX(m.chat_type) AS chat_type, MAX(cc.label) AS label
-           FROM messages m
-           LEFT JOIN chat_config cc ON cc.account_id = m.account_id AND cc.tg_chat_id = m.tg_chat_id
-           WHERE m.account_id = $1 AND m.tg_chat_id = $2`,
-          [accountId, targetChatId],
-        ) as Array<{ chat_type: string | null; label: string | null }>;
-        const { chat_type, label } = chatRows[0] ?? { chat_type: null, label: null };
-        const permErr = checkWritePermission(ctx.role, 'edit', chat_type, label, targetChatId);
+        const permErr = await checkAndAuditWrite('edit', targetChatId, { msg_id: args.tg_message_id }, ctx, accountId, env);
         if (permErr) return permErr;
-        if (ctx.token_id !== null) {
-          const now = Math.floor(Date.now() / 1000);
-          getSql(env)(
-            `INSERT INTO audit_log (token_id, account_id, action, target_chat_id, detail, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6)`,
-            [ctx.token_id, accountId, 'edit', targetChatId, JSON.stringify({ msg_id: args.tg_message_id }), now],
-          ).catch(() => { /* non-fatal */ });
-        }
       }
     }
     const req = new Request(`${baseUrl}/actions/edit`, {
@@ -2227,27 +2233,11 @@ async function dispatchMcpTool(
   }
 
   if (name === 'delete_message') {
-    if (ctx.role) {
+    {
       const targetChatId = typeof args.tg_chat_id === 'string' ? args.tg_chat_id : null;
       if (targetChatId) {
-        const chatRows = await getSql(env)(
-          `SELECT MAX(m.chat_type) AS chat_type, MAX(cc.label) AS label
-           FROM messages m
-           LEFT JOIN chat_config cc ON cc.account_id = m.account_id AND cc.tg_chat_id = m.tg_chat_id
-           WHERE m.account_id = $1 AND m.tg_chat_id = $2`,
-          [accountId, targetChatId],
-        ) as Array<{ chat_type: string | null; label: string | null }>;
-        const { chat_type, label } = chatRows[0] ?? { chat_type: null, label: null };
-        const permErr = checkWritePermission(ctx.role, 'delete', chat_type, label, targetChatId);
+        const permErr = await checkAndAuditWrite('delete', targetChatId, { msg_id: args.tg_message_id }, ctx, accountId, env);
         if (permErr) return permErr;
-        if (ctx.token_id !== null) {
-          const now = Math.floor(Date.now() / 1000);
-          getSql(env)(
-            `INSERT INTO audit_log (token_id, account_id, action, target_chat_id, detail, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6)`,
-            [ctx.token_id, accountId, 'delete', targetChatId, JSON.stringify({ msg_id: args.tg_message_id }), now],
-          ).catch(() => { /* non-fatal */ });
-        }
       }
     }
     const req = new Request(`${baseUrl}/actions/delete`, {
@@ -2262,27 +2252,11 @@ async function dispatchMcpTool(
   }
 
   if (name === 'forward_message') {
-    if (ctx.role) {
+    {
       const targetChatId = typeof args.to_chat_id === 'string' ? args.to_chat_id : null;
       if (targetChatId) {
-        const chatRows = await getSql(env)(
-          `SELECT MAX(m.chat_type) AS chat_type, MAX(cc.label) AS label
-           FROM messages m
-           LEFT JOIN chat_config cc ON cc.account_id = m.account_id AND cc.tg_chat_id = m.tg_chat_id
-           WHERE m.account_id = $1 AND m.tg_chat_id = $2`,
-          [accountId, targetChatId],
-        ) as Array<{ chat_type: string | null; label: string | null }>;
-        const { chat_type, label } = chatRows[0] ?? { chat_type: null, label: null };
-        const permErr = checkWritePermission(ctx.role, 'forward', chat_type, label, targetChatId);
+        const permErr = await checkAndAuditWrite('forward', targetChatId, { from_chat: args.tg_chat_id, msg_id: args.tg_message_id }, ctx, accountId, env);
         if (permErr) return permErr;
-        if (ctx.token_id !== null) {
-          const now = Math.floor(Date.now() / 1000);
-          getSql(env)(
-            `INSERT INTO audit_log (token_id, account_id, action, target_chat_id, detail, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6)`,
-            [ctx.token_id, accountId, 'forward', targetChatId, JSON.stringify({ from_chat: args.tg_chat_id, msg_id: args.tg_message_id }), now],
-          ).catch(() => { /* non-fatal */ });
-        }
       }
     }
     const req = new Request(`${baseUrl}/actions/forward`, {
@@ -2474,8 +2448,8 @@ async function dispatchMcpTool(
     // ---- Tokens ----
 
     if (name === 'create_token') {
-      if (typeof args.label !== 'string') throw new Error('label is required');
       if (typeof args.role !== 'string') throw new Error('role is required');
+      const tokenLabel = typeof args.label === 'string' ? args.label : null;
 
       // Resolve role_id
       const roleRows = await sql(`SELECT id FROM roles WHERE name = $1`, [args.role]) as Array<{ id: bigint }>;
@@ -2505,7 +2479,7 @@ async function dispatchMcpTool(
       const tokenRows = await sql(
         `INSERT INTO agent_tokens (token_hash, label, expires_at, created_at)
          VALUES ($1, $2, $3, $4) RETURNING id`,
-        [hash, args.label, expiresAt, now],
+        [hash, tokenLabel, expiresAt, now],
       ) as Array<{ id: bigint }>;
       const tokenId = tokenRows[0].id;
 
