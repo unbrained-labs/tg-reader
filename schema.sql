@@ -246,6 +246,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log (created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_log_token   ON audit_log (token_id);
 
 -- ---------------------------------------------------------------------------
 -- Observer jobs — AI agent cron tasks
@@ -276,7 +277,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   last_run_at    BIGINT,
   cooldown_secs  INTEGER NOT NULL DEFAULT 3600,  -- min gap between runs, prevents spam
 
-  created_at     BIGINT NOT NULL
+  created_at     BIGINT NOT NULL,
+
+  UNIQUE (account_id, name)
 );
 
 -- ---------------------------------------------------------------------------

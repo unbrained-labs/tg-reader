@@ -128,10 +128,12 @@ function checkWritePermission(
         target_chat_type: chatType,
       };
     }
-    if (writeLabels && label && !writeLabels.includes(label)) {
+    if (writeLabels && (!label || !writeLabels.includes(label))) {
       return {
         error: 'permission_denied',
-        message: `This token cannot ${action} to chats with label "${label}".`,
+        message: label
+          ? `This token cannot ${action} to chats with label "${label}". Allowed: ${writeLabels.join(', ')}.`
+          : `This token cannot ${action} to unlabeled chats. Allowed labels: ${writeLabels.join(', ')}.`,
         action,
         target_chat_type: chatType,
       };
@@ -1570,7 +1572,7 @@ async function handleAckAction(actionId: number, request: Request, env: Env, acc
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'Content-Type, X-Ingest-Token, X-Account-ID',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Ingest-Token, X-Account-ID, Authorization',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 };
 
@@ -1805,7 +1807,8 @@ const MCP_TOOL_DEFINITIONS = [
     inputSchema: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: 'Name of the role to update.' },
+        name: { type: 'string', description: 'Current name of the role to update.' },
+        new_name: { type: 'string', description: 'Rename the role to this value.' },
         read_mode: { type: 'string', enum: ['all', 'whitelist', 'blacklist'] },
         read_labels: { type: 'array', items: { type: 'string' } },
         read_chat_ids: { type: 'array', items: { type: 'string' } },
@@ -2186,6 +2189,15 @@ async function dispatchMcpTool(
       if (targetChatId) {
         const permErr = await checkAndAuditWrite('send', targetChatId, { queued: true }, ctx, accountId, env);
         if (permErr) return permErr;
+      } else if (Array.isArray(args.recipients) && ctx.role !== null) {
+        // Mass send: check write permission for each recipient individually
+        for (const r of args.recipients as Array<Record<string, unknown>>) {
+          const recipChatId = typeof r.tg_chat_id === 'string' ? r.tg_chat_id : null;
+          if (recipChatId) {
+            const permErr = await checkAndAuditWrite('send', recipChatId, { queued: true }, ctx, accountId, env);
+            if (permErr) return permErr;
+          }
+        }
       }
     }
 
@@ -2253,6 +2265,30 @@ async function dispatchMcpTool(
 
   if (name === 'forward_message') {
     {
+      // Check that the source chat is within read scope — you can't forward what you can't read
+      if (ctx.role && ctx.role.read_mode !== 'all') {
+        const sourceChatId = typeof args.tg_chat_id === 'string' ? args.tg_chat_id : null;
+        if (sourceChatId) {
+          const sqlFn = getSql(env);
+          const srcRows = await sqlFn(
+            `SELECT MAX(cc.label) AS label FROM messages m
+             LEFT JOIN chat_config cc ON cc.account_id = m.account_id AND cc.tg_chat_id = m.tg_chat_id
+             WHERE m.account_id = $1 AND m.tg_chat_id = $2`,
+            [accountId, sourceChatId],
+          ) as Array<{ label: string | null }>;
+          const srcLabel = srcRows[0]?.label ?? null;
+          const role = ctx.role;
+          const denied =
+            role.read_mode === 'whitelist'
+              ? !(role.read_chat_ids?.includes(sourceChatId) || (srcLabel && role.read_labels?.includes(srcLabel)))
+              : role.read_mode === 'blacklist'
+              ? (role.read_chat_ids?.includes(sourceChatId) || (srcLabel && role.read_labels?.includes(srcLabel)))
+              : false;
+          if (denied) {
+            return { error: 'permission_denied', message: `This token cannot read from chat ${sourceChatId} (out of read scope).`, action: 'forward' };
+          }
+        }
+      }
       const targetChatId = typeof args.to_chat_id === 'string' ? args.to_chat_id : null;
       if (targetChatId) {
         const permErr = await checkAndAuditWrite('forward', targetChatId, { from_chat: args.tg_chat_id, msg_id: args.tg_message_id }, ctx, accountId, env);
@@ -2463,7 +2499,7 @@ async function dispatchMcpTool(
       } else if (Array.isArray(args.account_ids)) {
         accountIds = args.account_ids as string[];
       } else {
-        throw new Error('account_id (string) or account_ids (array) is required');
+        accountIds = ['primary'];
       }
       if (accountIds.length === 0) throw new Error('account_ids must not be empty');
 
