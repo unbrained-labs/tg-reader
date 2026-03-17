@@ -2603,6 +2603,7 @@ async function dispatchMcpTool(
       if (typeof mc.provider !== 'string' || !mc.provider) throw new Error('model_config.provider is required');
       if (typeof mc.model !== 'string' || !mc.model) throw new Error('model_config.model is required');
       if (typeof mc.api_key_ref !== 'string' || !mc.api_key_ref) throw new Error('model_config.api_key_ref is required');
+      if (['INGEST_TOKEN', 'MASTER_TOKEN'].includes(mc.api_key_ref as string)) throw new Error('model_config.api_key_ref cannot reference internal Worker secrets');
 
       const modelConfigStr = JSON.stringify(args.model_config);
       const triggerConfigStr = args.trigger_config ? JSON.stringify(args.trigger_config) : null;
@@ -2704,6 +2705,7 @@ async function dispatchMcpTool(
         if (typeof umc.provider !== 'string' || !umc.provider) throw new Error('model_config.provider is required');
         if (typeof umc.model !== 'string' || !umc.model) throw new Error('model_config.model is required');
         if (typeof umc.api_key_ref !== 'string' || !umc.api_key_ref) throw new Error('model_config.api_key_ref is required');
+        if (['INGEST_TOKEN', 'MASTER_TOKEN'].includes(umc.api_key_ref as string)) throw new Error('model_config.api_key_ref cannot reference internal Worker secrets');
         updates.push(`model_config = $${n}`); binds.push(JSON.stringify(args.model_config)); n++;
       }
       if ('cooldown_secs' in args) { updates.push(`cooldown_secs = $${n}`); binds.push(args.cooldown_secs); n++; }
@@ -3292,7 +3294,7 @@ async function buildContext(job: JobRow, env: Env): Promise<string> {
   // Gate the trigger query by the job's read scope — the prompt must not receive
   // content from chats outside the token's allowed scope.
   const { clause: scopeClause, binds: scopeBinds } = buildReadScopeClause(job.role, 'm', n, 1);
-  const scopeWhere = scopeClause ? ` AND ${scopeClause}` : '';
+  const scopeWhere = scopeClause ? ` ${scopeClause}` : '';
   const allBinds = [...binds, ...scopeBinds];
 
   let trigMsg: Record<string, unknown> | null = null;
@@ -3553,10 +3555,13 @@ async function runJobs(env: Env): Promise<void> {
     try {
       const context = await buildContext(job, env);
       await runAgentLoop(job, context, env);
-      await markJobRun(job.id, now, env);
     } catch (err) {
       console.error(`[jobs] job "${job.name}" failed:`, err);
       // Continue — one failure must not block others
+    } finally {
+      // Always advance last_run_at to enforce cooldown, even on failure.
+      // Prevents a broken job from hammering the model API every 15 minutes.
+      await markJobRun(job.id, now, env).catch(e => console.error(`[jobs] markJobRun failed for "${job.name}":`, e));
     }
   }
 }
