@@ -734,6 +734,12 @@ async function handlePostContacts(request: Request, env: Env, accountId: string)
 async function handleGetContacts(request: Request, env: Env, accountId: string): Promise<Response> {
   const url = new URL(request.url);
   const hasMessages = url.searchParams.get('has_messages') === 'true';
+  const search = url.searchParams.get('search') ?? null;
+  const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '50', 10) || 50, 200);
+  const offset = parseInt(url.searchParams.get('offset') ?? '0', 10) || 0;
+
+  const searchPattern = search !== null ? `%${search.replace(/[%_\\]/g, '\\$&')}%` : null;
+
   const SQL = `
     SELECT
       c.tg_user_id,
@@ -748,14 +754,16 @@ async function handleGetContacts(request: Request, env: Env, accountId: string):
     FROM contacts c
     LEFT JOIN messages m ON m.account_id = c.account_id AND m.sender_id = c.tg_user_id
     WHERE c.account_id = $1
+      AND ($3::text IS NULL OR c.username ILIKE $3 OR c.first_name ILIKE $3 OR c.last_name ILIKE $3)
     GROUP BY c.tg_user_id, c.phone, c.username, c.first_name, c.last_name, c.is_mutual, c.is_bot
     HAVING ($2::boolean IS NOT TRUE OR COUNT(m.id) > 0)
     ORDER BY last_seen DESC NULLS LAST
+    LIMIT $4 OFFSET $5
   `.trim();
 
   const sql = getSql(env);
   try {
-    const rows = await sql(SQL, [accountId, hasMessages || null]) as Array<{
+    const rows = await sql(SQL, [accountId, hasMessages || null, searchPattern, limit, offset]) as Array<{
       tg_user_id: string; phone: string | null; username: string | null;
       first_name: string | null; last_name: string | null;
       is_mutual: number; is_bot: number;
@@ -786,6 +794,8 @@ async function handleChats(
   const unansweredOnly = url.searchParams.get('filter') === 'unanswered';
   const sortBy = url.searchParams.get('sort_by') ?? 'last_activity';
   const orderClause = sortBy === 'message_count' ? 'message_count DESC' : 'last_message_at DESC';
+  const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '50', 10) || 50, 200);
+  const offset = parseInt(url.searchParams.get('offset') ?? '0', 10) || 0;
 
   // W-6: escape LIKE metacharacters so % and _ in nameFilter are treated as literals
   const namePattern = nameFilter !== null
@@ -820,13 +830,14 @@ async function handleChats(
       MAX(CASE WHEN m.sender_id = $1 THEN m.sent_at ELSE 0 END)
     ))
     ORDER BY ${orderClause}
+    LIMIT $${6 + scopeBinds.length} OFFSET $${7 + scopeBinds.length}
   `.trim();
 
   const sql = getSql(env);
   try {
     const rows = await sql(
       SQL,
-      [accountId, namePattern, labelFilter, chatTypeFilter, unansweredOnly || null, ...scopeBinds],
+      [accountId, namePattern, labelFilter, chatTypeFilter, unansweredOnly || null, ...scopeBinds, limit, offset],
     ) as Array<{
       tg_chat_id: string; chat_name: string | null; chat_type: string | null;
       message_count: string; last_message_at: string | null; sync_status: string; label: string | null;

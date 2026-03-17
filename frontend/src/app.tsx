@@ -348,22 +348,26 @@ function Chats() {
   const [query, setQuery] = useState('')
   const [offset, setOffset] = useState(0)
   const [hasMore, setHasMore] = useState(false)
-  const [loading, setLoading] = useState(true)
+  const [initialLoading, setInitialLoading] = useState(true)
+  const [searching, setSearching] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState('')
 
-  // Load first page whenever search query changes
+  // Debounced search — fires 300ms after user stops typing
   useEffect(() => {
-    setLoading(true)
-    setError('')
-    setOffset(0)
-    fetchChats({ name: query || undefined })
-      .then(rows => {
-        setChats(rows)
-        setHasMore(rows.length === PAGE_SIZE)
-      })
-      .catch(err => setError(err.message))
-      .finally(() => setLoading(false))
+    const timer = setTimeout(() => {
+      setSearching(true)
+      setError('')
+      setOffset(0)
+      fetchChats({ name: query || undefined })
+        .then(rows => {
+          setChats(rows)
+          setHasMore(rows.length === PAGE_SIZE)
+        })
+        .catch(err => setError(err.message))
+        .finally(() => { setSearching(false); setInitialLoading(false) })
+    }, query ? 300 : 0)
+    return () => clearTimeout(timer)
   }, [query])
 
   function loadMore() {
@@ -379,13 +383,11 @@ function Chats() {
       .finally(() => setLoadingMore(false))
   }
 
-  if (loading) return <div class="page-content"><div class="empty-state"><span class="spinner" /></div></div>
-
   return (
     <>
       <PageHeader eyebrow="// chats" title="Indexed Chats">
         <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)">
-          {fmtNum(chats.length)}{hasMore ? '+' : ''} shown
+          {!initialLoading && <>{fmtNum(chats.length)}{hasMore ? '+' : ''} shown</>}
         </span>
       </PageHeader>
       <div class="page-content">
@@ -394,40 +396,47 @@ function Chats() {
           <input class="search-input" type="text" placeholder="search chats..."
             value={query} onInput={(e: any) => setQuery(e.target.value)} />
         </div>
-        <div class="table-wrap">
-          <table class="table">
-            <thead>
-              <tr>
-                <th>Chat</th>
-                <th>Type</th>
-                <th>Messages</th>
-                <th>Last Active</th>
-              </tr>
-            </thead>
-            <tbody>
-              {chats.length === 0
-                ? <tr><td colSpan={4} style="text-align:center;color:var(--text-secondary)">&gt; none</td></tr>
-                : chats.map(c => (
-                  <tr key={c.tg_chat_id}>
-                    <td>
-                      <div style="font-weight:500">{c.chat_name || '(unnamed)'}</div>
-                      <div class="muted mono" style="font-size:11px">{c.tg_chat_id}</div>
-                    </td>
-                    <td><span class={`badge ${chatTypeBadge(c.chat_type)}`}>{c.chat_type}</span></td>
-                    <td class="mono accent">{fmtNum(c.message_count)}</td>
-                    <td class="muted mono">{c.last_message_at ? fmtTs(c.last_message_at) : '—'}</td>
-                  </tr>
-                ))
-              }
-            </tbody>
-          </table>
-        </div>
-        {hasMore && (
-          <button class="btn btn-ghost" style="width:100%;justify-content:center;margin-top:8px"
-            onClick={loadMore} disabled={loadingMore}>
-            {loadingMore ? <span class="spinner" /> : '// load more'}
-          </button>
-        )}
+        {initialLoading || searching
+          ? <div class="empty-state"><span class="spinner" /></div>
+          : (
+            <>
+              <div class="table-wrap">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>Chat</th>
+                      <th>Type</th>
+                      <th>Messages</th>
+                      <th>Last Active</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {chats.length === 0
+                      ? <tr><td colSpan={4} style="text-align:center;color:var(--text-secondary)">&gt; none</td></tr>
+                      : chats.map(c => (
+                        <tr key={c.tg_chat_id}>
+                          <td>
+                            <div style="font-weight:500">{c.chat_name || '(unnamed)'}</div>
+                            <div class="muted mono" style="font-size:11px">{c.tg_chat_id}</div>
+                          </td>
+                          <td><span class={`badge ${chatTypeBadge(c.chat_type)}`}>{c.chat_type}</span></td>
+                          <td class="mono accent">{fmtNum(c.message_count)}</td>
+                          <td class="muted mono">{c.last_message_at ? fmtTs(c.last_message_at) : '—'}</td>
+                        </tr>
+                      ))
+                    }
+                  </tbody>
+                </table>
+              </div>
+              {hasMore && (
+                <button class="btn btn-ghost" style="width:100%;justify-content:center;margin-top:8px"
+                  onClick={loadMore} disabled={loadingMore}>
+                  {loadingMore ? <span class="spinner" /> : '// load more'}
+                </button>
+              )}
+            </>
+          )
+        }
       </div>
     </>
   )
@@ -439,22 +448,26 @@ function Contacts() {
   const [query, setQuery] = useState('')
   const [offset, setOffset] = useState(0)
   const [hasMore, setHasMore] = useState(false)
-  const [loading, setLoading] = useState(true)
+  const [initialLoading, setInitialLoading] = useState(true)
+  const [searching, setSearching] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState('')
 
-  // Load first page whenever search query changes
+  // Debounced search — fires 300ms after user stops typing
   useEffect(() => {
-    setLoading(true)
-    setError('')
-    setOffset(0)
-    fetchContacts({ search: query || undefined })
-      .then(rows => {
-        setContacts(rows)
-        setHasMore(rows.length === PAGE_SIZE)
-      })
-      .catch(err => setError(err.message))
-      .finally(() => setLoading(false))
+    const timer = setTimeout(() => {
+      setSearching(true)
+      setError('')
+      setOffset(0)
+      fetchContacts({ search: query || undefined })
+        .then(rows => {
+          setContacts(rows)
+          setHasMore(rows.length === PAGE_SIZE)
+        })
+        .catch(err => setError(err.message))
+        .finally(() => { setSearching(false); setInitialLoading(false) })
+    }, query ? 300 : 0)
+    return () => clearTimeout(timer)
   }, [query])
 
   function loadMore() {
@@ -470,13 +483,11 @@ function Contacts() {
       .finally(() => setLoadingMore(false))
   }
 
-  if (loading) return <div class="page-content"><div class="empty-state"><span class="spinner" /></div></div>
-
   return (
     <>
       <PageHeader eyebrow="// contacts" title="Known Contacts">
         <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)">
-          {fmtNum(contacts.length)}{hasMore ? '+' : ''} shown
+          {!initialLoading && <>{fmtNum(contacts.length)}{hasMore ? '+' : ''} shown</>}
         </span>
       </PageHeader>
       <div class="page-content">
@@ -485,44 +496,51 @@ function Contacts() {
           <input class="search-input" type="text" placeholder="search contacts..."
             value={query} onInput={(e: any) => setQuery(e.target.value)} />
         </div>
-        <div class="table-wrap">
-          <table class="table">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Username</th>
-                <th>Phone</th>
-                <th>Type</th>
-              </tr>
-            </thead>
-            <tbody>
-              {contacts.length === 0
-                ? <tr><td colSpan={4} style="text-align:center;color:var(--text-secondary)">&gt; none</td></tr>
-                : contacts.map(c => (
-                  <tr key={c.tg_user_id}>
-                    <td>
-                      <div style="font-weight:500">{[c.first_name, c.last_name].filter(Boolean).join(' ') || '(unnamed)'}</div>
-                      <div class="muted mono" style="font-size:11px">{c.tg_user_id}</div>
-                    </td>
-                    <td class="mono accent">{c.username ? `@${c.username}` : '—'}</td>
-                    <td class="mono muted">{c.phone ?? '—'}</td>
-                    <td>
-                      {c.is_bot
-                        ? <span class="badge badge-warning">bot</span>
-                        : <span class="badge badge-neutral">user</span>}
-                    </td>
-                  </tr>
-                ))
-              }
-            </tbody>
-          </table>
-        </div>
-        {hasMore && (
-          <button class="btn btn-ghost" style="width:100%;justify-content:center;margin-top:8px"
-            onClick={loadMore} disabled={loadingMore}>
-            {loadingMore ? <span class="spinner" /> : '// load more'}
-          </button>
-        )}
+        {initialLoading || searching
+          ? <div class="empty-state"><span class="spinner" /></div>
+          : (
+            <>
+              <div class="table-wrap">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Username</th>
+                      <th>Phone</th>
+                      <th>Type</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {contacts.length === 0
+                      ? <tr><td colSpan={4} style="text-align:center;color:var(--text-secondary)">&gt; none</td></tr>
+                      : contacts.map(c => (
+                        <tr key={c.tg_user_id}>
+                          <td>
+                            <div style="font-weight:500">{[c.first_name, c.last_name].filter(Boolean).join(' ') || '(unnamed)'}</div>
+                            <div class="muted mono" style="font-size:11px">{c.tg_user_id}</div>
+                          </td>
+                          <td class="mono accent">{c.username ? `@${c.username}` : '—'}</td>
+                          <td class="mono muted">{c.phone ?? '—'}</td>
+                          <td>
+                            {c.is_bot
+                              ? <span class="badge badge-warning">bot</span>
+                              : <span class="badge badge-neutral">user</span>}
+                          </td>
+                        </tr>
+                      ))
+                    }
+                  </tbody>
+                </table>
+              </div>
+              {hasMore && (
+                <button class="btn btn-ghost" style="width:100%;justify-content:center;margin-top:8px"
+                  onClick={loadMore} disabled={loadingMore}>
+                  {loadingMore ? <span class="spinner" /> : '// load more'}
+                </button>
+              )}
+            </>
+          )
+        }
       </div>
     </>
   )
