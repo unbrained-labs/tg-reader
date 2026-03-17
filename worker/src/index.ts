@@ -1103,18 +1103,16 @@ async function handleBackfillSeed(request: Request, env: Env, accountId: string)
   return json({ seeded });
 }
 
-async function handleBackfillPending(_request: Request, env: Env, accountId: string): Promise<Response> {
-  const SQL = `
-    SELECT tg_chat_id, chat_name, total_messages, fetched_messages, oldest_message_id, status
-    FROM backfill_state
-    WHERE account_id = $1 AND status IN ('pending', 'in_progress')
-    ORDER BY tg_chat_id
-  `.trim();
+async function handleBackfillPending(request: Request, env: Env, accountId: string): Promise<Response> {
+  const all = new URL(request.url).searchParams.get('all') === '1';
+  const SQL = all
+    ? `SELECT tg_chat_id, chat_name, total_messages, fetched_messages, oldest_message_id, status FROM backfill_state WHERE account_id = $1 ORDER BY status, tg_chat_id`
+    : `SELECT tg_chat_id, chat_name, total_messages, fetched_messages, oldest_message_id, status FROM backfill_state WHERE account_id = $1 AND status IN ('pending', 'in_progress') ORDER BY tg_chat_id`;
 
   const sql = getSql(env);
   try {
     const rows = await sql(SQL, [accountId]);
-    console.log(`[GET /backfill/pending] account=${accountId} count=${rows.length}`);
+    console.log(`[GET /backfill/pending] account=${accountId} all=${all} count=${rows.length}`);
     return json(rows);
   } catch (err) {
     console.error('[GET /backfill/pending] DB error', err);

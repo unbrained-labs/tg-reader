@@ -132,7 +132,7 @@ export interface BackfillJob {
 }
 
 export const fetchBackfill = () =>
-  req<BackfillJob[]>('/backfill/pending');
+  req<BackfillJob[]>('/backfill/pending?all=1');
 
 // ── Auth probe ─────────────────────────────────────────────────────────────
 export async function probeAuth(cfg: AuthConfig): Promise<void> {
