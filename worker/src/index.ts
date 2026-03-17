@@ -2572,23 +2572,12 @@ async function dispatchMcpTool(
     }
 
     if (name === 'revoke_token') {
-      if (typeof args.token_id !== 'string' && typeof args.label !== 'string') {
-        throw new Error('token_id or label is required');
-      }
-      let result: { rowCount?: number };
-      if (typeof args.token_id === 'string') {
-        result = await sql(
-          `DELETE FROM agent_tokens WHERE id = $1`,
-          [BigInt(args.token_id)],
-          { fullResults: true },
-        ) as { rowCount?: number };
-      } else {
-        result = await sql(
-          `DELETE FROM agent_tokens WHERE label = $1`,
-          [args.label],
-          { fullResults: true },
-        ) as { rowCount?: number };
-      }
+      if (typeof args.token_id !== 'string') throw new Error('token_id is required');
+      const result = await sql(
+        `DELETE FROM agent_tokens WHERE id = $1`,
+        [BigInt(args.token_id)],
+        { fullResults: true },
+      ) as { rowCount?: number };
       if ((result.rowCount ?? 0) === 0) throw new Error('Token not found');
       return { ok: true, note: 'Token revoked. Audit log rows are preserved.' };
     }
