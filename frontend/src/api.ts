@@ -106,8 +106,15 @@ export interface Chat {
   last_message_at: number | null;
 }
 
-export const fetchChats = (limit = 200) =>
-  req<Chat[]>(`/chats?limit=${limit}`);
+export const PAGE_SIZE = 50;
+
+export function fetchChats(params: { limit?: number; offset?: number; name?: string } = {}) {
+  const p = new URLSearchParams();
+  p.set('limit', String(params.limit ?? PAGE_SIZE));
+  if (params.offset) p.set('offset', String(params.offset));
+  if (params.name) p.set('name', params.name);
+  return req<Chat[]>(`/chats?${p}`);
+}
 
 // ── Contacts ───────────────────────────────────────────────────────────────
 export interface Contact {
@@ -119,8 +126,13 @@ export interface Contact {
   is_bot: number;  // SMALLINT 0|1
 }
 
-export const fetchContacts = (limit = 200) =>
-  req<Contact[]>(`/contacts?limit=${limit}`);
+export function fetchContacts(params: { limit?: number; offset?: number; search?: string } = {}) {
+  const p = new URLSearchParams();
+  p.set('limit', String(params.limit ?? PAGE_SIZE));
+  if (params.offset) p.set('offset', String(params.offset));
+  if (params.search) p.set('search', params.search);
+  return req<Contact[]>(`/contacts?${p}`);
+}
 
 // ── Backfill ───────────────────────────────────────────────────────────────
 export interface BackfillJob {

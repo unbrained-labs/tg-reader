@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'preact/hooks'
 import {
   getAuth, setAuth, clearAuth, probeAuth,
   fetchStats, fetchMessages, fetchChats, fetchContacts, fetchBackfill,
+  PAGE_SIZE,
   type AuthConfig, type Stats, type Message, type Chat, type Contact, type BackfillJob,
 } from './api'
 
@@ -344,20 +345,39 @@ function Search() {
 // ── Chats ─────────────────────────────────────────────────────────────────
 function Chats() {
   const [chats, setChats] = useState<Chat[]>([])
-  const [filter, setFilter] = useState('')
+  const [query, setQuery] = useState('')
+  const [offset, setOffset] = useState(0)
+  const [hasMore, setHasMore] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState('')
 
+  // Load first page whenever search query changes
   useEffect(() => {
-    fetchChats()
-      .then(r => setChats(r))
+    setLoading(true)
+    setError('')
+    setOffset(0)
+    fetchChats({ name: query || undefined })
+      .then(rows => {
+        setChats(rows)
+        setHasMore(rows.length === PAGE_SIZE)
+      })
       .catch(err => setError(err.message))
       .finally(() => setLoading(false))
-  }, [])
+  }, [query])
 
-  const filtered = chats.filter(c =>
-    !filter || c.chat_name?.toLowerCase().includes(filter.toLowerCase())
-  )
+  function loadMore() {
+    const nextOffset = offset + PAGE_SIZE
+    setLoadingMore(true)
+    fetchChats({ offset: nextOffset, name: query || undefined })
+      .then(rows => {
+        setChats(prev => [...prev, ...rows])
+        setOffset(nextOffset)
+        setHasMore(rows.length === PAGE_SIZE)
+      })
+      .catch(err => setError(err.message))
+      .finally(() => setLoadingMore(false))
+  }
 
   if (loading) return <div class="page-content"><div class="empty-state"><span class="spinner" /></div></div>
 
@@ -365,14 +385,14 @@ function Chats() {
     <>
       <PageHeader eyebrow="// chats" title="Indexed Chats">
         <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)">
-          {fmtNum(chats.length)} total
+          {fmtNum(chats.length)}{hasMore ? '+' : ''} shown
         </span>
       </PageHeader>
       <div class="page-content">
         {error && <div class="form-error">&gt; {error}</div>}
         <div class="search-row">
-          <input class="search-input" type="text" placeholder="filter chats..."
-            value={filter} onInput={(e: any) => setFilter(e.target.value)} />
+          <input class="search-input" type="text" placeholder="search chats..."
+            value={query} onInput={(e: any) => setQuery(e.target.value)} />
         </div>
         <div class="table-wrap">
           <table class="table">
@@ -385,9 +405,9 @@ function Chats() {
               </tr>
             </thead>
             <tbody>
-              {filtered.length === 0
+              {chats.length === 0
                 ? <tr><td colSpan={4} style="text-align:center;color:var(--text-secondary)">&gt; none</td></tr>
-                : filtered.map(c => (
+                : chats.map(c => (
                   <tr key={c.tg_chat_id}>
                     <td>
                       <div style="font-weight:500">{c.chat_name || '(unnamed)'}</div>
@@ -402,6 +422,12 @@ function Chats() {
             </tbody>
           </table>
         </div>
+        {hasMore && (
+          <button class="btn btn-ghost" style="width:100%;justify-content:center;margin-top:8px"
+            onClick={loadMore} disabled={loadingMore}>
+            {loadingMore ? <span class="spinner" /> : '// load more'}
+          </button>
+        )}
       </div>
     </>
   )
@@ -410,26 +436,39 @@ function Chats() {
 // ── Contacts ──────────────────────────────────────────────────────────────
 function Contacts() {
   const [contacts, setContacts] = useState<Contact[]>([])
-  const [filter, setFilter] = useState('')
+  const [query, setQuery] = useState('')
+  const [offset, setOffset] = useState(0)
+  const [hasMore, setHasMore] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState('')
 
+  // Load first page whenever search query changes
   useEffect(() => {
-    fetchContacts()
-      .then(r => setContacts(r))
+    setLoading(true)
+    setError('')
+    setOffset(0)
+    fetchContacts({ search: query || undefined })
+      .then(rows => {
+        setContacts(rows)
+        setHasMore(rows.length === PAGE_SIZE)
+      })
       .catch(err => setError(err.message))
       .finally(() => setLoading(false))
-  }, [])
+  }, [query])
 
-  const filtered = contacts.filter(c => {
-    if (!filter) return true
-    const q = filter.toLowerCase()
-    return (
-      c.username?.toLowerCase().includes(q) ||
-      c.first_name?.toLowerCase().includes(q) ||
-      c.last_name?.toLowerCase().includes(q)
-    )
-  })
+  function loadMore() {
+    const nextOffset = offset + PAGE_SIZE
+    setLoadingMore(true)
+    fetchContacts({ offset: nextOffset, search: query || undefined })
+      .then(rows => {
+        setContacts(prev => [...prev, ...rows])
+        setOffset(nextOffset)
+        setHasMore(rows.length === PAGE_SIZE)
+      })
+      .catch(err => setError(err.message))
+      .finally(() => setLoadingMore(false))
+  }
 
   if (loading) return <div class="page-content"><div class="empty-state"><span class="spinner" /></div></div>
 
@@ -437,14 +476,14 @@ function Contacts() {
     <>
       <PageHeader eyebrow="// contacts" title="Known Contacts">
         <span style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)">
-          {fmtNum(contacts.length)} total
+          {fmtNum(contacts.length)}{hasMore ? '+' : ''} shown
         </span>
       </PageHeader>
       <div class="page-content">
         {error && <div class="form-error">&gt; {error}</div>}
         <div class="search-row">
-          <input class="search-input" type="text" placeholder="filter contacts..."
-            value={filter} onInput={(e: any) => setFilter(e.target.value)} />
+          <input class="search-input" type="text" placeholder="search contacts..."
+            value={query} onInput={(e: any) => setQuery(e.target.value)} />
         </div>
         <div class="table-wrap">
           <table class="table">
@@ -457,9 +496,9 @@ function Contacts() {
               </tr>
             </thead>
             <tbody>
-              {filtered.length === 0
+              {contacts.length === 0
                 ? <tr><td colSpan={4} style="text-align:center;color:var(--text-secondary)">&gt; none</td></tr>
-                : filtered.map(c => (
+                : contacts.map(c => (
                   <tr key={c.tg_user_id}>
                     <td>
                       <div style="font-weight:500">{[c.first_name, c.last_name].filter(Boolean).join(' ') || '(unnamed)'}</div>
@@ -478,6 +517,12 @@ function Contacts() {
             </tbody>
           </table>
         </div>
+        {hasMore && (
+          <button class="btn btn-ghost" style="width:100%;justify-content:center;margin-top:8px"
+            onClick={loadMore} disabled={loadingMore}>
+            {loadingMore ? <span class="spinner" /> : '// load more'}
+          </button>
+        )}
       </div>
     </>
   )

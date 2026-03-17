@@ -8,7 +8,12 @@ import type { Env, Message, OutboxItem, OutboxRecipient, RoleRow, TokenContext }
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Headers': 'Content-Type, X-Ingest-Token, X-Account-ID, Authorization',
+      'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
+    },
   });
 }
 
@@ -1574,7 +1579,7 @@ async function handleAckAction(actionId: number, request: Request, env: Env, acc
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'Content-Type, X-Ingest-Token, X-Account-ID, Authorization',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
 };
 
 function mcpJson(data: unknown, status = 200): Response {
