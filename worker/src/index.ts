@@ -1883,7 +1883,7 @@ const MCP_TOOL_DEFINITIONS = [
         schedule: { type: 'string', description: 'Optional. Stored for reference only — cron expression evaluation is not yet implemented. The actual run frequency is controlled by cooldown_secs and the 15-minute cron tick. At least one of schedule or trigger_type is required.' },
         trigger_type: { type: 'string', enum: ['new_message', 'keyword', 'unanswered'], description: 'Optional. Trigger condition type.' },
         trigger_config: { type: 'object', description: 'Optional. Config for the trigger (chat_id, label, keywords, hours).' },
-        model_config: { type: 'object', description: 'BYOM config: { provider, model, api_key_ref, endpoint? }. provider="anthropic" or "openai".' },
+        model_config: { type: 'object', description: 'BYOM config: { provider, model, api_key_ref?, endpoint? }. provider="anthropic", "openai", or "cloudflare-ai". For cloudflare-ai, omit api_key_ref — uses the built-in Workers AI binding (no extra cost, no API key). Recommended free model: @cf/meta/llama-3.3-70b-instruct-fp8-fast.' },
         task_prompt: { type: 'string', description: 'Task prompt for the agent. Supports {chat_name}, {chat_id}, {sender}, {snippet}, {timestamp}, {account_id} variables.' },
         role: { type: 'string', description: 'Role name. A scoped token will be auto-created for this job.' },
         cooldown_secs: { type: 'number', description: 'Minimum seconds between runs (default 3600). Prevents repeated firing on active chats.' },
@@ -2644,8 +2644,10 @@ async function dispatchMcpTool(
       const mc = args.model_config as Record<string, unknown>;
       if (typeof mc.provider !== 'string' || !mc.provider) throw new Error('model_config.provider is required');
       if (typeof mc.model !== 'string' || !mc.model) throw new Error('model_config.model is required');
-      if (typeof mc.api_key_ref !== 'string' || !mc.api_key_ref) throw new Error('model_config.api_key_ref is required');
-      if (['INGEST_TOKEN', 'MASTER_TOKEN'].includes(mc.api_key_ref as string)) throw new Error('model_config.api_key_ref cannot reference internal Worker secrets');
+      if (mc.provider !== 'cloudflare-ai') {
+        if (typeof mc.api_key_ref !== 'string' || !mc.api_key_ref) throw new Error('model_config.api_key_ref is required (omit only for cloudflare-ai provider)');
+        if (['INGEST_TOKEN', 'MASTER_TOKEN'].includes(mc.api_key_ref as string)) throw new Error('model_config.api_key_ref cannot reference internal Worker secrets');
+      }
 
       const modelConfigStr = JSON.stringify(args.model_config);
       const triggerConfigStr = args.trigger_config ? JSON.stringify(args.trigger_config) : null;
@@ -2746,8 +2748,10 @@ async function dispatchMcpTool(
         const umc = args.model_config as Record<string, unknown>;
         if (typeof umc.provider !== 'string' || !umc.provider) throw new Error('model_config.provider is required');
         if (typeof umc.model !== 'string' || !umc.model) throw new Error('model_config.model is required');
-        if (typeof umc.api_key_ref !== 'string' || !umc.api_key_ref) throw new Error('model_config.api_key_ref is required');
-        if (['INGEST_TOKEN', 'MASTER_TOKEN'].includes(umc.api_key_ref as string)) throw new Error('model_config.api_key_ref cannot reference internal Worker secrets');
+        if (umc.provider !== 'cloudflare-ai') {
+          if (typeof umc.api_key_ref !== 'string' || !umc.api_key_ref) throw new Error('model_config.api_key_ref is required (omit only for cloudflare-ai provider)');
+          if (['INGEST_TOKEN', 'MASTER_TOKEN'].includes(umc.api_key_ref as string)) throw new Error('model_config.api_key_ref cannot reference internal Worker secrets');
+        }
         updates.push(`model_config = $${n}`); binds.push(JSON.stringify(args.model_config)); n++;
       }
       if ('cooldown_secs' in args) { updates.push(`cooldown_secs = $${n}`); binds.push(args.cooldown_secs); n++; }
@@ -3442,6 +3446,34 @@ async function callModel(
 ): Promise<ModelResponse> {
   const provider = typeof modelConfig.provider === 'string' ? modelConfig.provider : 'openai';
   const model = typeof modelConfig.model === 'string' ? modelConfig.model : 'gpt-4o';
+
+  // Cloudflare Workers AI — uses env.AI binding, no API key needed
+  if (provider === 'cloudflare-ai') {
+    const cfTools = tools.map(t => ({
+      type: 'function' as const,
+      function: { name: t.name, description: t.description, parameters: t.inputSchema },
+    }));
+    const res = await env.AI.run(
+      model as Parameters<typeof env.AI.run>[0],
+      { messages: toOpenAIMessages(messages), tools: cfTools } as AiTextGenerationInput,
+    ) as { response?: string | null; tool_calls?: Array<{ name: string; arguments: string | Record<string, unknown> }> };
+
+    const toolCalls = (res.tool_calls ?? []).map((tc, i) => {
+      let args: Record<string, unknown> = {};
+      if (typeof tc.arguments === 'string') {
+        try { args = JSON.parse(tc.arguments) as Record<string, unknown>; } catch { console.warn(`[jobs] cloudflare-ai: failed to parse tool arguments for "${tc.name}":`, tc.arguments); }
+      } else if (tc.arguments && typeof tc.arguments === 'object') {
+        args = tc.arguments as Record<string, unknown>;
+      }
+      return { id: `cf-${i}`, name: tc.name, args };
+    });
+    return {
+      stop_reason: toolCalls.length > 0 ? 'tool_use' : 'end_turn',
+      content: res.response ?? '',
+      tool_calls: toolCalls,
+    };
+  }
+
   const apiKeyRef = typeof modelConfig.api_key_ref === 'string' ? modelConfig.api_key_ref : null;
   const apiKey = apiKeyRef ? ((env as unknown as Record<string, string>)[apiKeyRef] ?? '') : '';
   if (!apiKey) throw new Error(`api_key_ref "${apiKeyRef ?? '(none)'}" is not set in Worker environment`);
