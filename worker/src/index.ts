@@ -2189,15 +2189,17 @@ async function dispatchMcpTool(
     // Mass send limits — enforced for both send and draft
     if (Array.isArray(args.recipients) && (args.recipients as unknown[]).length > 0) {
       const rawRecipients = args.recipients as Array<Record<string, unknown>>;
-      const sql = getSql(env);
 
       // Read limits from global_config (both in one query)
-      const cfgRows = await sql(
+      const cfgRows = await getSql(env)(
         `SELECT key, value FROM global_config WHERE account_id = 'global' AND key IN ('mass_send_max_recipients', 'mass_send_contacts_only')`,
         [],
       ) as Array<{ key: string; value: string }>;
       const cfgMap = new Map(cfgRows.map(r => [r.key, r.value]));
       const maxRecipients = parseInt(cfgMap.get('mass_send_max_recipients') ?? '25', 10);
+      if (!Number.isFinite(maxRecipients) || maxRecipients < 1) {
+        throw new Error(`global_config mass_send_max_recipients is invalid ('${cfgMap.get('mass_send_max_recipients')}'). Must be a positive integer.`);
+      }
       const contactsOnly = (cfgMap.get('mass_send_contacts_only') ?? '1') !== '0';
 
       if (rawRecipients.length > maxRecipients) {
@@ -2206,21 +2208,26 @@ async function dispatchMcpTool(
 
       if (contactsOnly) {
         const chatIds = rawRecipients.map(r => r.tg_chat_id as string).filter(Boolean);
-        if (chatIds.length > 0) {
-          const known = await sql(
-            `SELECT tg_user_id FROM contacts WHERE account_id = $1 AND tg_user_id = ANY($2::text[])`,
-            [accountId, chatIds],
-          ) as Array<{ tg_user_id: string }>;
-          const knownSet = new Set(known.map(c => c.tg_user_id));
-          const unknowns = chatIds.filter(id => !knownSet.has(id));
-          if (unknowns.length > 0) {
-            throw new Error(`mass_send_contacts_only is enabled. ${unknowns.length} recipient(s) not in contacts: ${unknowns.slice(0, 5).join(', ')}. Set mass_send_contacts_only=0 in global_config to allow non-contacts.`);
-          }
+        // Reject if any recipient is missing tg_chat_id — hallucinated/incomplete data
+        if (chatIds.length < rawRecipients.length) {
+          const missing = rawRecipients.length - chatIds.length;
+          throw new Error(`mass_send_contacts_only is enabled and ${missing} recipient(s) have no tg_chat_id. Provide tg_chat_id for every recipient, or set mass_send_contacts_only=0 in global_config.`);
+        }
+        // contacts.account_id must match the account used during contact sync (GramJS getMe())
+        const known = await getSql(env)(
+          `SELECT tg_user_id FROM contacts WHERE account_id = $1 AND tg_user_id = ANY($2::text[])`,
+          [accountId, chatIds],
+        ) as Array<{ tg_user_id: string }>;
+        const knownSet = new Set(known.map(c => c.tg_user_id));
+        const unknowns = chatIds.filter(id => !knownSet.has(id));
+        if (unknowns.length > 0) {
+          throw new Error(`mass_send_contacts_only is enabled. ${unknowns.length} recipient(s) not in contacts. Set mass_send_contacts_only=0 in global_config to allow non-contacts.`);
         }
       }
     }
 
     // Write permission check (send only — drafts are not writes until promoted)
+    // Note: mass send limits above apply to both send and draft.
     if (name === 'send') {
       const targetChatId = typeof args.tg_chat_id === 'string' ? args.tg_chat_id : null;
       if (targetChatId) {

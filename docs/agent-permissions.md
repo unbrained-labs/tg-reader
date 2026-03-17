@@ -354,6 +354,16 @@ UPDATE global_config SET value = '0' WHERE account_id = 'global' AND key = 'mass
 
 If a job hallucinates chat IDs, or a recipient list contains stale/wrong IDs, the contacts gate prevents accidental messages to strangers. The contacts table is populated by GramJS on startup and during backfill — it represents people you already have a real relationship with on Telegram.
 
+The gate also requires every recipient object to include a `tg_chat_id` — a recipients array where IDs are missing is rejected outright, not silently passed through.
+
+### MASTER_TOKEN and limits
+
+MASTER_TOKEN is subject to both the recipient cap and the contacts-only gate. It is not exempt. Per-recipient audit log entries are only written for scoped agent tokens (not MASTER_TOKEN), since MASTER_TOKEN operations are considered owner-initiated.
+
+### Per-day rate limiting
+
+The recipient cap is per-request, not per-day. A write-capable token can call `send` with 25 recipients repeatedly. GramJS jitter (2–5s per message) provides natural throttling at the delivery layer, but there is no daily send quota enforced at the Worker. This is sufficient for personal use but should be revisited before issuing write tokens for automated high-frequency jobs.
+
 ### Telegram ToS context
 
 Automated mass DMs to strangers are a permaban offence. The cap + contacts gate + GramJS jitter together keep usage in the "passive personal archive with occasional outreach" profile, which is low-risk. High-volume outreach to non-contacts falls outside what this system is designed for.
