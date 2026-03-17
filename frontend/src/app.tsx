@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'preact/hooks'
 import {
   getAuth, setAuth, clearAuth, probeAuth,
   fetchStats, fetchMessages, fetchChats, fetchContacts, fetchBackfill,
-  type AuthConfig, type Stats, type Message, type Chat, type BackfillJob,
+  type AuthConfig, type Stats, type Message, type Chat, type Contact, type BackfillJob,
 } from './api'
 
 // ── Icons (inline SVG, zero dependency) ────────────────────────────────────
@@ -195,7 +195,7 @@ function Overview() {
   useEffect(() => {
     setLoading(true)
     Promise.all([fetchStats(), fetchMessages({ limit: 10 })])
-      .then(([s, m]) => { setStats(s); setRecent(m.messages) })
+      .then(([s, m]) => { setStats(s); setRecent(m.results) })
       .catch(err => setError(err.message))
       .finally(() => setLoading(false))
   }, [])
@@ -226,11 +226,11 @@ function Overview() {
                 <div class="stat-value">{fmtNum(stats.total_contacts)}</div>
                 <div class="stat-delta">&gt; known</div>
               </div>
-              {stats.date_range?.oldest && (
+              {stats.earliest_message_at && (
                 <div class="stat-card">
                   <div class="stat-label">Since</div>
                   <div class="stat-value" style="font-size:18px">
-                    {new Date(stats.date_range.oldest).toLocaleDateString('en-US', { month: 'short', year: 'numeric' })}
+                    {new Date(stats.earliest_message_at * 1000).toLocaleDateString('en-US', { month: 'short', year: 'numeric' })}
                   </div>
                   <div class="stat-delta">&gt; earliest message</div>
                 </div>
@@ -248,7 +248,7 @@ function Overview() {
                 <div class="message-meta">
                   <span class="message-chat">{m.chat_name || m.tg_chat_id}</span>
                   <span>&mdash;</span>
-                  <span>{m.sender_name || m.sender_id}</span>
+                  <span>{m.sender_username ? `@${m.sender_username}` : m.sender_first_name || m.sender_id}</span>
                   <span style="margin-left:auto">{fmtTs(m.sent_at)}</span>
                 </div>
                 <div class="message-text">{m.text}</div>
@@ -277,7 +277,7 @@ function Search() {
     setSearched(true)
     try {
       const r = await fetchMessages({ q: q || undefined, chat_type: chatType || undefined, limit: 50 })
-      setResults(r.messages)
+      setResults(r.results)
       setTotal(r.total)
     } catch (err: any) {
       setError(err.message)
@@ -326,7 +326,7 @@ function Search() {
             </div>
             <div class="message-text">{m.text}</div>
             <div class="message-meta" style="margin-top:2px">
-              <span class="muted mono">{m.sender_name || m.sender_id}</span>
+              <span class="muted mono">{m.sender_username ? `@${m.sender_username}` : m.sender_first_name || m.sender_id}</span>
             </div>
           </div>
         ))}
@@ -350,7 +350,7 @@ function Chats() {
 
   useEffect(() => {
     fetchChats()
-      .then(r => setChats(r.chats))
+      .then(r => setChats(r))
       .catch(err => setError(err.message))
       .finally(() => setLoading(false))
   }, [])
@@ -409,14 +409,14 @@ function Chats() {
 
 // ── Contacts ──────────────────────────────────────────────────────────────
 function Contacts() {
-  const [contacts, setContacts] = useState<any[]>([])
+  const [contacts, setContacts] = useState<Contact[]>([])
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
   useEffect(() => {
     fetchContacts()
-      .then(r => setContacts(r.contacts))
+      .then(r => setContacts(r))
       .catch(err => setError(err.message))
       .finally(() => setLoading(false))
   }, [])
@@ -492,12 +492,12 @@ function Backfill() {
 
   useEffect(() => {
     fetchBackfill()
-      .then(r => setJobs(r.jobs))
+      .then(r => setJobs(r))
       .catch(err => setError(err.message))
       .finally(() => setLoading(false))
   }, [])
 
-  const tabs = ['all', 'pending', 'in_progress', 'done', 'error']
+  const tabs = ['all', 'pending', 'in_progress', 'complete', 'failed']
 
   const filtered = jobs.filter(j => filter === 'all' || j.status === filter)
 
@@ -505,8 +505,8 @@ function Backfill() {
     const map: Record<string, string> = {
       pending: 'badge-neutral',
       in_progress: 'badge-accent',
-      done: 'badge-success',
-      error: 'badge-error',
+      complete: 'badge-success',
+      failed: 'badge-error',
     }
     return map[s] ?? 'badge-neutral'
   }

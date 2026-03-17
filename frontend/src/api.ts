@@ -10,19 +10,20 @@ let _cfg: AuthConfig | null = null;
 
 export function setAuth(cfg: AuthConfig) {
   _cfg = cfg;
-  localStorage.setItem('tgr_auth', JSON.stringify(cfg));
+  // sessionStorage: gone on tab close, not persisted to disk
+  sessionStorage.setItem('tgr_auth', JSON.stringify(cfg));
 }
 
 export function getAuth(): AuthConfig | null {
   if (_cfg) return _cfg;
-  const stored = localStorage.getItem('tgr_auth');
+  const stored = sessionStorage.getItem('tgr_auth');
   if (stored) { _cfg = JSON.parse(stored); return _cfg; }
   return null;
 }
 
 export function clearAuth() {
   _cfg = null;
-  localStorage.removeItem('tgr_auth');
+  sessionStorage.removeItem('tgr_auth');
 }
 
 async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
@@ -50,7 +51,8 @@ export interface Stats {
   total_messages: number;
   total_chats: number;
   total_contacts: number;
-  date_range: { oldest: string; newest: string };
+  earliest_message_at: number | null;  // unix epoch seconds
+  latest_message_at: number | null;    // unix epoch seconds
 }
 
 export const fetchStats = () => req<Stats>('/stats');
@@ -63,15 +65,18 @@ export interface Message {
   chat_name: string;
   chat_type: string;
   sender_id: string;
-  sender_name: string | null;
+  sender_username: string | null;
+  sender_first_name: string | null;
+  sender_last_name: string | null;
   text: string;
   sent_at: number;
 }
 
 export interface SearchResult {
-  messages: Message[];
+  results: Message[];
   total: number;
-  next_cursor: string | null;
+  next_before_id: number | null;
+  next_before_sent_at: number | null;
 }
 
 export function fetchMessages(params: {
@@ -79,14 +84,16 @@ export function fetchMessages(params: {
   chat_id?: string;
   chat_type?: string;
   limit?: number;
-  cursor?: string;
+  next_before_id?: number;
+  next_before_sent_at?: number;
 }) {
   const p = new URLSearchParams();
   if (params.q) p.set('q', params.q);
   if (params.chat_id) p.set('chat_id', params.chat_id);
   if (params.chat_type) p.set('chat_type', params.chat_type);
   p.set('limit', String(params.limit ?? 50));
-  if (params.cursor) p.set('cursor', params.cursor);
+  if (params.next_before_id) p.set('next_before_id', String(params.next_before_id));
+  if (params.next_before_sent_at) p.set('next_before_sent_at', String(params.next_before_sent_at));
   return req<SearchResult>(`/search?${p}`);
 }
 
@@ -100,7 +107,7 @@ export interface Chat {
 }
 
 export const fetchChats = (limit = 200) =>
-  req<{ chats: Chat[] }>(`/chats?limit=${limit}`);
+  req<Chat[]>(`/chats?limit=${limit}`);
 
 // ── Contacts ───────────────────────────────────────────────────────────────
 export interface Contact {
@@ -109,11 +116,11 @@ export interface Contact {
   last_name: string | null;
   username: string | null;
   phone: string | null;
-  is_bot: boolean;
+  is_bot: number;  // SMALLINT 0|1
 }
 
 export const fetchContacts = (limit = 200) =>
-  req<{ contacts: Contact[] }>(`/contacts?limit=${limit}`);
+  req<Contact[]>(`/contacts?limit=${limit}`);
 
 // ── Backfill ───────────────────────────────────────────────────────────────
 export interface BackfillJob {
@@ -121,11 +128,11 @@ export interface BackfillJob {
   chat_name: string;
   total_messages: number;
   fetched_messages: number;
-  status: 'pending' | 'in_progress' | 'done' | 'error';
+  status: 'pending' | 'in_progress' | 'complete' | 'failed';
 }
 
 export const fetchBackfill = () =>
-  req<{ jobs: BackfillJob[] }>('/backfill/pending');
+  req<BackfillJob[]>('/backfill/pending');
 
 // ── Auth probe ─────────────────────────────────────────────────────────────
 export async function probeAuth(cfg: AuthConfig): Promise<void> {
