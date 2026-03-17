@@ -3419,7 +3419,7 @@ async function callModel(
     const toolCalls = (res.tool_calls ?? []).map((tc, i) => {
       let args: Record<string, unknown> = {};
       if (typeof tc.arguments === 'string') {
-        try { args = JSON.parse(tc.arguments) as Record<string, unknown>; } catch { /* empty */ }
+        try { args = JSON.parse(tc.arguments) as Record<string, unknown>; } catch { console.warn(`[jobs] cloudflare-ai: failed to parse tool arguments for "${tc.name}":`, tc.arguments); }
       } else if (tc.arguments && typeof tc.arguments === 'object') {
         args = tc.arguments as Record<string, unknown>;
       }
