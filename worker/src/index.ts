@@ -1877,7 +1877,7 @@ const MCP_TOOL_DEFINITIONS = [
       type: 'object',
       properties: {
         name: { type: 'string', description: 'Unique job name.' },
-        schedule: { type: 'string', description: 'Optional. Cron expression (e.g. "0 8 * * *"). At least one of schedule or trigger_type is required.' },
+        schedule: { type: 'string', description: 'Optional. Stored for reference only — cron expression evaluation is not yet implemented. The actual run frequency is controlled by cooldown_secs and the 15-minute cron tick. At least one of schedule or trigger_type is required.' },
         trigger_type: { type: 'string', enum: ['new_message', 'keyword', 'unanswered'], description: 'Optional. Trigger condition type.' },
         trigger_config: { type: 'object', description: 'Optional. Config for the trigger (chat_id, label, keywords, hours).' },
         model_config: { type: 'object', description: 'BYOM config: { provider, model, api_key_ref, endpoint? }. provider="anthropic" or "openai".' },
@@ -2228,6 +2228,9 @@ async function dispatchMcpTool(
   if (name === 'edit_message') {
     {
       const targetChatId = typeof args.tg_chat_id === 'string' ? args.tg_chat_id : null;
+      if (!targetChatId && ctx.role !== null) {
+        return { error: 'permission_denied', message: 'tg_chat_id is required for edit_message.' };
+      }
       if (targetChatId) {
         const permErr = await checkAndAuditWrite('edit', targetChatId, { msg_id: args.tg_message_id }, ctx, accountId, env);
         if (permErr) return permErr;
@@ -2247,6 +2250,9 @@ async function dispatchMcpTool(
   if (name === 'delete_message') {
     {
       const targetChatId = typeof args.tg_chat_id === 'string' ? args.tg_chat_id : null;
+      if (!targetChatId && ctx.role !== null) {
+        return { error: 'permission_denied', message: 'tg_chat_id is required for delete_message.' };
+      }
       if (targetChatId) {
         const permErr = await checkAndAuditWrite('delete', targetChatId, { msg_id: args.tg_message_id }, ctx, accountId, env);
         if (permErr) return permErr;
@@ -2590,6 +2596,11 @@ async function dispatchMcpTool(
       if (typeof args.task_prompt !== 'string') throw new Error('task_prompt is required');
       if (!args.schedule && !args.trigger_type) throw new Error('At least one of schedule or trigger_type is required');
 
+      const mc = args.model_config as Record<string, unknown>;
+      if (typeof mc.provider !== 'string' || !mc.provider) throw new Error('model_config.provider is required');
+      if (typeof mc.model !== 'string' || !mc.model) throw new Error('model_config.model is required');
+      if (typeof mc.api_key_ref !== 'string' || !mc.api_key_ref) throw new Error('model_config.api_key_ref is required');
+
       const modelConfigStr = JSON.stringify(args.model_config);
       const triggerConfigStr = args.trigger_config ? JSON.stringify(args.trigger_config) : null;
       const cooldownSecs = typeof args.cooldown_secs === 'number' ? args.cooldown_secs : 3600;
@@ -2650,13 +2661,23 @@ async function dispatchMcpTool(
     if (name === 'toggle_job') {
       if (typeof args.name !== 'string') throw new Error('name is required');
       const enabled = args.enabled !== false ? 1 : 0;
-      await sql(`UPDATE jobs SET enabled = $1 WHERE account_id = $2 AND name = $3`, [enabled, accountId, args.name]);
+      const toggleResult = await sql(
+        `UPDATE jobs SET enabled = $1 WHERE account_id = $2 AND name = $3`,
+        [enabled, accountId, args.name],
+        { fullResults: true },
+      ) as { rowCount?: number };
+      if ((toggleResult.rowCount ?? 0) === 0) throw new Error(`Job "${args.name}" not found`);
       return { ok: true };
     }
 
     if (name === 'delete_job') {
       if (typeof args.name !== 'string') throw new Error('name is required');
-      await sql(`DELETE FROM jobs WHERE account_id = $1 AND name = $2`, [accountId, args.name]);
+      const deleteResult = await sql(
+        `DELETE FROM jobs WHERE account_id = $1 AND name = $2`,
+        [accountId, args.name],
+        { fullResults: true },
+      ) as { rowCount?: number };
+      if ((deleteResult.rowCount ?? 0) === 0) throw new Error(`Job "${args.name}" not found`);
       return { ok: true };
     }
 
@@ -3271,7 +3292,9 @@ async function buildContext(job: JobRow, env: Env): Promise<string> {
     .replace(/\{sender\}/g,
       (trigMsg?.sender_username as string | undefined) ??
       (trigMsg?.sender_first_name as string | undefined) ?? '')
-    .replace(/\{snippet\}/g, typeof trigMsg?.text === 'string' ? trigMsg.text.slice(0, 300) : '');
+    .replace(/\{snippet\}/g, typeof trigMsg?.text === 'string'
+      ? `<message_snippet>${trigMsg.text.slice(0, 300)}</message_snippet>`
+      : '');
 }
 
 async function markJobRun(jobId: bigint, now: number, env: Env): Promise<void> {
@@ -3356,6 +3379,7 @@ async function callModel(
   const model = typeof modelConfig.model === 'string' ? modelConfig.model : 'gpt-4o';
   const apiKeyRef = typeof modelConfig.api_key_ref === 'string' ? modelConfig.api_key_ref : null;
   const apiKey = apiKeyRef ? ((env as unknown as Record<string, string>)[apiKeyRef] ?? '') : '';
+  if (!apiKey) throw new Error(`api_key_ref "${apiKeyRef ?? '(none)'}" is not set in Worker environment`);
 
   if (provider === 'anthropic') {
     const endpoint = typeof modelConfig.endpoint === 'string'
@@ -3435,14 +3459,21 @@ async function callModel(
   };
 }
 
+const JOB_DEADLINE_MS = 60_000; // 60s wall-clock max per job loop
+
 async function runAgentLoop(job: JobRow, context: string, env: Env): Promise<void> {
   const ctx: TokenContext = { token_id: job.token_id, role: job.role };
   const messages: AgentMessage[] = [{ role: 'user', content: context }];
   let modelConfig: Record<string, unknown> = {};
   try { modelConfig = JSON.parse(job.model_config) as Record<string, unknown>; } catch { /* use defaults */ }
 
+  const deadline = Date.now() + JOB_DEADLINE_MS;
   const MAX_ITERATIONS = 20;
   for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
+    if (Date.now() > deadline) {
+      console.warn(`[jobs] job "${job.name}" hit ${JOB_DEADLINE_MS / 1000}s deadline at iteration ${iter} — stopping`);
+      break;
+    }
     let response: ModelResponse;
     try {
       response = await callModel(
