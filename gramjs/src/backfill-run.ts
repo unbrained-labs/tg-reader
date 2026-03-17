@@ -36,6 +36,16 @@ interface PendingDialog {
 
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// floodSleepThreshold:300 makes the SDK auto-sleep for FLOOD_WAIT ≤ 300s.
+// Any FloodWait error that escapes to our catch blocks is necessarily >300s.
+function isFloodWait(errMsg: string): boolean {
+  return errMsg.toUpperCase().includes('FLOOD_WAIT');
+}
+
+// ---------------------------------------------------------------------------
 // Worker API helpers
 // ---------------------------------------------------------------------------
 
@@ -212,6 +222,12 @@ async function backfillDialog(
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
+      // SDK auto-sleeps for FLOOD_WAIT ≤ 300s. If it reaches here the wait is >300s —
+      // stop entirely per CLAUDE.md anti-ban rules; resume tomorrow.
+      if (isFloodWait(errMsg)) {
+        console.error('[backfill] FLOOD_WAIT >300s — stopping. Resume tomorrow.');
+        process.exit(1);
+      }
       console.error(`[backfill] getHistory error for dialog ${index + 1}:`, errMsg);
       await postProgress(accountId, { tg_chat_id, status: 'failed', last_error: errMsg });
       return;

@@ -32,6 +32,30 @@ export interface Env {
   DATABASE_URL: string;
   BACKUP_BUCKET: R2Bucket;
   INGEST_TOKEN: string;
+  MASTER_TOKEN: string;  // full access + permission management; separate from INGEST_TOKEN
+}
+
+// Role row — mirrors the roles table; JSON TEXT columns are pre-parsed to arrays.
+export interface RoleRow {
+  id: bigint;
+  name: string;
+  read_mode: 'all' | 'whitelist' | 'blacklist';
+  read_labels: string[] | null;     // null = no label filter
+  read_chat_ids: string[] | null;   // null = no chat_id filter
+  can_send: number;    // 0 | 1
+  can_edit: number;    // 0 | 1
+  can_delete: number;  // 0 | 1
+  can_forward: number; // 0 | 1
+  write_chat_types: string[] | null;  // null = inherit read scope
+  write_labels: string[] | null;
+  write_chat_ids: string[] | null;
+}
+
+// Token context threaded through the MCP dispatch stack.
+// token_id === null means the caller used MASTER_TOKEN — bypass all role checks.
+export interface TokenContext {
+  token_id: bigint | null;
+  role: RoleRow | null;
 }
 
 // Message row — matches schema.sql exactly

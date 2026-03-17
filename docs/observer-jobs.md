@@ -145,6 +145,8 @@ The Worker injects context before calling the model:
 
 For schedule-only jobs, message variables are empty — the agent uses MCP tools to fetch what it needs.
 
+**Security note:** `{snippet}` injects untrusted message content from the archive. The Worker wraps it in `<message_snippet>...</message_snippet>` XML tags to structurally separate it from your instructions. A malicious sender could still craft content attempting to override instructions (prompt injection). Mitigate by keeping write-capable job tokens narrowly scoped, and by not using `{snippet}` in jobs that have broad write permissions.
+
 **Examples:**
 
 ```
@@ -271,7 +273,7 @@ Update prompt, schedule, trigger, model config, or cooldown.
 
 ## Operational notes
 
-- **Cooldown** prevents the same job firing on every cron tick once triggered. Default 1 hour. Set higher for noisy chats.
+- **Cooldown** is the actual rate control — `cooldown_secs` sets the minimum gap between runs. The `schedule` cron expression is stored but not yet evaluated against the cron tick time; a job fires whenever cooldown has elapsed and conditions are met. Default cooldown: 1 hour. Set higher for noisy chats.
 - **No token = no run** — a job with `token_id = null` is skipped silently.
 - **Audit log** — all actions the job's agent takes are logged via the standard write audit (token_id tracked).
 - **Model failures** — if the model call fails (timeout, API error), log the error and continue. Do not retry in the same cron tick.

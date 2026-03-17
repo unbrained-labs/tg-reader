@@ -186,3 +186,105 @@ CREATE INDEX IF NOT EXISTS idx_pending_actions_due ON pending_actions(account_id
 
 INSERT INTO global_config (account_id, key, value) VALUES ('global', 'sync_mode', 'all')
   ON CONFLICT (account_id, key) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- RBAC — roles, agent tokens, and audit log
+-- ---------------------------------------------------------------------------
+
+-- Roles are account-agnostic templates — reusable across any number of accounts.
+-- The account binding comes from token_account_roles, not from the role itself.
+CREATE TABLE IF NOT EXISTS roles (
+  id               BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name             TEXT NOT NULL UNIQUE,   -- "work-reader", "dm-assistant", "full"
+
+  -- Read scope
+  read_mode        TEXT NOT NULL DEFAULT 'all',  -- 'all' | 'whitelist' | 'blacklist'
+  read_labels      TEXT,    -- JSON array e.g. ["work","clients"], NULL = no filter from this field
+  read_chat_ids    TEXT,    -- JSON array of tg_chat_ids, NULL = no filter from this field
+
+  -- Write permissions (all off by default)
+  can_send         SMALLINT NOT NULL DEFAULT 0,
+  can_edit         SMALLINT NOT NULL DEFAULT 0,
+  can_delete       SMALLINT NOT NULL DEFAULT 0,
+  can_forward      SMALLINT NOT NULL DEFAULT 0,
+
+  -- Write scope (NULL = inherit read scope)
+  write_chat_types TEXT,   -- JSON array: ["user","group","supergroup","channel"]
+  write_labels     TEXT,   -- JSON array of labels
+  write_chat_ids   TEXT    -- JSON array of tg_chat_ids
+);
+
+CREATE TABLE IF NOT EXISTS agent_tokens (
+  id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  token_hash   TEXT NOT NULL UNIQUE,  -- SHA-256 hex of the raw token, never plaintext
+  label        TEXT,                  -- "work claude", "read-only scout"
+  expires_at   BIGINT,                -- Unix epoch seconds, NULL = no expiry
+  last_used_at BIGINT,                -- NULL until first use; updated at most once per day
+  created_at   BIGINT NOT NULL
+);
+
+-- Many-to-many: one token can access multiple accounts, each with its own role.
+-- Single-account tokens just have one row here.
+CREATE TABLE IF NOT EXISTS token_account_roles (
+  token_id    BIGINT NOT NULL REFERENCES agent_tokens(id) ON DELETE CASCADE,
+  account_id  TEXT NOT NULL,
+  role_id     BIGINT NOT NULL REFERENCES roles(id) ON DELETE RESTRICT,
+  PRIMARY KEY (token_id, account_id)
+);
+
+-- Audit log for write operations (send / edit / delete / forward).
+-- Retention configurable via global_config key 'audit_log_retention_days' (default 90).
+-- Read operations are NOT logged — volume is tiny even for heavy write usage.
+CREATE TABLE IF NOT EXISTS audit_log (
+  id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  token_id       BIGINT REFERENCES agent_tokens(id) ON DELETE SET NULL,
+  account_id     TEXT NOT NULL,
+  action         TEXT NOT NULL,    -- 'send' | 'edit' | 'delete' | 'forward'
+  target_chat_id TEXT,
+  detail         TEXT,             -- JSON: message_id, action type — no message content
+  created_at     BIGINT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log (created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_log_token   ON audit_log (token_id);
+
+-- ---------------------------------------------------------------------------
+-- Observer jobs — AI agent cron tasks
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS jobs (
+  id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account_id     TEXT NOT NULL,
+  name           TEXT NOT NULL,
+
+  enabled        SMALLINT NOT NULL DEFAULT 1,
+
+  -- Trigger: schedule, condition, or both
+  schedule       TEXT,           -- cron expression e.g. "0 8 * * *" (optional)
+  trigger_type   TEXT,           -- 'new_message' | 'keyword' | 'unanswered' (optional)
+  trigger_config TEXT,           -- JSON, depends on trigger_type
+
+  -- Model (BYOM — Bring Your Own Model)
+  model_config   TEXT NOT NULL,  -- JSON: { provider, model, api_key_ref, endpoint? }
+
+  -- Task
+  task_prompt    TEXT NOT NULL,  -- instructions for the agent; supports {variables}
+
+  -- Access (RBAC) — null token = job is disabled until a token is assigned
+  token_id       BIGINT REFERENCES agent_tokens(id) ON DELETE SET NULL,
+
+  -- State
+  last_run_at    BIGINT,
+  cooldown_secs  INTEGER NOT NULL DEFAULT 3600,  -- min gap between runs, prevents spam
+
+  created_at     BIGINT NOT NULL,
+
+  UNIQUE (account_id, name)
+);
+
+-- ---------------------------------------------------------------------------
+-- Additional seed data
+-- ---------------------------------------------------------------------------
+
+INSERT INTO global_config (account_id, key, value) VALUES ('global', 'audit_log_retention_days', '90')
+  ON CONFLICT (account_id, key) DO NOTHING;

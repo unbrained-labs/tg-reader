@@ -7,4 +7,5 @@ binding = "BACKUP_BUCKET"
 bucket_name = "tg-reader-backup"
 
 [triggers]
-crons = ["0 3 * * *", "0 4 1 * *"]  # daily backup at 3am UTC, monthly storage check at 4am on 1st
+crons = ["0 3 * * *", "0 4 1 * *", "*/15 * * * *"]
+#        daily backup   monthly chk   observer job runner
