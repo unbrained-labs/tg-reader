@@ -2187,7 +2187,7 @@ async function dispatchMcpTool(
     if (typeof args.text !== 'string' || !args.text.trim()) throw new Error('text is required');
 
     // Mass send limits — enforced for both send and draft
-    if (Array.isArray(args.recipients) && (args.recipients as unknown[]).length > 0) {
+    if (Array.isArray(args.recipients) && args.recipients.length > 0) {
       const rawRecipients = args.recipients as Array<Record<string, unknown>>;
 
       // Read limits from global_config (both in one query)
@@ -2206,14 +2206,16 @@ async function dispatchMcpTool(
         throw new Error(`Mass send capped at ${maxRecipients} recipients (got ${rawRecipients.length}). Adjust mass_send_max_recipients in global_config to change this limit.`);
       }
 
+      // Always require tg_chat_id on every recipient — hallucinated/incomplete data rejected regardless of contactsOnly
+      const chatIds = rawRecipients.map(r => r.tg_chat_id as string).filter(Boolean);
+      if (chatIds.length < rawRecipients.length) {
+        const missing = rawRecipients.length - chatIds.length;
+        throw new Error(`${missing} recipient(s) have no tg_chat_id. Every recipient must include a tg_chat_id.`);
+      }
+
       if (contactsOnly) {
-        const chatIds = rawRecipients.map(r => r.tg_chat_id as string).filter(Boolean);
-        // Reject if any recipient is missing tg_chat_id — hallucinated/incomplete data
-        if (chatIds.length < rawRecipients.length) {
-          const missing = rawRecipients.length - chatIds.length;
-          throw new Error(`mass_send_contacts_only is enabled and ${missing} recipient(s) have no tg_chat_id. Provide tg_chat_id for every recipient, or set mass_send_contacts_only=0 in global_config.`);
-        }
-        // contacts.account_id must match the account used during contact sync (GramJS getMe())
+        // For DMs tg_chat_id equals the user's Telegram ID, which is what contacts.tg_user_id stores.
+        // contacts.account_id must match the account used during contact sync (GramJS getMe()).
         const known = await getSql(env)(
           `SELECT tg_user_id FROM contacts WHERE account_id = $1 AND tg_user_id = ANY($2::text[])`,
           [accountId, chatIds],
@@ -2221,13 +2223,12 @@ async function dispatchMcpTool(
         const knownSet = new Set(known.map(c => c.tg_user_id));
         const unknowns = chatIds.filter(id => !knownSet.has(id));
         if (unknowns.length > 0) {
-          throw new Error(`mass_send_contacts_only is enabled. ${unknowns.length} recipient(s) not in contacts. Set mass_send_contacts_only=0 in global_config to allow non-contacts.`);
+          throw new Error(`mass_send_contacts_only is enabled. Recipients not in contacts: ${unknowns.join(', ')}. Set mass_send_contacts_only=0 in global_config to allow non-contacts.`);
         }
       }
     }
 
     // Write permission check (send only — drafts are not writes until promoted)
-    // Note: mass send limits above apply to both send and draft.
     if (name === 'send') {
       const targetChatId = typeof args.tg_chat_id === 'string' ? args.tg_chat_id : null;
       if (targetChatId) {
