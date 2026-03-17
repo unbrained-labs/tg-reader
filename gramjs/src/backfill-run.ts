@@ -42,7 +42,7 @@ interface PendingDialog {
 // floodSleepThreshold:300 makes the SDK auto-sleep for FLOOD_WAIT ≤ 300s.
 // Any FloodWait error that escapes to our catch blocks is necessarily >300s.
 function isFloodWait(errMsg: string): boolean {
-  return errMsg.toUpperCase().includes('FLOOD_WAIT') || errMsg.includes('seconds is required');
+  return errMsg.toUpperCase().includes('FLOOD_WAIT');
 }
 
 // ---------------------------------------------------------------------------

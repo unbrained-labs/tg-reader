@@ -112,10 +112,12 @@ function checkWritePermission(
   const hasExplicitWriteScope = writeTypes || writeLabels || writeChatIds;
 
   if (hasExplicitWriteScope) {
-    if (writeTypes && chatType && !writeTypes.includes(chatType)) {
+    if (writeTypes && (!chatType || !writeTypes.includes(chatType))) {
       return {
         error: 'permission_denied',
-        message: `This token cannot ${action} to ${chatType} chats. Allowed: ${writeTypes.join(', ')}.`,
+        message: chatType
+          ? `This token cannot ${action} to ${chatType} chats. Allowed: ${writeTypes.join(', ')}.`
+          : `This token cannot ${action} to this chat — chat type is unknown. Allowed types: ${writeTypes.join(', ')}.`,
         action,
         target_chat_type: chatType,
       };
@@ -187,10 +189,11 @@ async function checkAndAuditWrite(
   if (!ctx.role) return null; // MASTER_TOKEN — bypass
   const sql = getSql(env);
   const chatRows = await sql(
-    `SELECT MAX(m.chat_type) AS chat_type, MAX(cc.label) AS label
+    `SELECT m.chat_type, cc.label
      FROM messages m
      LEFT JOIN chat_config cc ON cc.account_id = m.account_id AND cc.tg_chat_id = m.tg_chat_id
-     WHERE m.account_id = $1 AND m.tg_chat_id = $2`,
+     WHERE m.account_id = $1 AND m.tg_chat_id = $2
+     ORDER BY m.sent_at DESC LIMIT 1`,
     [accountId, chatId],
   ) as Array<{ chat_type: string | null; label: string | null }>;
   const { chat_type, label } = chatRows[0] ?? { chat_type: null, label: null };
@@ -2607,13 +2610,14 @@ async function dispatchMcpTool(
 
       // Auto-create a scoped token if a role name is provided
       let tokenId: bigint | null = null;
+      let jobRawToken: string | null = null;
       if (typeof args.role === 'string') {
         const roleRows = await sql(`SELECT id FROM roles WHERE name = $1`, [args.role]) as Array<{ id: bigint }>;
         if (roleRows.length === 0) throw new Error(`Role "${args.role}" not found`);
         const rawBytes = new Uint8Array(32);
         crypto.getRandomValues(rawBytes);
-        const rawToken = Array.from(rawBytes).map(b => b.toString(16).padStart(2, '0')).join('');
-        const hash = await hashToken(rawToken);
+        jobRawToken = Array.from(rawBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+        const hash = await hashToken(jobRawToken);
         const tokenRows = await sql(
           `INSERT INTO agent_tokens (token_hash, label, created_at) VALUES ($1, $2, $3) RETURNING id`,
           [hash, `job:${args.name}`, now],
@@ -2634,7 +2638,12 @@ async function dispatchMcpTool(
           modelConfigStr, args.task_prompt, tokenId, cooldownSecs, now,
         ],
       ) as Array<{ id: bigint }>;
-      return { ok: true, job_id: rows[0].id.toString() };
+      const result: Record<string, unknown> = { ok: true, job_id: rows[0].id.toString() };
+      if (jobRawToken) {
+        result.token = jobRawToken;
+        result.token_note = 'Save this token now — it cannot be retrieved again.';
+      }
+      return result;
     }
 
     if (name === 'list_jobs') {
@@ -2690,7 +2699,13 @@ async function dispatchMcpTool(
       if ('schedule' in args) { updates.push(`schedule = $${n}`); binds.push(args.schedule ?? null); n++; }
       if ('trigger_type' in args) { updates.push(`trigger_type = $${n}`); binds.push(args.trigger_type ?? null); n++; }
       if ('trigger_config' in args) { updates.push(`trigger_config = $${n}`); binds.push(args.trigger_config ? JSON.stringify(args.trigger_config) : null); n++; }
-      if ('model_config' in args) { updates.push(`model_config = $${n}`); binds.push(JSON.stringify(args.model_config)); n++; }
+      if ('model_config' in args) {
+        const umc = args.model_config as Record<string, unknown>;
+        if (typeof umc.provider !== 'string' || !umc.provider) throw new Error('model_config.provider is required');
+        if (typeof umc.model !== 'string' || !umc.model) throw new Error('model_config.model is required');
+        if (typeof umc.api_key_ref !== 'string' || !umc.api_key_ref) throw new Error('model_config.api_key_ref is required');
+        updates.push(`model_config = $${n}`); binds.push(JSON.stringify(args.model_config)); n++;
+      }
       if ('cooldown_secs' in args) { updates.push(`cooldown_secs = $${n}`); binds.push(args.cooldown_secs); n++; }
       if (updates.length === 0) throw new Error('No fields to update');
       await sql(`UPDATE jobs SET ${updates.join(', ')} WHERE account_id = $1 AND name = $2`, binds);
@@ -3274,14 +3289,20 @@ async function buildContext(job: JobRow, env: Env): Promise<string> {
     }
   }
 
+  // Gate the trigger query by the job's read scope — the prompt must not receive
+  // content from chats outside the token's allowed scope.
+  const { clause: scopeClause, binds: scopeBinds } = buildReadScopeClause(job.role, 'm', n, 1);
+  const scopeWhere = scopeClause ? ` AND ${scopeClause}` : '';
+  const allBinds = [...binds, ...scopeBinds];
+
   let trigMsg: Record<string, unknown> | null = null;
   try {
     const rows = await sql(
       `SELECT m.tg_chat_id, m.chat_name, m.sender_username, m.sender_first_name, m.text, m.sent_at
        FROM messages m
-       WHERE m.account_id = $1 AND m.sent_at > $2${extraWhere}
+       WHERE m.account_id = $1 AND m.sent_at > $2${extraWhere}${scopeWhere}
        ORDER BY m.sent_at DESC LIMIT 1`,
-      binds,
+      allBinds,
     ) as Array<Record<string, unknown>>;
     trigMsg = rows[0] ?? null;
   } catch { /* proceed without trigger context */ }
@@ -3461,6 +3482,14 @@ async function callModel(
 
 const JOB_DEADLINE_MS = 60_000; // 60s wall-clock max per job loop
 
+// MASTER_TOKEN-only management tools — never expose to job agents (scoped tokens)
+const MASTER_ONLY_TOOLS = new Set([
+  'create_role', 'list_roles', 'update_role', 'delete_role',
+  'create_token', 'list_tokens', 'revoke_token',
+  'create_job', 'list_jobs', 'toggle_job', 'delete_job', 'update_job',
+]);
+const JOB_TOOL_DEFINITIONS = MCP_TOOL_DEFINITIONS.filter(t => !MASTER_ONLY_TOOLS.has(t.name));
+
 async function runAgentLoop(job: JobRow, context: string, env: Env): Promise<void> {
   const ctx: TokenContext = { token_id: job.token_id, role: job.role };
   const messages: AgentMessage[] = [{ role: 'user', content: context }];
@@ -3479,7 +3508,7 @@ async function runAgentLoop(job: JobRow, context: string, env: Env): Promise<voi
       response = await callModel(
         modelConfig,
         messages,
-        MCP_TOOL_DEFINITIONS as Array<{ name: string; description: string; inputSchema: unknown }>,
+        JOB_TOOL_DEFINITIONS as Array<{ name: string; description: string; inputSchema: unknown }>,
         env,
       );
     } catch (err) {
