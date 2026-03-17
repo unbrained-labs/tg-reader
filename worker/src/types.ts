@@ -33,6 +33,7 @@ export interface Env {
   BACKUP_BUCKET: R2Bucket;
   INGEST_TOKEN: string;
   MASTER_TOKEN: string;  // full access + permission management; separate from INGEST_TOKEN
+  AI: Ai;                // Workers AI binding — used by cloudflare-ai provider jobs
 }
 
 // Role row — mirrors the roles table; JSON TEXT columns are pre-parsed to arrays.
