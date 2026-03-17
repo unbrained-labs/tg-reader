@@ -2186,6 +2186,40 @@ async function dispatchMcpTool(
   if (name === 'send' || name === 'draft') {
     if (typeof args.text !== 'string' || !args.text.trim()) throw new Error('text is required');
 
+    // Mass send limits — enforced for both send and draft
+    if (Array.isArray(args.recipients) && (args.recipients as unknown[]).length > 0) {
+      const rawRecipients = args.recipients as Array<Record<string, unknown>>;
+      const sql = getSql(env);
+
+      // Read limits from global_config (both in one query)
+      const cfgRows = await sql(
+        `SELECT key, value FROM global_config WHERE account_id = 'global' AND key IN ('mass_send_max_recipients', 'mass_send_contacts_only')`,
+        [],
+      ) as Array<{ key: string; value: string }>;
+      const cfgMap = new Map(cfgRows.map(r => [r.key, r.value]));
+      const maxRecipients = parseInt(cfgMap.get('mass_send_max_recipients') ?? '25', 10);
+      const contactsOnly = (cfgMap.get('mass_send_contacts_only') ?? '1') !== '0';
+
+      if (rawRecipients.length > maxRecipients) {
+        throw new Error(`Mass send capped at ${maxRecipients} recipients (got ${rawRecipients.length}). Adjust mass_send_max_recipients in global_config to change this limit.`);
+      }
+
+      if (contactsOnly) {
+        const chatIds = rawRecipients.map(r => r.tg_chat_id as string).filter(Boolean);
+        if (chatIds.length > 0) {
+          const known = await sql(
+            `SELECT tg_user_id FROM contacts WHERE account_id = $1 AND tg_user_id = ANY($2::text[])`,
+            [accountId, chatIds],
+          ) as Array<{ tg_user_id: string }>;
+          const knownSet = new Set(known.map(c => c.tg_user_id));
+          const unknowns = chatIds.filter(id => !knownSet.has(id));
+          if (unknowns.length > 0) {
+            throw new Error(`mass_send_contacts_only is enabled. ${unknowns.length} recipient(s) not in contacts: ${unknowns.slice(0, 5).join(', ')}. Set mass_send_contacts_only=0 in global_config to allow non-contacts.`);
+          }
+        }
+      }
+    }
+
     // Write permission check (send only — drafts are not writes until promoted)
     if (name === 'send') {
       const targetChatId = typeof args.tg_chat_id === 'string' ? args.tg_chat_id : null;

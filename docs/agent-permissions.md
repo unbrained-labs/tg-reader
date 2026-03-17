@@ -324,6 +324,36 @@ If `write_*` fields are null, inherit read scope.
 
 ---
 
-## Open questions
+## Mass send limits
 
-1. **Rate limiting per token** — prevent mass-sending from a write-capable token. Revisit before issuing write tokens in production.
+Mass sends (outbox with a `recipients` array) are subject to configurable safety limits enforced by the Worker before any rows are written. Applies to both `send` and `draft` MCP calls.
+
+### Configurable keys (`global_config`, account_id = `global`)
+
+| key | default | meaning |
+|-----|---------|---------|
+| `mass_send_max_recipients` | `25` | Maximum recipients per outbox. Request is rejected if over this. |
+| `mass_send_contacts_only` | `1` | `1` = recipients must be in the `contacts` table. `0` = allow any chat ID. |
+
+### GramJS inter-message delay
+
+GramJS applies a 2–5 second random jitter between each message in a mass send. This is hardcoded and not configurable — fixed intervals look mechanical to Telegram's detection systems, and 2–5s is the safe minimum.
+
+### Changing the limits
+
+Update via direct SQL (MASTER_TOKEN admin):
+```sql
+-- Raise the cap to 50
+UPDATE global_config SET value = '50' WHERE account_id = 'global' AND key = 'mass_send_max_recipients';
+
+-- Allow sending to non-contacts
+UPDATE global_config SET value = '0' WHERE account_id = 'global' AND key = 'mass_send_contacts_only';
+```
+
+### Why contacts-only by default
+
+If a job hallucinates chat IDs, or a recipient list contains stale/wrong IDs, the contacts gate prevents accidental messages to strangers. The contacts table is populated by GramJS on startup and during backfill — it represents people you already have a real relationship with on Telegram.
+
+### Telegram ToS context
+
+Automated mass DMs to strangers are a permaban offence. The cap + contacts gate + GramJS jitter together keep usage in the "passive personal archive with occasional outreach" profile, which is low-risk. High-volume outreach to non-contacts falls outside what this system is designed for.

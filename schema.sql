@@ -288,3 +288,10 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 INSERT INTO global_config (account_id, key, value) VALUES ('global', 'audit_log_retention_days', '90')
   ON CONFLICT (account_id, key) DO NOTHING;
+
+-- Mass send safety limits (configurable via global_config)
+INSERT INTO global_config (account_id, key, value) VALUES ('global', 'mass_send_max_recipients', '25')
+  ON CONFLICT (account_id, key) DO NOTHING;
+
+INSERT INTO global_config (account_id, key, value) VALUES ('global', 'mass_send_contacts_only', '1')
+  ON CONFLICT (account_id, key) DO NOTHING;
