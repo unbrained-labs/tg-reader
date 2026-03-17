@@ -341,7 +341,9 @@ GramJS applies a 2–5 second random jitter between each message in a mass send.
 
 ### Changing the limits
 
-Update via direct SQL (MASTER_TOKEN admin):
+These are intentionally not exposed as MCP tools — config changes should be deliberate admin operations, not something an agent can do in a tool call.
+
+Update via Neon MCP (from any Claude session with Neon connected) or psql:
 ```sql
 -- Raise the cap to 50
 UPDATE global_config SET value = '50' WHERE account_id = 'global' AND key = 'mass_send_max_recipients';
