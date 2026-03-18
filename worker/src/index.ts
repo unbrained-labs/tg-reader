@@ -3237,76 +3237,93 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
   // ── Tokens ────────────────────────────────────────────────────────────────
 
   if (method === 'GET' && pathname === '/tokens') {
-    const sql = getSql(env);
-    const rows = await sql(`
-      SELECT at.id, at.label, at.expires_at, at.last_used_at, at.created_at,
-             tar.account_id, r.name AS role_name,
-             r.read_mode, r.can_send, r.can_edit, r.can_delete, r.can_forward
-      FROM agent_tokens at
-      JOIN token_account_roles tar ON tar.token_id = at.id
-      JOIN roles r ON r.id = tar.role_id
-      ORDER BY at.created_at DESC, at.id, tar.account_id
-    `) as Array<Record<string, unknown>>;
-    const tokens: Record<string, Record<string, unknown>> = {};
-    for (const row of rows) {
-      const tid = (row.id as bigint).toString();
-      if (!tokens[tid]) {
-        tokens[tid] = {
-          id: tid,
-          label: row.label ?? null,
-          expires_at: row.expires_at ? Number(row.expires_at) : null,
-          last_used_at: row.last_used_at ? Number(row.last_used_at) : null,
-          created_at: Number(row.created_at),
-          accounts: [],
-        };
+    try {
+      const sql = getSql(env);
+      const rows = await sql(`
+        SELECT at.id, at.label, at.expires_at, at.last_used_at, at.created_at,
+               tar.account_id, r.name AS role_name,
+               r.read_mode, r.can_send, r.can_edit, r.can_delete, r.can_forward
+        FROM agent_tokens at
+        JOIN token_account_roles tar ON tar.token_id = at.id
+        JOIN roles r ON r.id = tar.role_id
+        WHERE tar.account_id = $1
+        ORDER BY at.created_at DESC, at.id, tar.account_id
+      `, [accountId]) as Array<Record<string, unknown>>;
+      const tokens: Record<string, Record<string, unknown>> = {};
+      for (const row of rows) {
+        const tid = (row.id as bigint).toString();
+        if (!tokens[tid]) {
+          tokens[tid] = {
+            id: tid,
+            label: row.label ?? null,
+            expires_at: row.expires_at ? Number(row.expires_at) : null,
+            last_used_at: row.last_used_at ? Number(row.last_used_at) : null,
+            created_at: Number(row.created_at),
+            accounts: [],
+          };
+        }
+        (tokens[tid].accounts as Array<Record<string, unknown>>).push({
+          account_id: row.account_id,
+          role: row.role_name,
+          read_mode: row.read_mode,
+          can_send: !!row.can_send,
+          can_edit: !!row.can_edit,
+          can_delete: !!row.can_delete,
+          can_forward: !!row.can_forward,
+        });
       }
-      (tokens[tid].accounts as Array<Record<string, unknown>>).push({
-        account_id: row.account_id,
-        role: row.role_name,
-        read_mode: row.read_mode,
-        can_send: !!row.can_send,
-        can_edit: !!row.can_edit,
-        can_delete: !!row.can_delete,
-        can_forward: !!row.can_forward,
-      });
+      return json(Object.values(tokens));
+    } catch (err) {
+      console.error('[GET /tokens] DB error', err);
+      return json({ ok: false, error: 'DB error' }, 500);
     }
-    return json(Object.values(tokens));
   }
 
   const tokenDeleteMatch = pathname.match(/^\/tokens\/(\d+)$/);
   if (method === 'DELETE' && tokenDeleteMatch) {
-    const tokenId = tokenDeleteMatch[1];
-    const sql = getSql(env);
-    const result = await sql(
-      `DELETE FROM agent_tokens WHERE id = $1`,
-      [BigInt(tokenId)],
-      { fullResults: true },
-    ) as { rowCount?: number };
-    if ((result.rowCount ?? 0) === 0) return json({ ok: false, error: 'Token not found' }, 404);
-    return json({ ok: true });
+    try {
+      const tokenId = tokenDeleteMatch[1];
+      const sql = getSql(env);
+      // Verify ownership before deleting
+      const owned = await sql(
+        `SELECT 1 FROM token_account_roles WHERE token_id = $1 AND account_id = $2`,
+        [BigInt(tokenId), accountId],
+      ) as unknown[];
+      if (owned.length === 0) return json({ ok: false, error: 'Token not found' }, 404);
+      await sql(`DELETE FROM agent_tokens WHERE id = $1`, [BigInt(tokenId)]);
+      return json({ ok: true });
+    } catch (err) {
+      console.error('[DELETE /tokens] DB error', err);
+      return json({ ok: false, error: 'DB error' }, 500);
+    }
   }
 
   if (method === 'GET' && pathname === '/roles') {
-    const sql = getSql(env);
-    const rows = await sql(`
-      SELECT id, name, read_mode, can_send, can_edit, can_delete, can_forward,
-             read_labels, read_chat_ids, write_labels, write_chat_ids, write_chat_types
-      FROM roles ORDER BY name
-    `) as Array<Record<string, unknown>>;
-    return json(rows.map(r => ({
-      id: (r.id as bigint).toString(),
-      name: r.name,
-      read_mode: r.read_mode,
-      can_send: !!r.can_send,
-      can_edit: !!r.can_edit,
-      can_delete: !!r.can_delete,
-      can_forward: !!r.can_forward,
-      read_labels: r.read_labels ?? null,
-      read_chat_ids: r.read_chat_ids ?? null,
-      write_labels: r.write_labels ?? null,
-      write_chat_ids: r.write_chat_ids ?? null,
-      write_chat_types: r.write_chat_types ?? null,
-    })));
+    try {
+      const sql = getSql(env);
+      const rows = await sql(`
+        SELECT id, name, read_mode, can_send, can_edit, can_delete, can_forward,
+               read_labels, read_chat_ids, write_labels, write_chat_ids, write_chat_types
+        FROM roles ORDER BY name
+      `) as Array<Record<string, unknown>>;
+      return json(rows.map(r => ({
+        id: (r.id as bigint).toString(),
+        name: r.name,
+        read_mode: r.read_mode,
+        can_send: !!r.can_send,
+        can_edit: !!r.can_edit,
+        can_delete: !!r.can_delete,
+        can_forward: !!r.can_forward,
+        read_labels: r.read_labels ?? null,
+        read_chat_ids: r.read_chat_ids ?? null,
+        write_labels: r.write_labels ?? null,
+        write_chat_ids: r.write_chat_ids ?? null,
+        write_chat_types: r.write_chat_types ?? null,
+      })));
+    } catch (err) {
+      console.error('[GET /roles] DB error', err);
+      return json({ ok: false, error: 'DB error' }, 500);
+    }
   }
 
   if (method === 'POST' && pathname === '/tokens') {
@@ -3314,24 +3331,29 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
     try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
     const b = body as Record<string, unknown>;
     if (typeof b.role_name !== 'string' || !b.role_name.trim()) return json({ ok: false, error: 'role_name is required' }, 400);
-    const sql = getSql(env);
-    const now = Math.floor(Date.now() / 1000);
-    const roleRows = await sql(`SELECT id FROM roles WHERE name = $1`, [b.role_name]) as Array<{ id: bigint }>;
-    if (roleRows.length === 0) return json({ ok: false, error: `Role "${b.role_name}" not found` }, 404);
-    const roleId = roleRows[0].id;
-    const tokenLabel = typeof b.label === 'string' && b.label.trim() ? b.label.trim() : null;
-    const expiresAt = typeof b.expires_at === 'number' ? b.expires_at : null;
-    const rawBytes = new Uint8Array(32);
-    crypto.getRandomValues(rawBytes);
-    const rawToken = Array.from(rawBytes).map(bv => bv.toString(16).padStart(2, '0')).join('');
-    const hash = await hashToken(rawToken);
-    const tokenRows = await sql(
-      `INSERT INTO agent_tokens (token_hash, label, expires_at, created_at) VALUES ($1, $2, $3, $4) RETURNING id`,
-      [hash, tokenLabel, expiresAt, now],
-    ) as Array<{ id: bigint }>;
-    const tokenId = tokenRows[0].id;
-    await sql(`INSERT INTO token_account_roles (token_id, account_id, role_id) VALUES ($1, $2, $3)`, [tokenId, accountId, roleId]);
-    return json({ ok: true, token: rawToken, token_id: tokenId.toString(), label: tokenLabel, role: b.role_name, note: 'Save this token now — it cannot be retrieved again.' });
+    try {
+      const sql = getSql(env);
+      const now = Math.floor(Date.now() / 1000);
+      const roleRows = await sql(`SELECT id FROM roles WHERE name = $1`, [b.role_name]) as Array<{ id: bigint }>;
+      if (roleRows.length === 0) return json({ ok: false, error: `Role "${b.role_name}" not found` }, 404);
+      const roleId = roleRows[0].id;
+      const tokenLabel = typeof b.label === 'string' && b.label.trim() ? b.label.trim() : null;
+      const expiresAt = typeof b.expires_at === 'number' ? b.expires_at : null;
+      const rawBytes = new Uint8Array(32);
+      crypto.getRandomValues(rawBytes);
+      const rawToken = Array.from(rawBytes).map(bv => bv.toString(16).padStart(2, '0')).join('');
+      const hash = await hashToken(rawToken);
+      const tokenRows = await sql(
+        `INSERT INTO agent_tokens (token_hash, label, expires_at, created_at) VALUES ($1, $2, $3, $4) RETURNING id`,
+        [hash, tokenLabel, expiresAt, now],
+      ) as Array<{ id: bigint }>;
+      const tokenId = tokenRows[0].id;
+      await sql(`INSERT INTO token_account_roles (token_id, account_id, role_id) VALUES ($1, $2, $3)`, [tokenId, accountId, roleId]);
+      return json({ ok: true, token: rawToken, token_id: tokenId.toString(), label: tokenLabel, role: b.role_name, note: 'Save this token now — it cannot be retrieved again.' });
+    } catch (err) {
+      console.error('[POST /tokens] DB error', err);
+      return json({ ok: false, error: 'DB error' }, 500);
+    }
   }
 
   // ── Jobs ──────────────────────────────────────────────────────────────────

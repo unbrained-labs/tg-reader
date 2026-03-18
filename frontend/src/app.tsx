@@ -1486,7 +1486,7 @@ function Tokens() {
       await revokeToken(id)
       setTokens(prev => prev.filter(t => t.id !== id))
       setConfirmRevoke(null)
-    } catch (e: any) { alert(e.message) }
+    } catch (e: any) { setErr(e.message) }
     finally { setRevoking(null) }
   }
 
