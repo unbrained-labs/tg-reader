@@ -205,6 +205,22 @@ export function toggleJob(name: string, enabled: boolean) {
   });
 }
 
+export interface CreateJobPayload {
+  name: string;
+  task_prompt: string;
+  model_config: { provider: string; model: string; api_key_ref: string };
+  schedule?: string | null;
+  trigger_type?: string | null;
+  cooldown_secs?: number;
+}
+
+export function createJob(data: CreateJobPayload) {
+  return req<{ ok: boolean; job_id: string; token: string; token_note: string }>('/jobs', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
 // ── Chat Config ─────────────────────────────────────────────────────────────
 export interface ChatConfig {
   tg_chat_id: string;
@@ -219,6 +235,8 @@ export const fetchChatsConfig = () => req<ChatConfig[]>('/chats/config');
 // ── Global Config ───────────────────────────────────────────────────────────
 export interface GlobalConfig {
   sync_mode: 'all' | 'whitelist' | 'blacklist' | 'none';
+  mass_send_max_recipients: number;
+  mass_send_contacts_only: boolean;
 }
 
 export const fetchGlobalConfig = () => req<GlobalConfig>('/config');
@@ -229,6 +247,81 @@ export function setGlobalConfig(data: Partial<GlobalConfig>) {
     body: JSON.stringify(data),
   });
 }
+
+export function updateChatConfig(data: {
+  tg_chat_id: string;
+  chat_name?: string | null;
+  sync?: 'include' | 'exclude' | null;
+  label?: string | null;
+}) {
+  return req<{ ok: boolean }>('/chats/config', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export function deleteChatConfig(tgChatId: string) {
+  return req<{ ok: boolean }>(`/chats/config/${encodeURIComponent(tgChatId)}`, {
+    method: 'DELETE',
+  });
+}
+
+// ── Tokens ─────────────────────────────────────────────────────────────────
+export interface TokenAccount {
+  account_id: string;
+  role: string;
+  read_mode: string;
+  can_send: boolean;
+  can_edit: boolean;
+  can_delete: boolean;
+  can_forward: boolean;
+}
+
+export interface AgentToken {
+  id: string;
+  label: string | null;
+  expires_at: number | null;
+  last_used_at: number | null;
+  created_at: number;
+  accounts: TokenAccount[];
+}
+
+export const fetchTokens = () => req<AgentToken[]>('/tokens');
+
+export function revokeToken(id: string) {
+  return req<{ ok: boolean }>(`/tokens/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+export interface CreateTokenPayload {
+  role_name: string;
+  label?: string;
+  expires_at?: number;
+}
+
+export function createToken(data: CreateTokenPayload) {
+  return req<{ ok: boolean; token: string; token_id: string; label: string | null; role: string; note: string }>('/tokens', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+// ── Roles ───────────────────────────────────────────────────────────────────
+export interface Role {
+  id: string;
+  name: string;
+  read_mode: string;
+  can_send: boolean;
+  can_edit: boolean;
+  can_delete: boolean;
+  can_forward: boolean;
+  read_labels: string | null;
+  read_chat_ids: string | null;
+  write_labels: string | null;
+  write_chat_ids: string | null;
+  write_chat_types: string | null;
+}
+
+export const fetchRoles = () => req<Role[]>('/roles');
 
 // ── Auth probe ─────────────────────────────────────────────────────────────
 export async function probeAuth(cfg: AuthConfig): Promise<void> {

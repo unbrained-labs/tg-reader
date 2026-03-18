@@ -340,15 +340,18 @@ function buildGapMessage(raw: Api.Message, chats: Api.TypeChat[], users: Api.Typ
     if (u) chat_name = [u.firstName, u.lastName].filter(Boolean).join(' ') || undefined;
   }
 
+  const senderId = resolveSenderId(raw.fromId);
+  const senderUser = users.find((u): u is Api.User => u instanceof Api.User && String(u.id) === senderId);
+
   return {
     tg_message_id: String(raw.id), // S-1
     tg_chat_id,
     chat_type: chat_type as Message['chat_type'],
     chat_name,
-    sender_id: resolveSenderId(raw.fromId),
-    sender_username: undefined,
-    sender_first_name: undefined,
-    sender_last_name: undefined,
+    sender_id: senderId,
+    sender_username: senderUser?.username ?? undefined,
+    sender_first_name: senderUser?.firstName ?? undefined,
+    sender_last_name: senderUser?.lastName ?? undefined,
     message_type: resolveMessageType(raw),
     text: raw.message || undefined,
     media_type: resolveMediaType(raw.media ?? undefined),

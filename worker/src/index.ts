@@ -537,10 +537,14 @@ async function handleSearch(
 
       const DATA_SQL = `
         SELECT m.id, m.tg_message_id, m.tg_chat_id, m.chat_name, m.chat_type,
-               m.sender_id, m.sender_username, m.sender_first_name, m.sender_last_name,
+               m.sender_id,
+               COALESCE(m.sender_username, c.username) AS sender_username,
+               COALESCE(m.sender_first_name, c.first_name) AS sender_first_name,
+               COALESCE(m.sender_last_name, c.last_name) AS sender_last_name,
                m.message_type, m.text, m.media_type,
                m.reply_to_message_id, m.forwarded_from_name, m.sent_at
         FROM messages m
+        LEFT JOIN contacts c ON c.account_id = m.account_id AND c.tg_user_id = m.sender_id
         WHERE m.search_vector @@ to_tsquery('simple', $1)
           AND m.account_id = $2
           AND m.is_deleted = 0
@@ -594,21 +598,25 @@ async function handleSearch(
       const limitIdx = baseBinds.length + keysetBinds.length + scopeBinds.length + 1;
 
       const DATA_SQL = `
-        SELECT id, tg_message_id, tg_chat_id, chat_name, chat_type,
-               sender_id, sender_username, sender_first_name, sender_last_name,
-               message_type, text, media_type,
-               reply_to_message_id, forwarded_from_name, sent_at
-        FROM messages
-        WHERE account_id = $1
-          AND is_deleted = 0
-          AND ($2::text IS NULL OR tg_chat_id = $2)
-          AND ($3::text IS NULL OR sender_username = $3
-            OR sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $1 AND username = $3))
-          AND sent_at >= $4
-          AND sent_at <= $5
+        SELECT m.id, m.tg_message_id, m.tg_chat_id, m.chat_name, m.chat_type,
+               m.sender_id,
+               COALESCE(m.sender_username, c.username) AS sender_username,
+               COALESCE(m.sender_first_name, c.first_name) AS sender_first_name,
+               COALESCE(m.sender_last_name, c.last_name) AS sender_last_name,
+               m.message_type, m.text, m.media_type,
+               m.reply_to_message_id, m.forwarded_from_name, m.sent_at
+        FROM messages m
+        LEFT JOIN contacts c ON c.account_id = m.account_id AND c.tg_user_id = m.sender_id
+        WHERE m.account_id = $1
+          AND m.is_deleted = 0
+          AND ($2::text IS NULL OR m.tg_chat_id = $2)
+          AND ($3::text IS NULL OR m.sender_username = $3
+            OR m.sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $1 AND username = $3))
+          AND m.sent_at >= $4
+          AND m.sent_at <= $5
           ${keysetClause}
           ${scopeClause}
-        ORDER BY sent_at DESC, id DESC
+        ORDER BY m.sent_at DESC, m.id DESC
         LIMIT $${limitIdx}
       `.trim();
 
@@ -648,6 +656,58 @@ async function handleSearch(
       return json({ ok: false, error: 'Invalid search query — check for unmatched quotes or special characters' }, 400);
     }
     console.error('[GET /search] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// History (REST — for dashboard chat view)
+// ---------------------------------------------------------------------------
+
+async function handleHistory(request: Request, env: Env, accountId: string): Promise<Response> {
+  const url = new URL(request.url);
+  const p = url.searchParams;
+  const chatId = p.get('chat_id');
+  if (!chatId) return json({ ok: false, error: 'chat_id is required' }, 400);
+  const limit = Math.min(parseInt(p.get('limit') ?? '50', 10) || 50, 100);
+  const afterId = p.has('after_id') ? parseInt(p.get('after_id')!, 10) : null;
+  const afterSentAt = p.has('after_sent_at') ? parseInt(p.get('after_sent_at')!, 10) : null;
+
+  const baseBinds: unknown[] = [accountId, chatId];
+  const keysetBinds: unknown[] = afterSentAt !== null && afterId !== null ? [afterSentAt, afterId] : [];
+  const keysetClause = keysetBinds.length > 0
+    ? `AND (m.sent_at > $3 OR (m.sent_at = $3 AND m.id > $4))`
+    : ``;
+  const limitIdx = baseBinds.length + keysetBinds.length + 1;
+
+  const SQL = `
+    SELECT m.id, m.tg_message_id, m.tg_chat_id, m.chat_name, m.chat_type,
+           m.sender_id,
+           COALESCE(m.sender_username, c.username) AS sender_username,
+           COALESCE(m.sender_first_name, c.first_name) AS sender_first_name,
+           COALESCE(m.sender_last_name, c.last_name) AS sender_last_name,
+           m.text, m.sent_at
+    FROM messages m
+    LEFT JOIN contacts c ON c.account_id = m.account_id AND c.tg_user_id = m.sender_id
+    WHERE m.account_id = $1
+      AND m.tg_chat_id = $2
+      AND m.is_deleted = 0
+      ${keysetClause}
+    ORDER BY m.sent_at ASC, m.id ASC
+    LIMIT $${limitIdx}
+  `.trim();
+
+  const sql = getSql(env);
+  try {
+    const rows = await sql(SQL, [...baseBinds, ...keysetBinds, limit]) as Array<{ id: number; sent_at: number }>;
+    const lastRow = rows.length === limit ? rows[rows.length - 1] : null;
+    return json({
+      messages: rows,
+      next_after_id: lastRow?.id ?? null,
+      next_after_sent_at: lastRow?.sent_at ?? null,
+    });
+  } catch (err) {
+    console.error('[GET /history] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
   }
 }
@@ -906,15 +966,23 @@ async function handleStats(_request: Request, env: Env, accountId: string): Prom
 async function handleGetConfig(_request: Request, env: Env, accountId: string): Promise<Response> {
   const sql = getSql(env);
   try {
-    // Account-specific setting takes precedence over global default.
     const rows = await sql(
-      `SELECT value FROM global_config
-       WHERE key = 'sync_mode' AND account_id IN ($1, 'global')
-       ORDER BY CASE WHEN account_id = $1 THEN 0 ELSE 1 END
-       LIMIT 1`,
+      `SELECT key, value FROM global_config
+       WHERE key IN ('sync_mode', 'mass_send_max_recipients', 'mass_send_contacts_only')
+         AND account_id IN ($1, 'global')
+       ORDER BY key, CASE WHEN account_id = $1 THEN 0 ELSE 1 END`,
       [accountId],
-    ) as Array<{ value: string }>;
-    return json({ sync_mode: rows[0]?.value ?? 'all' });
+    ) as Array<{ key: string; value: string }>;
+    // Per-account value wins over global default (take first occurrence per key)
+    const cfg: Record<string, string> = {};
+    for (const r of rows) {
+      if (!(r.key in cfg)) cfg[r.key] = r.value;
+    }
+    return json({
+      sync_mode: cfg['sync_mode'] ?? 'all',
+      mass_send_max_recipients: parseInt(cfg['mass_send_max_recipients'] ?? '25', 10),
+      mass_send_contacts_only: (cfg['mass_send_contacts_only'] ?? '1') !== '0',
+    });
   } catch (err) {
     console.error('[GET /config] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
@@ -925,17 +993,41 @@ async function handlePostConfig(request: Request, env: Env, accountId: string): 
   let body: unknown;
   try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
 
-  const syncMode = (body as Record<string, unknown>).sync_mode;
-  if (!VALID_SYNC_MODES.includes(syncMode as typeof VALID_SYNC_MODES[number])) {
-    return json({ ok: false, error: `sync_mode must be one of: ${VALID_SYNC_MODES.join(', ')}` }, 400);
+  const b = body as Record<string, unknown>;
+  const updates: Array<[string, string]> = [];
+
+  if ('sync_mode' in b) {
+    const syncMode = b.sync_mode;
+    if (!VALID_SYNC_MODES.includes(syncMode as typeof VALID_SYNC_MODES[number])) {
+      return json({ ok: false, error: `sync_mode must be one of: ${VALID_SYNC_MODES.join(', ')}` }, 400);
+    }
+    updates.push(['sync_mode', syncMode as string]);
+  }
+
+  if ('mass_send_max_recipients' in b) {
+    const v = parseInt(String(b.mass_send_max_recipients), 10);
+    if (!Number.isFinite(v) || v < 1 || v > 500) {
+      return json({ ok: false, error: 'mass_send_max_recipients must be a number between 1 and 500' }, 400);
+    }
+    updates.push(['mass_send_max_recipients', String(v)]);
+  }
+
+  if ('mass_send_contacts_only' in b) {
+    updates.push(['mass_send_contacts_only', b.mass_send_contacts_only ? '1' : '0']);
+  }
+
+  if (updates.length === 0) {
+    return json({ ok: false, error: 'No valid fields to update' }, 400);
   }
 
   const sql = getSql(env);
   try {
-    await sql(
-      `INSERT INTO global_config (account_id, key, value) VALUES ($1, 'sync_mode', $2) ON CONFLICT(account_id, key) DO UPDATE SET value = EXCLUDED.value`,
-      [accountId, syncMode],
-    );
+    for (const [key, value] of updates) {
+      await sql(
+        `INSERT INTO global_config (account_id, key, value) VALUES ($1, $2, $3) ON CONFLICT(account_id, key) DO UPDATE SET value = EXCLUDED.value`,
+        [accountId, key, value],
+      );
+    }
     return json({ ok: true });
   } catch (err) {
     console.error('[POST /config] DB error', err);
@@ -2023,17 +2115,21 @@ async function dispatchMcpTool(
     const limitIdx = baseBinds.length + keysetBinds.length + scopeBinds.length + 1;
 
     const SQL = `
-      SELECT id, tg_message_id, tg_chat_id, chat_name, chat_type,
-             sender_id, sender_username, sender_first_name, sender_last_name,
-             message_type, text, media_type,
-             reply_to_message_id, forwarded_from_name, sent_at
-      FROM messages
-      WHERE account_id = $1
-        AND tg_chat_id = $2
-        AND is_deleted = 0
+      SELECT m.id, m.tg_message_id, m.tg_chat_id, m.chat_name, m.chat_type,
+             m.sender_id,
+             COALESCE(m.sender_username, c.username) AS sender_username,
+             COALESCE(m.sender_first_name, c.first_name) AS sender_first_name,
+             COALESCE(m.sender_last_name, c.last_name) AS sender_last_name,
+             m.message_type, m.text, m.media_type,
+             m.reply_to_message_id, m.forwarded_from_name, m.sent_at
+      FROM messages m
+      LEFT JOIN contacts c ON c.account_id = m.account_id AND c.tg_user_id = m.sender_id
+      WHERE m.account_id = $1
+        AND m.tg_chat_id = $2
+        AND m.is_deleted = 0
         ${keysetClause}
         ${scopeClause}
-      ORDER BY sent_at ASC, id ASC
+      ORDER BY m.sent_at ASC, m.id ASC
       LIMIT $${limitIdx}
     `.trim();
 
@@ -2894,6 +2990,10 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
     return handleSearch(request, env, accountId);
   }
 
+  if (method === 'GET' && pathname === '/history') {
+    return handleHistory(request, env, accountId);
+  }
+
   if (method === 'GET' && pathname === '/stats') {
     return handleStats(request, env, accountId);
   }
@@ -3039,6 +3139,156 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
       token_label: r.token_label ?? null,
     })));
   }
+
+  if (method === 'POST' && pathname === '/jobs') {
+    let body: unknown;
+    try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
+    const b = body as Record<string, unknown>;
+    if (typeof b.name !== 'string' || !b.name.trim()) return json({ ok: false, error: 'name is required' }, 400);
+    if (typeof b.task_prompt !== 'string' || !b.task_prompt.trim()) return json({ ok: false, error: 'task_prompt is required' }, 400);
+    if (typeof b.model_config !== 'object' || !b.model_config) return json({ ok: false, error: 'model_config is required' }, 400);
+    const mc = b.model_config as Record<string, unknown>;
+    if (typeof mc.provider !== 'string' || !mc.provider) return json({ ok: false, error: 'model_config.provider is required' }, 400);
+    if (typeof mc.model !== 'string' || !mc.model) return json({ ok: false, error: 'model_config.model is required' }, 400);
+    if (typeof mc.api_key_ref !== 'string' || !mc.api_key_ref) return json({ ok: false, error: 'model_config.api_key_ref is required' }, 400);
+    if (['INGEST_TOKEN', 'MASTER_TOKEN'].includes(mc.api_key_ref as string)) return json({ ok: false, error: 'api_key_ref cannot reference internal tokens' }, 400);
+
+    const jobName = b.name.trim();
+    const sql = getSql(env);
+    const now = Math.floor(Date.now() / 1000);
+
+    // Auto-create or reuse a default read-all+send role and a scoped token for this job
+    let roleId: bigint;
+    const existingRole = await sql(`SELECT id FROM roles WHERE name = 'job-default'`) as Array<{ id: bigint }>;
+    if (existingRole.length > 0) {
+      roleId = existingRole[0].id;
+    } else {
+      const newRole = await sql(
+        `INSERT INTO roles (name, read_mode, can_send) VALUES ('job-default', 'all', 1) RETURNING id`,
+      ) as Array<{ id: bigint }>;
+      roleId = newRole[0].id;
+    }
+
+    const rawBytes = new Uint8Array(32);
+    crypto.getRandomValues(rawBytes);
+    const rawToken = Array.from(rawBytes).map(b2 => b2.toString(16).padStart(2, '0')).join('');
+    const hash = await hashToken(rawToken);
+    const tokenRows = await sql(
+      `INSERT INTO agent_tokens (token_hash, label, created_at) VALUES ($1, $2, $3) RETURNING id`,
+      [hash, `job:${jobName}`, now],
+    ) as Array<{ id: bigint }>;
+    const tokenId = tokenRows[0].id;
+    await sql(`INSERT INTO token_account_roles (token_id, account_id, role_id) VALUES ($1, $2, $3)`, [tokenId, accountId, roleId]);
+
+    const rows = await sql(
+      `INSERT INTO jobs (account_id, name, schedule, trigger_type, model_config, task_prompt, token_id, cooldown_secs, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+      [accountId, jobName, b.schedule ?? null, b.trigger_type ?? null, JSON.stringify(b.model_config), b.task_prompt, tokenId, b.cooldown_secs ?? 3600, now],
+    ) as Array<{ id: bigint }>;
+    return json({ ok: true, job_id: rows[0].id.toString(), token: rawToken, token_note: 'Save this token — it cannot be retrieved again.' });
+  }
+
+  // ── Tokens ────────────────────────────────────────────────────────────────
+
+  if (method === 'GET' && pathname === '/tokens') {
+    const sql = getSql(env);
+    const rows = await sql(`
+      SELECT at.id, at.label, at.expires_at, at.last_used_at, at.created_at,
+             tar.account_id, r.name AS role_name,
+             r.read_mode, r.can_send, r.can_edit, r.can_delete, r.can_forward
+      FROM agent_tokens at
+      JOIN token_account_roles tar ON tar.token_id = at.id
+      JOIN roles r ON r.id = tar.role_id
+      ORDER BY at.created_at DESC, at.id, tar.account_id
+    `) as Array<Record<string, unknown>>;
+    const tokens: Record<string, Record<string, unknown>> = {};
+    for (const row of rows) {
+      const tid = (row.id as bigint).toString();
+      if (!tokens[tid]) {
+        tokens[tid] = {
+          id: tid,
+          label: row.label ?? null,
+          expires_at: row.expires_at ? Number(row.expires_at) : null,
+          last_used_at: row.last_used_at ? Number(row.last_used_at) : null,
+          created_at: Number(row.created_at),
+          accounts: [],
+        };
+      }
+      (tokens[tid].accounts as Array<Record<string, unknown>>).push({
+        account_id: row.account_id,
+        role: row.role_name,
+        read_mode: row.read_mode,
+        can_send: !!row.can_send,
+        can_edit: !!row.can_edit,
+        can_delete: !!row.can_delete,
+        can_forward: !!row.can_forward,
+      });
+    }
+    return json(Object.values(tokens));
+  }
+
+  const tokenDeleteMatch = pathname.match(/^\/tokens\/(\d+)$/);
+  if (method === 'DELETE' && tokenDeleteMatch) {
+    const tokenId = tokenDeleteMatch[1];
+    const sql = getSql(env);
+    const result = await sql(
+      `DELETE FROM agent_tokens WHERE id = $1`,
+      [BigInt(tokenId)],
+      { fullResults: true },
+    ) as { rowCount?: number };
+    if ((result.rowCount ?? 0) === 0) return json({ ok: false, error: 'Token not found' }, 404);
+    return json({ ok: true });
+  }
+
+  if (method === 'GET' && pathname === '/roles') {
+    const sql = getSql(env);
+    const rows = await sql(`
+      SELECT id, name, read_mode, can_send, can_edit, can_delete, can_forward,
+             read_labels, read_chat_ids, write_labels, write_chat_ids, write_chat_types
+      FROM roles ORDER BY name
+    `) as Array<Record<string, unknown>>;
+    return json(rows.map(r => ({
+      id: (r.id as bigint).toString(),
+      name: r.name,
+      read_mode: r.read_mode,
+      can_send: !!r.can_send,
+      can_edit: !!r.can_edit,
+      can_delete: !!r.can_delete,
+      can_forward: !!r.can_forward,
+      read_labels: r.read_labels ?? null,
+      read_chat_ids: r.read_chat_ids ?? null,
+      write_labels: r.write_labels ?? null,
+      write_chat_ids: r.write_chat_ids ?? null,
+      write_chat_types: r.write_chat_types ?? null,
+    })));
+  }
+
+  if (method === 'POST' && pathname === '/tokens') {
+    let body: unknown;
+    try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
+    const b = body as Record<string, unknown>;
+    if (typeof b.role_name !== 'string' || !b.role_name.trim()) return json({ ok: false, error: 'role_name is required' }, 400);
+    const sql = getSql(env);
+    const now = Math.floor(Date.now() / 1000);
+    const roleRows = await sql(`SELECT id FROM roles WHERE name = $1`, [b.role_name]) as Array<{ id: bigint }>;
+    if (roleRows.length === 0) return json({ ok: false, error: `Role "${b.role_name}" not found` }, 404);
+    const roleId = roleRows[0].id;
+    const tokenLabel = typeof b.label === 'string' && b.label.trim() ? b.label.trim() : null;
+    const expiresAt = typeof b.expires_at === 'number' ? b.expires_at : null;
+    const rawBytes = new Uint8Array(32);
+    crypto.getRandomValues(rawBytes);
+    const rawToken = Array.from(rawBytes).map(bv => bv.toString(16).padStart(2, '0')).join('');
+    const hash = await hashToken(rawToken);
+    const tokenRows = await sql(
+      `INSERT INTO agent_tokens (token_hash, label, expires_at, created_at) VALUES ($1, $2, $3, $4) RETURNING id`,
+      [hash, tokenLabel, expiresAt, now],
+    ) as Array<{ id: bigint }>;
+    const tokenId = tokenRows[0].id;
+    await sql(`INSERT INTO token_account_roles (token_id, account_id, role_id) VALUES ($1, $2, $3)`, [tokenId, accountId, roleId]);
+    return json({ ok: true, token: rawToken, token_id: tokenId.toString(), label: tokenLabel, role: b.role_name, note: 'Save this token now — it cannot be retrieved again.' });
+  }
+
+  // ── Jobs ──────────────────────────────────────────────────────────────────
 
   const jobToggleMatch = pathname.match(/^\/jobs\/(.+)\/toggle$/);
   if (method === 'POST' && jobToggleMatch) {
