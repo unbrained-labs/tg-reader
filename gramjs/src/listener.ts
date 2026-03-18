@@ -340,15 +340,18 @@ function buildGapMessage(raw: Api.Message, chats: Api.TypeChat[], users: Api.Typ
     if (u) chat_name = [u.firstName, u.lastName].filter(Boolean).join(' ') || undefined;
   }
 
+  const senderId = resolveSenderId(raw.fromId);
+  const senderUser = users.find((u): u is Api.User => u instanceof Api.User && String(u.id) === senderId);
+
   return {
     tg_message_id: String(raw.id), // S-1
     tg_chat_id,
     chat_type: chat_type as Message['chat_type'],
     chat_name,
-    sender_id: resolveSenderId(raw.fromId),
-    sender_username: undefined,
-    sender_first_name: undefined,
-    sender_last_name: undefined,
+    sender_id: senderId,
+    sender_username: senderUser?.username ?? undefined,
+    sender_first_name: senderUser?.firstName ?? undefined,
+    sender_last_name: senderUser?.lastName ?? undefined,
     message_type: resolveMessageType(raw),
     text: raw.message || undefined,
     media_type: resolveMediaType(raw.media ?? undefined),
@@ -495,6 +498,19 @@ async function ackOutbox(
   });
 }
 
+// Resolve a peer for sending. Tries username first (works without entity cache),
+// falls back to numeric ID (works if GramJS has interacted with this peer before).
+async function resolveEntity(client: TelegramClient, chatId: string, username?: string | null) {
+  if (username) {
+    try {
+      return await client.getEntity(`@${username}`);
+    } catch {
+      // Fall through to numeric ID
+    }
+  }
+  return await client.getEntity(chatId);
+}
+
 async function sendOutboxItem(client: TelegramClient, item: OutboxItem): Promise<void> {
   const sentAt = Math.floor(Date.now() / 1000);
   const replyTo = item.reply_to_message_id ? { replyToMsgId: item.reply_to_message_id } : {};
@@ -502,7 +518,8 @@ async function sendOutboxItem(client: TelegramClient, item: OutboxItem): Promise
   // Single-chat send
   if (item.tg_chat_id) {
     try {
-      await client.sendMessage(item.tg_chat_id, { message: item.text, ...replyTo });
+      const entity = await resolveEntity(client, item.tg_chat_id);
+      await client.sendMessage(entity, { message: item.text, ...replyTo });
       await ackOutbox(item.id, 'sent', sentAt);
       console.log(`[outbox] sent id=${item.id} chat=${item.tg_chat_id}`);
     } catch (err) {
@@ -526,7 +543,8 @@ async function sendOutboxItem(client: TelegramClient, item: OutboxItem): Promise
     const r = recipients[i];
     const text = renderTemplate(item.text, { first_name: r.first_name, last_name: r.last_name, username: r.username });
     try {
-      await client.sendMessage(r.tg_chat_id, { message: text });
+      const entity = await resolveEntity(client, r.tg_chat_id, r.username);
+      await client.sendMessage(entity, { message: text });
       results.push({ id: r.id, status: 'sent', sent_at: Math.floor(Date.now() / 1000) });
       console.log(`[outbox] mass id=${item.id} sent to ${r.tg_chat_id}`);
     } catch (err) {

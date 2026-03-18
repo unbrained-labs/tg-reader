@@ -69,6 +69,7 @@ Personal Telegram message archive. Captures all messages (sent + received) into 
 | API + MCP server | Cloudflare Workers Paid | $5/mo |
 | Database | Neon PostgreSQL (serverless) | $0–19/mo |
 | Backups | Cloudflare R2 | ~$0/mo |
+| Dashboard UI *(optional)* | Preact + Vite, served as static assets | free |
 
 ## Sync modes
 
@@ -116,6 +117,7 @@ All timestamps are Unix epoch seconds. Full-text search powered by PostgreSQL GI
 │       ├── listener.ts      live capture + outbox/actions polling
 │       ├── backfill-seed.ts enumerate dialogs → backfill_state
 │       └── backfill-run.ts  paginated getHistory() → /ingest
+├── frontend/      Optional dashboard UI (Preact + Vite)
 ├── schema.sql     PostgreSQL schema (single source of truth)
 ├── SPEC.md        Full functional specification
 └── CLAUDE.md      Agent conventions and constraints
@@ -131,3 +133,4 @@ See [docs/](docs/) for full documentation.
 3. Run `gramjs/src/auth.ts` locally → set `fly secrets set GRAMJS_SESSION=...`
 4. Deploy GramJS to Fly.io
 5. Run backfill scripts (after 1–2 days of live capture)
+6. *(Optional)* Build and deploy the dashboard UI — see [docs/setup.md#dashboard](docs/setup.md#dashboard)
