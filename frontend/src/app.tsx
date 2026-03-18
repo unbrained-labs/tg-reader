@@ -3,9 +3,10 @@ import {
   getAuth, setAuth, clearAuth, probeAuth,
   fetchStats, fetchMessages, fetchChats, fetchContacts, fetchBackfill,
   fetchJobs, toggleJob, fetchChatsConfig, fetchGlobalConfig, setGlobalConfig,
+  fetchHistory, fetchAuditLog,
   PAGE_SIZE,
   type AuthConfig, type Stats, type Message, type Chat, type Contact, type BackfillJob,
-  type Job, type ChatConfig, type GlobalConfig,
+  type Job, type ChatConfig, type GlobalConfig, type HistoryResult, type AuditEntry,
 } from './api'
 
 // ── Icons (inline SVG, zero dependency) ────────────────────────────────────
@@ -347,7 +348,7 @@ function Search() {
 }
 
 // ── Chats ─────────────────────────────────────────────────────────────────
-function Chats() {
+function Chats({ onSelectChat }: { onSelectChat: (id: string, name: string) => void }) {
   const [chats, setChats] = useState<Chat[]>([])
   const [query, setQuery] = useState('')
   const [offset, setOffset] = useState(0)
@@ -418,7 +419,8 @@ function Chats() {
                     {chats.length === 0
                       ? <tr><td colSpan={4} style="text-align:center;color:var(--text-secondary)">&gt; none</td></tr>
                       : chats.map(c => (
-                        <tr key={c.tg_chat_id}>
+                        <tr key={c.tg_chat_id} style="cursor:pointer"
+                          onClick={() => onSelectChat(c.tg_chat_id, c.chat_name || c.tg_chat_id)}>
                           <td>
                             <div style="font-weight:500">{c.chat_name || '(unnamed)'}</div>
                             <div class="muted mono" style="font-size:11px">{c.tg_chat_id}</div>
@@ -550,17 +552,91 @@ function Contacts() {
   )
 }
 
+// ── ChatView ──────────────────────────────────────────────────────────────
+function ChatView({ chat, onBack }: { chat: { id: string; name: string }; onBack: () => void }) {
+  const [messages, setMessages] = useState<Message[]>([])
+  const [nextAfterId, setNextAfterId] = useState<number | null>(null)
+  const [nextAfterSentAt, setNextAfterSentAt] = useState<number | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    fetchHistory({ chat_id: chat.id, limit: 50 })
+      .then((r: HistoryResult) => {
+        setMessages(r.messages)
+        setNextAfterId(r.next_after_id)
+        setNextAfterSentAt(r.next_after_sent_at)
+      })
+      .catch((err: any) => setError(err.message))
+      .finally(() => setLoading(false))
+  }, [chat.id])
+
+  function loadMore() {
+    if (!nextAfterId) return
+    setLoadingMore(true)
+    fetchHistory({ chat_id: chat.id, limit: 50, after_id: nextAfterId, after_sent_at: nextAfterSentAt ?? undefined })
+      .then((r: HistoryResult) => {
+        setMessages(prev => [...prev, ...r.messages])
+        setNextAfterId(r.next_after_id)
+        setNextAfterSentAt(r.next_after_sent_at)
+      })
+      .catch((err: any) => setError(err.message))
+      .finally(() => setLoadingMore(false))
+  }
+
+  if (loading) return <div class="page-content"><div class="empty-state"><span class="spinner" /></div></div>
+
+  return (
+    <>
+      <PageHeader eyebrow="// chats" title={chat.name}>
+        <button class="btn btn-ghost" style="font-size:12px" onClick={onBack}>
+          ← back
+        </button>
+      </PageHeader>
+      <div class="page-content">
+        {error && <div class="form-error">&gt; {error}</div>}
+        {messages.length === 0
+          ? <div class="empty-state"><div class="empty-state-text">&gt; no messages</div></div>
+          : messages.map(m => {
+            const sender = m.sender_username ? `@${m.sender_username}` : m.sender_first_name || m.sender_id
+            return (
+              <div key={m.id} class="message-card">
+                <div class="message-meta">
+                  <span style="font-weight:500">{sender}</span>
+                  <span style="margin-left:auto" class="muted mono">{fmtTs(m.sent_at)}</span>
+                </div>
+                <div class="message-text">{m.text || <span class="muted">[media]</span>}</div>
+              </div>
+            )
+          })
+        }
+        {nextAfterId && (
+          <button class="btn btn-ghost" style="width:100%;justify-content:center;margin-top:8px"
+            onClick={loadMore} disabled={loadingMore}>
+            {loadingMore ? <span class="spinner" /> : '// load more'}
+          </button>
+        )}
+      </div>
+    </>
+  )
+}
+
 // ── Automation ────────────────────────────────────────────────────────────
 function Automation() {
   const [jobs, setJobs] = useState<Job[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [toggling, setToggling] = useState<string | null>(null)
+  const [auditTab, setAuditTab] = useState<'jobs' | 'activity'>('jobs')
+  const [auditLog, setAuditLog] = useState<AuditEntry[]>([])
+  const [auditLoading, setAuditLoading] = useState(false)
+  const [auditError, setAuditError] = useState('')
 
   useEffect(() => {
     fetchJobs()
       .then(setJobs)
-      .catch(err => setError(err.message))
+      .catch((err: any) => setError(err.message))
       .finally(() => setLoading(false))
   }, [])
 
@@ -576,58 +652,120 @@ function Automation() {
     }
   }
 
+  function switchTab(t: 'jobs' | 'activity') {
+    setAuditTab(t)
+    if (t === 'activity' && auditLog.length === 0 && !auditLoading) {
+      setAuditLoading(true)
+      fetchAuditLog()
+        .then(setAuditLog)
+        .catch((err: any) => setAuditError(err.message))
+        .finally(() => setAuditLoading(false))
+    }
+  }
+
+  const actionBadge = (a: string) => ({
+    send: 'badge-success',
+    edit: 'badge-accent',
+    delete: 'badge-error',
+    forward: 'badge-neutral',
+  } as Record<string, string>)[a] ?? 'badge-neutral'
+
   if (loading) return <div class="page-content"><div class="empty-state"><span class="spinner" /></div></div>
 
   return (
     <>
       <PageHeader eyebrow="// automation" title="Observer Jobs" />
-      <div class="page-content">
-        {error && <div class="form-error">&gt; {error}</div>}
-        {jobs.length === 0
-          ? <div class="empty-state"><div class="empty-state-text">&gt; no jobs — create one via Claude MCP</div></div>
-          : (
-            <div class="table-wrap">
-              <table class="table">
-                <thead>
-                  <tr>
-                    <th>Job</th>
-                    <th>Trigger</th>
-                    <th>Last Run</th>
-                    <th>Token</th>
-                    <th>Enabled</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {jobs.map(j => (
-                    <tr key={j.id}>
-                      <td>
-                        <div style="font-weight:500">{j.name}</div>
-                        {j.schedule && <div class="muted mono" style="font-size:11px">{j.schedule}</div>}
-                      </td>
-                      <td>
-                        {j.trigger_type
-                          ? <span class="badge badge-accent">{j.trigger_type}</span>
-                          : <span class="muted mono">—</span>}
-                      </td>
-                      <td class="muted mono">{j.last_run_at ? fmtTs(j.last_run_at) : '—'}</td>
-                      <td class="muted mono" style="font-size:11px">{j.token_label ?? '—'}</td>
-                      <td>
-                        <button
-                          class={`btn ${j.enabled ? 'btn-primary' : 'btn-ghost'}`}
-                          style="padding:4px 10px;font-size:11px"
-                          onClick={() => handleToggle(j)}
-                          disabled={toggling === j.name}
-                        >
-                          {toggling === j.name ? <span class="spinner" /> : j.enabled ? 'on' : 'off'}
-                        </button>
-                      </td>
+      <div class="page-content" style="padding-top:0;gap:0">
+        <div class="filter-bar">
+          <button class={`filter-tab${auditTab === 'jobs' ? ' active' : ''}`} onClick={() => switchTab('jobs')}>
+            // jobs
+          </button>
+          <button class={`filter-tab${auditTab === 'activity' ? ' active' : ''}`} onClick={() => switchTab('activity')}>
+            // activity
+          </button>
+        </div>
+        <div style="height:24px" />
+        {error && <div class="form-error" style="margin-bottom:16px">&gt; {error}</div>}
+
+        {auditTab === 'jobs' && (
+          jobs.length === 0
+            ? <div class="empty-state"><div class="empty-state-text">&gt; no jobs — create one via Claude MCP</div></div>
+            : (
+              <div class="table-wrap">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>Job</th>
+                      <th>Trigger</th>
+                      <th>Last Run</th>
+                      <th>Token</th>
+                      <th>Enabled</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )
-        }
+                  </thead>
+                  <tbody>
+                    {jobs.map(j => (
+                      <tr key={j.id}>
+                        <td>
+                          <div style="font-weight:500">{j.name}</div>
+                          {j.schedule && <div class="muted mono" style="font-size:11px">{j.schedule}</div>}
+                        </td>
+                        <td>
+                          {j.trigger_type
+                            ? <span class="badge badge-accent">{j.trigger_type}</span>
+                            : <span class="muted mono">—</span>}
+                        </td>
+                        <td class="muted mono">{j.last_run_at ? fmtTs(j.last_run_at) : '—'}</td>
+                        <td class="muted mono" style="font-size:11px">{j.token_label ?? '—'}</td>
+                        <td>
+                          <button
+                            class={`btn ${j.enabled ? 'btn-primary' : 'btn-ghost'}`}
+                            style="padding:4px 10px;font-size:11px"
+                            onClick={() => handleToggle(j)}
+                            disabled={toggling === j.name}
+                          >
+                            {toggling === j.name ? <span class="spinner" /> : j.enabled ? 'on' : 'off'}
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )
+        )}
+
+        {auditTab === 'activity' && (
+          auditLoading
+            ? <div class="empty-state"><span class="spinner" /></div>
+            : auditError
+              ? <div class="form-error">&gt; {auditError}</div>
+              : auditLog.length === 0
+                ? <div class="empty-state"><div class="empty-state-text">&gt; no activity</div></div>
+                : (
+                  <div class="table-wrap">
+                    <table class="table">
+                      <thead>
+                        <tr>
+                          <th>Action</th>
+                          <th>Chat</th>
+                          <th>Token</th>
+                          <th>Time</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {auditLog.map(e => (
+                          <tr key={e.id}>
+                            <td><span class={`badge ${actionBadge(e.action)}`}>{e.action}</span></td>
+                            <td class="mono muted" style="font-size:11px">{e.target_chat_id ?? '—'}</td>
+                            <td class="mono muted" style="font-size:11px">{e.token_label ?? '—'}</td>
+                            <td class="muted mono">{fmtTs(e.created_at)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )
+        )}
       </div>
     </>
   )
@@ -791,10 +929,16 @@ function Config() {
 export function App() {
   const [authed, setAuthed] = useState(() => !!getAuth())
   const [screen, setScreen] = useState<Screen>('overview')
+  const [selectedChat, setSelectedChat] = useState<{ id: string; name: string } | null>(null)
 
   function onLogout() {
     clearAuth()
     setAuthed(false)
+  }
+
+  function onNav(s: Screen) {
+    setScreen(s)
+    setSelectedChat(null)
   }
 
   if (!authed) {
@@ -803,21 +947,34 @@ export function App() {
 
   const accountId = getAuth()?.accountId ?? 'primary'
 
-  const screens: Record<Screen, any> = {
-    overview:   Overview,
-    search:     Search,
-    chats:      Chats,
-    contacts:   Contacts,
-    automation: Automation,
-    config:     Config,
+  if (selectedChat) {
+    return (
+      <div class="layout">
+        <Sidebar screen={screen} onNav={onNav} onLogout={onLogout} accountId={accountId} />
+        <main class="main">
+          <ChatView chat={selectedChat} onBack={() => setSelectedChat(null)} />
+        </main>
+      </div>
+    )
   }
-  const CurrentScreen = screens[screen]
+
+  function renderScreen() {
+    switch (screen) {
+      case 'chats':
+        return <Chats onSelectChat={(id, name) => setSelectedChat({ id, name })} />
+      case 'overview':   return <Overview />
+      case 'search':     return <Search />
+      case 'contacts':   return <Contacts />
+      case 'automation': return <Automation />
+      case 'config':     return <Config />
+    }
+  }
 
   return (
     <div class="layout">
-      <Sidebar screen={screen} onNav={setScreen} onLogout={onLogout} accountId={accountId} />
+      <Sidebar screen={screen} onNav={onNav} onLogout={onLogout} accountId={accountId} />
       <main class="main">
-        <CurrentScreen />
+        {renderScreen()}
       </main>
     </div>
   )

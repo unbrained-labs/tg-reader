@@ -57,6 +57,44 @@ export interface Stats {
 
 export const fetchStats = () => req<Stats>('/stats');
 
+// ── History ────────────────────────────────────────────────────────────────
+export interface HistoryResult {
+  messages: Message[];
+  next_after_id: number | null;
+  next_after_sent_at: number | null;
+}
+
+export function fetchHistory(params: {
+  chat_id: string;
+  limit?: number;
+  after_id?: number;
+  after_sent_at?: number;
+}) {
+  const p = new URLSearchParams();
+  p.set('chat_id', params.chat_id);
+  p.set('limit', String(params.limit ?? 50));
+  if (params.after_id) p.set('after_id', String(params.after_id));
+  if (params.after_sent_at) p.set('after_sent_at', String(params.after_sent_at));
+  return req<HistoryResult>(`/history?${p}`);
+}
+
+// ── Audit Log ───────────────────────────────────────────────────────────────
+export interface AuditEntry {
+  id: string;
+  action: 'send' | 'edit' | 'delete' | 'forward';
+  target_chat_id: string | null;
+  detail: string | null;
+  token_label: string | null;
+  created_at: number;
+}
+
+export function fetchAuditLog(params: { limit?: number; offset?: number } = {}) {
+  const p = new URLSearchParams();
+  p.set('limit', String(params.limit ?? 50));
+  if (params.offset) p.set('offset', String(params.offset));
+  return req<AuditEntry[]>(`/audit-log?${p}`);
+}
+
 // ── Search ─────────────────────────────────────────────────────────────────
 export interface Message {
   id: number;

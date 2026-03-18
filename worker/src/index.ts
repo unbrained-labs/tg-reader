@@ -2993,6 +2993,30 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
     return handleAckAction(parseInt(actionAckMatch[1], 10), request, env, accountId);
   }
 
+  if (method === 'GET' && pathname === '/audit-log') {
+    const url = new URL(request.url);
+    const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '50', 10) || 50, 200);
+    const offset = parseInt(url.searchParams.get('offset') ?? '0', 10) || 0;
+    const sql = getSql(env);
+    const rows = await sql(`
+      SELECT al.id, al.action, al.target_chat_id, al.detail, al.created_at,
+             at.label AS token_label
+      FROM audit_log al
+      LEFT JOIN agent_tokens at ON at.id = al.token_id
+      WHERE al.account_id = $1
+      ORDER BY al.created_at DESC
+      LIMIT $2 OFFSET $3
+    `, [accountId, limit, offset]) as Array<Record<string, unknown>>;
+    return json(rows.map(r => ({
+      id: (r.id as bigint).toString(),
+      action: r.action,
+      target_chat_id: r.target_chat_id ?? null,
+      detail: r.detail ?? null,
+      token_label: r.token_label ?? null,
+      created_at: Number(r.created_at),
+    })));
+  }
+
   if (method === 'GET' && pathname === '/jobs') {
     const sql = getSql(env);
     const rows = await sql(`
