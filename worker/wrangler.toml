@@ -9,6 +9,9 @@ bucket_name = "tg-reader-backup"
 [assets]
 directory = "./public"
 
+[ai]
+binding = "AI"
+
 [triggers]
 crons = ["0 3 * * *", "0 4 1 * *", "*/15 * * * *"]
 #        daily backup   monthly chk   observer job runner

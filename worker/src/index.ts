@@ -1989,7 +1989,7 @@ const MCP_TOOL_DEFINITIONS = [
         schedule: { type: 'string', description: 'Optional. Stored for reference only — cron expression evaluation is not yet implemented. The actual run frequency is controlled by cooldown_secs and the 15-minute cron tick. At least one of schedule or trigger_type is required.' },
         trigger_type: { type: 'string', enum: ['new_message', 'keyword', 'unanswered'], description: 'Optional. Trigger condition type.' },
         trigger_config: { type: 'object', description: 'Optional. Config for the trigger (chat_id, label, keywords, hours).' },
-        model_config: { type: 'object', description: 'BYOM config: { provider, model, api_key_ref, endpoint? }. provider="anthropic" or "openai".' },
+        model_config: { type: 'object', description: 'BYOM config: { provider, model, api_key_ref?, endpoint? }. provider="anthropic", "openai", or "cloudflare-ai". For cloudflare-ai, omit api_key_ref — uses the built-in Workers AI binding (no extra cost, no API key). Recommended free model: @cf/meta/llama-3.3-70b-instruct-fp8-fast.' },
         task_prompt: { type: 'string', description: 'Task prompt for the agent. Supports {chat_name}, {chat_id}, {sender}, {snippet}, {timestamp}, {account_id} variables.' },
         role: { type: 'string', description: 'Role name. A scoped token will be auto-created for this job.' },
         cooldown_secs: { type: 'number', description: 'Minimum seconds between runs (default 3600). Prevents repeated firing on active chats.' },
@@ -2295,6 +2295,48 @@ async function dispatchMcpTool(
 
   if (name === 'send' || name === 'draft') {
     if (typeof args.text !== 'string' || !args.text.trim()) throw new Error('text is required');
+
+    // Mass send limits — enforced for both send and draft
+    if (Array.isArray(args.recipients) && args.recipients.length > 0) {
+      const rawRecipients = args.recipients as Array<Record<string, unknown>>;
+
+      // Read limits from global_config (both in one query)
+      const cfgRows = await getSql(env)(
+        `SELECT key, value FROM global_config WHERE account_id = 'global' AND key IN ('mass_send_max_recipients', 'mass_send_contacts_only')`,
+        [],
+      ) as Array<{ key: string; value: string }>;
+      const cfgMap = new Map(cfgRows.map(r => [r.key, r.value]));
+      const maxRecipients = parseInt(cfgMap.get('mass_send_max_recipients') ?? '25', 10);
+      if (!Number.isFinite(maxRecipients) || maxRecipients < 1) {
+        throw new Error(`global_config mass_send_max_recipients is invalid ('${cfgMap.get('mass_send_max_recipients')}'). Must be a positive integer.`);
+      }
+      const contactsOnly = (cfgMap.get('mass_send_contacts_only') ?? '1') !== '0';
+
+      if (rawRecipients.length > maxRecipients) {
+        throw new Error(`Mass send capped at ${maxRecipients} recipients (got ${rawRecipients.length}). Adjust mass_send_max_recipients in global_config to change this limit.`);
+      }
+
+      // Always require tg_chat_id on every recipient — hallucinated/incomplete data rejected regardless of contactsOnly
+      const chatIds = rawRecipients.map(r => r.tg_chat_id as string).filter(Boolean);
+      if (chatIds.length < rawRecipients.length) {
+        const missing = rawRecipients.length - chatIds.length;
+        throw new Error(`${missing} recipient(s) have no tg_chat_id. Every recipient must include a tg_chat_id.`);
+      }
+
+      if (contactsOnly) {
+        // For DMs tg_chat_id equals the user's Telegram ID, which is what contacts.tg_user_id stores.
+        // contacts.account_id must match the account used during contact sync (GramJS getMe()).
+        const known = await getSql(env)(
+          `SELECT tg_user_id FROM contacts WHERE account_id = $1 AND tg_user_id = ANY($2::text[])`,
+          [accountId, chatIds],
+        ) as Array<{ tg_user_id: string }>;
+        const knownSet = new Set(known.map(c => c.tg_user_id));
+        const unknowns = chatIds.filter(id => !knownSet.has(id));
+        if (unknowns.length > 0) {
+          throw new Error(`mass_send_contacts_only is enabled. Recipients not in contacts: ${unknowns.join(', ')}. Set mass_send_contacts_only=0 in global_config to allow non-contacts.`);
+        }
+      }
+    }
 
     // Write permission check (send only — drafts are not writes until promoted)
     if (name === 'send') {
@@ -2712,8 +2754,10 @@ async function dispatchMcpTool(
       const mc = args.model_config as Record<string, unknown>;
       if (typeof mc.provider !== 'string' || !mc.provider) throw new Error('model_config.provider is required');
       if (typeof mc.model !== 'string' || !mc.model) throw new Error('model_config.model is required');
-      if (typeof mc.api_key_ref !== 'string' || !mc.api_key_ref) throw new Error('model_config.api_key_ref is required');
-      if (['INGEST_TOKEN', 'MASTER_TOKEN'].includes(mc.api_key_ref as string)) throw new Error('model_config.api_key_ref cannot reference internal Worker secrets');
+      if (mc.provider !== 'cloudflare-ai') {
+        if (typeof mc.api_key_ref !== 'string' || !mc.api_key_ref) throw new Error('model_config.api_key_ref is required (omit only for cloudflare-ai provider)');
+        if (['INGEST_TOKEN', 'MASTER_TOKEN'].includes(mc.api_key_ref as string)) throw new Error('model_config.api_key_ref cannot reference internal Worker secrets');
+      }
 
       const modelConfigStr = JSON.stringify(args.model_config);
       const triggerConfigStr = args.trigger_config ? JSON.stringify(args.trigger_config) : null;
@@ -2814,8 +2858,10 @@ async function dispatchMcpTool(
         const umc = args.model_config as Record<string, unknown>;
         if (typeof umc.provider !== 'string' || !umc.provider) throw new Error('model_config.provider is required');
         if (typeof umc.model !== 'string' || !umc.model) throw new Error('model_config.model is required');
-        if (typeof umc.api_key_ref !== 'string' || !umc.api_key_ref) throw new Error('model_config.api_key_ref is required');
-        if (['INGEST_TOKEN', 'MASTER_TOKEN'].includes(umc.api_key_ref as string)) throw new Error('model_config.api_key_ref cannot reference internal Worker secrets');
+        if (umc.provider !== 'cloudflare-ai') {
+          if (typeof umc.api_key_ref !== 'string' || !umc.api_key_ref) throw new Error('model_config.api_key_ref is required (omit only for cloudflare-ai provider)');
+          if (['INGEST_TOKEN', 'MASTER_TOKEN'].includes(umc.api_key_ref as string)) throw new Error('model_config.api_key_ref cannot reference internal Worker secrets');
+        }
         updates.push(`model_config = $${n}`); binds.push(JSON.stringify(args.model_config)); n++;
       }
       if ('cooldown_secs' in args) { updates.push(`cooldown_secs = $${n}`); binds.push(args.cooldown_secs); n++; }
@@ -3727,6 +3773,34 @@ async function callModel(
 ): Promise<ModelResponse> {
   const provider = typeof modelConfig.provider === 'string' ? modelConfig.provider : 'openai';
   const model = typeof modelConfig.model === 'string' ? modelConfig.model : 'gpt-4o';
+
+  // Cloudflare Workers AI — uses env.AI binding, no API key needed
+  if (provider === 'cloudflare-ai') {
+    const cfTools = tools.map(t => ({
+      type: 'function' as const,
+      function: { name: t.name, description: t.description, parameters: t.inputSchema },
+    }));
+    const res = await env.AI.run(
+      model as Parameters<typeof env.AI.run>[0],
+      { messages: toOpenAIMessages(messages), tools: cfTools } as AiTextGenerationInput,
+    ) as { response?: string | null; tool_calls?: Array<{ name: string; arguments: string | Record<string, unknown> }> };
+
+    const toolCalls = (res.tool_calls ?? []).map((tc, i) => {
+      let args: Record<string, unknown> = {};
+      if (typeof tc.arguments === 'string') {
+        try { args = JSON.parse(tc.arguments) as Record<string, unknown>; } catch { console.warn(`[jobs] cloudflare-ai: failed to parse tool arguments for "${tc.name}":`, tc.arguments); }
+      } else if (tc.arguments && typeof tc.arguments === 'object') {
+        args = tc.arguments as Record<string, unknown>;
+      }
+      return { id: `cf-${i}`, name: tc.name, args };
+    });
+    return {
+      stop_reason: toolCalls.length > 0 ? 'tool_use' : 'end_turn',
+      content: res.response ?? '',
+      tool_calls: toolCalls,
+    };
+  }
+
   const apiKeyRef = typeof modelConfig.api_key_ref === 'string' ? modelConfig.api_key_ref : null;
   const apiKey = apiKeyRef ? ((env as unknown as Record<string, string>)[apiKeyRef] ?? '') : '';
   if (!apiKey) throw new Error(`api_key_ref "${apiKeyRef ?? '(none)'}" is not set in Worker environment`);
