@@ -146,6 +146,52 @@ export interface BackfillJob {
 export const fetchBackfill = () =>
   req<BackfillJob[]>('/backfill/pending?all=1');
 
+// ── Jobs ───────────────────────────────────────────────────────────────────
+export interface Job {
+  id: string;
+  name: string;
+  enabled: boolean;
+  schedule: string | null;
+  trigger_type: string | null;
+  last_run_at: number | null;  // unix epoch seconds
+  cooldown_secs: number;
+  token_label: string | null;
+}
+
+export const fetchJobs = () => req<Job[]>('/jobs');
+
+export function toggleJob(name: string, enabled: boolean) {
+  return req<{ ok: boolean; enabled: boolean }>(`/jobs/${encodeURIComponent(name)}/toggle`, {
+    method: 'POST',
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+// ── Chat Config ─────────────────────────────────────────────────────────────
+export interface ChatConfig {
+  tg_chat_id: string;
+  chat_name: string | null;
+  sync: 'include' | 'exclude' | null;
+  label: string | null;
+  updated_at: number;
+}
+
+export const fetchChatsConfig = () => req<ChatConfig[]>('/chats/config');
+
+// ── Global Config ───────────────────────────────────────────────────────────
+export interface GlobalConfig {
+  sync_mode: 'all' | 'whitelist' | 'blacklist' | 'none';
+}
+
+export const fetchGlobalConfig = () => req<GlobalConfig>('/config');
+
+export function setGlobalConfig(data: Partial<GlobalConfig>) {
+  return req<{ ok: boolean }>('/config', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
 // ── Auth probe ─────────────────────────────────────────────────────────────
 export async function probeAuth(cfg: AuthConfig): Promise<void> {
   const url = `${cfg.workerUrl.replace(/\/$/, '')}/stats`;

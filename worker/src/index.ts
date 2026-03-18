@@ -2993,6 +2993,45 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
     return handleAckAction(parseInt(actionAckMatch[1], 10), request, env, accountId);
   }
 
+  if (method === 'GET' && pathname === '/jobs') {
+    const sql = getSql(env);
+    const rows = await sql(`
+      SELECT j.id, j.name, j.enabled, j.schedule, j.trigger_type,
+             j.last_run_at, j.cooldown_secs, j.created_at,
+             at.label AS token_label
+      FROM jobs j
+      LEFT JOIN agent_tokens at ON at.id = j.token_id
+      WHERE j.account_id = $1
+      ORDER BY j.name
+    `, [accountId]) as Array<Record<string, unknown>>;
+    return json(rows.map(r => ({
+      id: (r.id as bigint).toString(),
+      name: r.name,
+      enabled: !!r.enabled,
+      schedule: r.schedule ?? null,
+      trigger_type: r.trigger_type ?? null,
+      last_run_at: r.last_run_at ? Number(r.last_run_at) : null,
+      cooldown_secs: r.cooldown_secs,
+      token_label: r.token_label ?? null,
+    })));
+  }
+
+  const jobToggleMatch = pathname.match(/^\/jobs\/(.+)\/toggle$/);
+  if (method === 'POST' && jobToggleMatch) {
+    const jobName = decodeURIComponent(jobToggleMatch[1]);
+    let body: unknown;
+    try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid JSON body' }, 400); }
+    const enabled = (body as Record<string, unknown>).enabled !== false ? 1 : 0;
+    const sql = getSql(env);
+    const result = await sql(
+      `UPDATE jobs SET enabled = $1 WHERE account_id = $2 AND name = $3`,
+      [enabled, accountId, jobName],
+      { fullResults: true },
+    ) as { rowCount?: number };
+    if ((result.rowCount ?? 0) === 0) return json({ ok: false, error: `Job "${jobName}" not found` }, 404);
+    return json({ ok: true, enabled: !!enabled });
+  }
+
   return json({ ok: false, error: 'Not Found' }, 404);
 }
 

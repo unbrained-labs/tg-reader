@@ -2,8 +2,10 @@ import { useState, useEffect, useCallback } from 'preact/hooks'
 import {
   getAuth, setAuth, clearAuth, probeAuth,
   fetchStats, fetchMessages, fetchChats, fetchContacts, fetchBackfill,
+  fetchJobs, toggleJob, fetchChatsConfig, fetchGlobalConfig, setGlobalConfig,
   PAGE_SIZE,
   type AuthConfig, type Stats, type Message, type Chat, type Contact, type BackfillJob,
+  type Job, type ChatConfig, type GlobalConfig,
 } from './api'
 
 // ── Icons (inline SVG, zero dependency) ────────────────────────────────────
@@ -15,15 +17,16 @@ const Icon = ({ d, size = 16 }: { d: string; size?: number }) => (
 )
 
 const icons = {
-  overview: 'M3 3h7v7H3zm11 0h7v7h-7zM3 14h7v7H3zm11 3h7m-3.5-3.5v7',
-  search:   'M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z',
-  chats:    'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z',
-  contacts: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zm8 4v6m3-3h-6',
-  backfill: 'M4 4v5h.582m15.356 2A8.001 8.001 0 0 0 4.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 0 1-15.357-2m15.357 2H15',
-  logout:   'M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3h4a3 3 0 0 1 3 3v1',
+  overview:   'M3 3h7v7H3zm11 0h7v7h-7zM3 14h7v7H3zm11 3h7m-3.5-3.5v7',
+  search:     'M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z',
+  chats:      'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z',
+  contacts:   'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zm8 4v6m3-3h-6',
+  automation: 'M12 2a10 10 0 1 0 0 20A10 10 0 0 0 12 2zm0 6v4l3 3m6-3a9 9 0 1 1-18 0 9 9 0 0 1 18 0z',
+  config:     'M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 0 0-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 0 0-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 0 0-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 0 0-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 0 0 1.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0z',
+  logout:     'M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3h4a3 3 0 0 1 3 3v1',
 }
 
-type Screen = 'overview' | 'search' | 'chats' | 'contacts' | 'backfill'
+type Screen = 'overview' | 'search' | 'chats' | 'contacts' | 'automation' | 'config'
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 function fmtNum(n: number) {
@@ -134,11 +137,12 @@ function Sidebar({ screen, onNav, onLogout, accountId }: {
   accountId: string
 }) {
   const navItems: Array<{ id: Screen; label: string; icon: keyof typeof icons }> = [
-    { id: 'overview', label: '// overview', icon: 'overview' },
-    { id: 'search',   label: '// search',   icon: 'search' },
-    { id: 'chats',    label: '// chats',    icon: 'chats' },
-    { id: 'contacts', label: '// contacts', icon: 'contacts' },
-    { id: 'backfill', label: '// backfill', icon: 'backfill' },
+    { id: 'overview',   label: '// overview',   icon: 'overview' },
+    { id: 'search',     label: '// search',     icon: 'search' },
+    { id: 'chats',      label: '// chats',      icon: 'chats' },
+    { id: 'contacts',   label: '// contacts',   icon: 'contacts' },
+    { id: 'automation', label: '// automation', icon: 'automation' },
+    { id: 'config',     label: '// config',     icon: 'config' },
   ]
 
   return (
@@ -546,94 +550,238 @@ function Contacts() {
   )
 }
 
-// ── Backfill ─────────────────────────────────────────────────────────────
-function Backfill() {
-  const [jobs, setJobs] = useState<BackfillJob[]>([])
-  const [filter, setFilter] = useState<string>('all')
+// ── Automation ────────────────────────────────────────────────────────────
+function Automation() {
+  const [jobs, setJobs] = useState<Job[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [toggling, setToggling] = useState<string | null>(null)
 
   useEffect(() => {
-    fetchBackfill()
-      .then(r => setJobs(r))
+    fetchJobs()
+      .then(setJobs)
       .catch(err => setError(err.message))
       .finally(() => setLoading(false))
   }, [])
 
-  const tabs = ['all', 'pending', 'in_progress', 'complete', 'failed']
-
-  const filtered = jobs.filter(j => filter === 'all' || j.status === filter)
-
-  const statusBadge = (s: string) => {
-    const map: Record<string, string> = {
-      pending: 'badge-neutral',
-      in_progress: 'badge-accent',
-      complete: 'badge-success',
-      failed: 'badge-error',
+  async function handleToggle(job: Job) {
+    setToggling(job.name)
+    try {
+      await toggleJob(job.name, !job.enabled)
+      setJobs(prev => prev.map(j => j.name === job.name ? { ...j, enabled: !j.enabled } : j))
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setToggling(null)
     }
-    return map[s] ?? 'badge-neutral'
   }
 
   if (loading) return <div class="page-content"><div class="empty-state"><span class="spinner" /></div></div>
 
   return (
     <>
-      <PageHeader eyebrow="// backfill" title="Backfill Jobs" />
-      <div class="page-content" style="padding-top:0;gap:0">
-        <div class="filter-bar">
-          {tabs.map(t => (
-            <button key={t} class={`filter-tab${filter === t ? ' active' : ''}`} onClick={() => setFilter(t)}>
-              {t === 'all' ? '// all' : t.replace('_', ' ')}
-            </button>
-          ))}
-        </div>
-        <div style="height:24px" />
-        {error && <div class="form-error" style="margin-bottom:16px">&gt; {error}</div>}
-        {filtered.length === 0
-          ? <div class="empty-state"><div class="empty-state-text">&gt; no jobs</div></div>
+      <PageHeader eyebrow="// automation" title="Observer Jobs" />
+      <div class="page-content">
+        {error && <div class="form-error">&gt; {error}</div>}
+        {jobs.length === 0
+          ? <div class="empty-state"><div class="empty-state-text">&gt; no jobs — create one via Claude MCP</div></div>
           : (
             <div class="table-wrap">
               <table class="table">
                 <thead>
                   <tr>
-                    <th>Chat</th>
-                    <th>Status</th>
-                    <th>Progress</th>
-                    <th>Messages</th>
+                    <th>Job</th>
+                    <th>Trigger</th>
+                    <th>Last Run</th>
+                    <th>Token</th>
+                    <th>Enabled</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map(j => {
-                    const pct = j.total_messages > 0
-                      ? Math.round((j.fetched_messages / j.total_messages) * 100)
-                      : 0
-                    return (
-                      <tr key={j.tg_chat_id}>
-                        <td>
-                          <div style="font-weight:500">{j.chat_name || '(unnamed)'}</div>
-                          <div class="muted mono" style="font-size:11px">{j.tg_chat_id}</div>
-                        </td>
-                        <td><span class={`badge ${statusBadge(j.status)}`}>{j.status.replace('_', ' ')}</span></td>
-                        <td style="min-width:160px">
-                          <div class="progress-wrap">
-                            <div class="progress-bar-bg">
-                              <div class="progress-bar-fill" style={{ width: `${pct}%` }} />
-                            </div>
-                            <div class="progress-label">{pct}%</div>
-                          </div>
-                        </td>
-                        <td class="mono">
-                          <span class="accent">{fmtNum(j.fetched_messages)}</span>
-                          <span class="muted"> / {fmtNum(j.total_messages)}</span>
-                        </td>
-                      </tr>
-                    )
-                  })}
+                  {jobs.map(j => (
+                    <tr key={j.id}>
+                      <td>
+                        <div style="font-weight:500">{j.name}</div>
+                        {j.schedule && <div class="muted mono" style="font-size:11px">{j.schedule}</div>}
+                      </td>
+                      <td>
+                        {j.trigger_type
+                          ? <span class="badge badge-accent">{j.trigger_type}</span>
+                          : <span class="muted mono">—</span>}
+                      </td>
+                      <td class="muted mono">{j.last_run_at ? fmtTs(j.last_run_at) : '—'}</td>
+                      <td class="muted mono" style="font-size:11px">{j.token_label ?? '—'}</td>
+                      <td>
+                        <button
+                          class={`btn ${j.enabled ? 'btn-primary' : 'btn-ghost'}`}
+                          style="padding:4px 10px;font-size:11px"
+                          onClick={() => handleToggle(j)}
+                          disabled={toggling === j.name}
+                        >
+                          {toggling === j.name ? <span class="spinner" /> : j.enabled ? 'on' : 'off'}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>
           )
         }
+      </div>
+    </>
+  )
+}
+
+// ── Config ────────────────────────────────────────────────────────────────
+function Config() {
+  const [tab, setTab] = useState<'global' | 'chats' | 'system'>('global')
+  const [globalConfig, setGlobalConfigState] = useState<GlobalConfig | null>(null)
+  const [chatConfigs, setChatConfigs] = useState<ChatConfig[]>([])
+  const [backfillJobs, setBackfillJobs] = useState<BackfillJob[]>([])
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    Promise.all([fetchGlobalConfig(), fetchChatsConfig(), fetchBackfill()])
+      .then(([gc, cc, bf]) => {
+        setGlobalConfigState(gc)
+        setChatConfigs(cc)
+        setBackfillJobs(bf)
+      })
+      .catch(err => setError(err.message))
+      .finally(() => setLoading(false))
+  }, [])
+
+  async function saveSyncMode(mode: string) {
+    setSaving(true)
+    setSaved(false)
+    try {
+      await setGlobalConfig({ sync_mode: mode as GlobalConfig['sync_mode'] })
+      setGlobalConfigState(prev => prev ? { ...prev, sync_mode: mode as GlobalConfig['sync_mode'] } : prev)
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (loading) return <div class="page-content"><div class="empty-state"><span class="spinner" /></div></div>
+
+  const tabs: Array<{ id: 'global' | 'chats' | 'system'; label: string }> = [
+    { id: 'global', label: '// global' },
+    { id: 'chats',  label: '// chat config' },
+    { id: 'system', label: '// system' },
+  ]
+
+  const backfillSummary = {
+    total:    backfillJobs.length,
+    complete: backfillJobs.filter(j => j.status === 'complete').length,
+    pending:  backfillJobs.filter(j => j.status === 'pending' || j.status === 'in_progress').length,
+    failed:   backfillJobs.filter(j => j.status === 'failed').length,
+  }
+
+  return (
+    <>
+      <PageHeader eyebrow="// config" title="Configuration" />
+      <div class="page-content" style="padding-top:0;gap:0">
+        <div class="filter-bar">
+          {tabs.map(t => (
+            <button key={t.id} class={`filter-tab${tab === t.id ? ' active' : ''}`} onClick={() => setTab(t.id)}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+        <div style="height:24px" />
+        {error && <div class="form-error" style="margin-bottom:16px">&gt; {error}</div>}
+
+        {tab === 'global' && globalConfig && (
+          <section class="section">
+            <div class="section-label">Sync Mode</div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              {(['all', 'whitelist', 'blacklist', 'none'] as const).map(mode => (
+                <button
+                  key={mode}
+                  class={`btn ${globalConfig.sync_mode === mode ? 'btn-primary' : 'btn-ghost'}`}
+                  style="font-size:12px"
+                  onClick={() => saveSyncMode(mode)}
+                  disabled={saving}
+                >
+                  {mode}
+                </button>
+              ))}
+              {saving && <span class="spinner" />}
+              {saved && <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent)">&gt; saved</span>}
+            </div>
+            <div class="muted mono" style="font-size:11px;margin-top:8px">
+              all = sync everything · whitelist = only included chats · blacklist = exclude listed chats · none = pause sync
+            </div>
+          </section>
+        )}
+
+        {tab === 'chats' && (
+          chatConfigs.length === 0
+            ? <div class="empty-state"><div class="empty-state-text">&gt; no chat config overrides</div></div>
+            : (
+              <div class="table-wrap">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>Chat</th>
+                      <th>Label</th>
+                      <th>Sync</th>
+                      <th>Updated</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {chatConfigs.map(c => (
+                      <tr key={c.tg_chat_id}>
+                        <td>
+                          <div style="font-weight:500">{c.chat_name || '(unnamed)'}</div>
+                          <div class="muted mono" style="font-size:11px">{c.tg_chat_id}</div>
+                        </td>
+                        <td class="mono accent">{c.label ?? '—'}</td>
+                        <td>
+                          {c.sync === 'exclude'
+                            ? <span class="badge badge-error">exclude</span>
+                            : <span class="badge badge-success">include</span>}
+                        </td>
+                        <td class="muted mono">{c.updated_at ? fmtTs(c.updated_at) : '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )
+        )}
+
+        {tab === 'system' && (
+          <section class="section">
+            <div class="section-label">Backfill Status</div>
+            <div class="stat-grid">
+              <div class="stat-card">
+                <div class="stat-label">Total Chats</div>
+                <div class="stat-value">{fmtNum(backfillSummary.total)}</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">Complete</div>
+                <div class="stat-value" style="color:var(--accent)">{fmtNum(backfillSummary.complete)}</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">In Progress</div>
+                <div class="stat-value">{fmtNum(backfillSummary.pending)}</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">Failed</div>
+                <div class="stat-value" style={backfillSummary.failed > 0 ? 'color:#ef4444' : ''}>{fmtNum(backfillSummary.failed)}</div>
+              </div>
+            </div>
+          </section>
+        )}
       </div>
     </>
   )
@@ -656,11 +804,12 @@ export function App() {
   const accountId = getAuth()?.accountId ?? 'primary'
 
   const screens: Record<Screen, any> = {
-    overview: Overview,
-    search:   Search,
-    chats:    Chats,
-    contacts: Contacts,
-    backfill: Backfill,
+    overview:   Overview,
+    search:     Search,
+    chats:      Chats,
+    contacts:   Contacts,
+    automation: Automation,
+    config:     Config,
   }
   const CurrentScreen = screens[screen]
 
