@@ -323,6 +323,33 @@ export interface Role {
 
 export const fetchRoles = () => req<Role[]>('/roles');
 
+// ── Insights ────────────────────────────────────────────────────────────────
+export interface InsightData {
+  tone: 'warm' | 'neutral' | 'professional' | 'tense';
+  tone_trend?: 'improving' | 'stable' | 'declining';
+  topics: string[];
+  relationship_arc?: string;
+  initiated_by?: 'me' | 'them' | 'balanced';
+  avg_response_time_hrs?: number;
+  unresolved_threads?: string[];
+  last_active_days_ago?: number;
+  summary: string;
+  follow_up?: string | null;
+}
+
+export interface ChatInsight {
+  tg_chat_id: string;
+  generated_at: number;
+  last_message_at: number;
+  model: string;
+  insight_type: string;
+  data: InsightData;
+}
+
+export function fetchInsight(chatId: string) {
+  return req<{ insight: ChatInsight | null }>(`/insights/${encodeURIComponent(chatId)}`);
+}
+
 // ── Auth probe ─────────────────────────────────────────────────────────────
 export async function probeAuth(cfg: AuthConfig): Promise<void> {
   const url = `${cfg.workerUrl.replace(/\/$/, '')}/stats`;
