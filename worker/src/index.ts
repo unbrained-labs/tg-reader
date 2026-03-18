@@ -2042,6 +2042,46 @@ const MCP_TOOL_DEFINITIONS = [
       required: ['name'],
     },
   },
+  // ---------------------------------------------------------------------------
+  // AI Chat Insights tools — MASTER_TOKEN only
+  // ---------------------------------------------------------------------------
+  {
+    name: 'get_insights',
+    description: 'Return the cached AI insight for a chat. Returns null if no insight has been generated yet. Use this to display insights in the UI or check if regeneration is needed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tg_chat_id: { type: 'string', description: 'Telegram chat ID to fetch insight for.' },
+      },
+      required: ['tg_chat_id'],
+    },
+  },
+  {
+    name: 'generate_insight',
+    description: 'Check if a chat has new messages since the last insight (delta check), then call the LLM to generate a fresh insight and store it. Skips if nothing has changed. Returns { skipped: true } if no new messages, or the new insight data if regenerated. Use this in observer jobs that run nightly.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tg_chat_id: { type: 'string', description: 'Telegram chat ID to analyse.' },
+        model: { type: 'string', description: 'Model identifier used for generation (stored for audit). E.g. "claude-haiku-4-5".' },
+        message_limit: { type: 'number', description: 'Max messages to pass to the LLM. Default 500. Use higher values for deep analysis of quiet chats.' },
+      },
+      required: ['tg_chat_id'],
+    },
+  },
+  {
+    name: 'upsert_insight',
+    description: 'Directly write a structured insight for a chat. Use this when the observer job generates the insight externally and wants to store the result. The data object must match the insight schema.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tg_chat_id: { type: 'string', description: 'Telegram chat ID.' },
+        model: { type: 'string', description: 'Model used to generate this insight.' },
+        data: { type: 'object', description: 'Insight data object: { tone, tone_trend?, topics, relationship_arc?, initiated_by?, avg_response_time_hrs?, unresolved_threads?, last_active_days_ago?, summary, follow_up? }' },
+      },
+      required: ['tg_chat_id', 'model', 'data'],
+    },
+  },
 ];
 
 const TEXT_SNIPPET_LEN = 500;
@@ -2513,6 +2553,7 @@ async function dispatchMcpTool(
     'create_role', 'list_roles', 'update_role', 'delete_role',
     'create_token', 'list_tokens', 'revoke_token',
     'create_job', 'list_jobs', 'toggle_job', 'delete_job', 'update_job',
+    'get_insights', 'generate_insight', 'upsert_insight',
   ].includes(name)) {
     if (ctx.token_id !== null) {
       return { error: 'permission_denied', message: 'MASTER_TOKEN required for permission management tools.' };
@@ -2868,6 +2909,108 @@ async function dispatchMcpTool(
       if (updates.length === 0) throw new Error('No fields to update');
       await sql(`UPDATE jobs SET ${updates.join(', ')} WHERE account_id = $1 AND name = $2`, binds);
       return { ok: true };
+    }
+
+    // ---- AI Chat Insights ----
+
+    if (name === 'get_insights') {
+      if (typeof args.tg_chat_id !== 'string') throw new Error('tg_chat_id is required');
+      const rows = await sql(
+        `SELECT tg_chat_id, generated_at, last_message_at, model, insight_type, data
+         FROM chat_insights WHERE account_id = $1 AND tg_chat_id = $2`,
+        [accountId, args.tg_chat_id],
+      ) as Array<Record<string, unknown>>;
+      if (rows.length === 0) return { insight: null };
+      const r = rows[0];
+      return {
+        insight: {
+          tg_chat_id: r.tg_chat_id,
+          generated_at: Number(r.generated_at),
+          last_message_at: Number(r.last_message_at),
+          model: r.model,
+          insight_type: r.insight_type,
+          data: r.data,
+        },
+      };
+    }
+
+    if (name === 'generate_insight') {
+      if (typeof args.tg_chat_id !== 'string') throw new Error('tg_chat_id is required');
+      const chatId = args.tg_chat_id;
+      const model = typeof args.model === 'string' ? args.model : 'unknown';
+      const messageLimit = typeof args.message_limit === 'number' ? args.message_limit : 500;
+      const localNow = Math.floor(Date.now() / 1000);
+
+      // Delta check: compare current MAX(sent_at) against stored watermark
+      const deltaRows = await sql(
+        `SELECT ci.last_message_at, MAX(m.sent_at) AS current_last_msg
+         FROM messages m
+         LEFT JOIN chat_insights ci ON ci.tg_chat_id = m.tg_chat_id AND ci.account_id = m.account_id
+         WHERE m.tg_chat_id = $1 AND m.account_id = $2
+         GROUP BY ci.last_message_at`,
+        [chatId, accountId],
+      ) as Array<{ last_message_at: number | null; current_last_msg: number | null }>;
+
+      if (deltaRows.length === 0) return { skipped: true, reason: 'no messages found for this chat' };
+
+      const { last_message_at, current_last_msg } = deltaRows[0];
+      if (last_message_at !== null && current_last_msg !== null && current_last_msg <= last_message_at) {
+        return { skipped: true, reason: 'no new messages since last insight', last_message_at, current_last_msg };
+      }
+
+      // Fetch messages for analysis
+      const msgRows = await sql(
+        `SELECT text, sent_at, sender_id, sender_username, sender_first_name
+         FROM messages
+         WHERE tg_chat_id = $1 AND account_id = $2 AND text IS NOT NULL AND text != ''
+         ORDER BY sent_at DESC
+         LIMIT $3`,
+        [chatId, accountId, messageLimit],
+      ) as Array<Record<string, unknown>>;
+
+      const lastMsgAt = current_last_msg ?? localNow;
+
+      // Return the messages for the caller (observer job) to pass to the LLM.
+      // The observer job calls upsert_insight with the result.
+      return {
+        skipped: false,
+        tg_chat_id: chatId,
+        message_count: msgRows.length,
+        last_message_at: lastMsgAt,
+        messages: msgRows.reverse().map(m => ({
+          text: m.text,
+          sent_at: Number(m.sent_at),
+          sender: m.sender_username ? `@${m.sender_username}` : (m.sender_first_name ?? m.sender_id),
+          is_self: m.sender_id === accountId,
+        })),
+        prompt_hint: 'Analyse this conversation and return a JSON object with fields: tone (warm/neutral/professional/tense), tone_trend (improving/stable/declining, optional), topics (array of strings), relationship_arc (string, optional), initiated_by (me/them/balanced), avg_response_time_hrs (number, optional), unresolved_threads (array of strings, optional), last_active_days_ago (number), summary (2-3 sentences), follow_up (string or null).',
+      };
+    }
+
+    if (name === 'upsert_insight') {
+      if (typeof args.tg_chat_id !== 'string') throw new Error('tg_chat_id is required');
+      if (typeof args.model !== 'string') throw new Error('model is required');
+      if (typeof args.data !== 'object' || !args.data) throw new Error('data is required');
+      const upsertNow = Math.floor(Date.now() / 1000);
+
+      // Get current MAX(sent_at) as watermark
+      const wmRows = await sql(
+        `SELECT MAX(sent_at) AS last_msg FROM messages WHERE tg_chat_id = $1 AND account_id = $2`,
+        [args.tg_chat_id, accountId],
+      ) as Array<{ last_msg: number | null }>;
+      const lastMessageAt = wmRows[0]?.last_msg ?? upsertNow;
+
+      await sql(
+        `INSERT INTO chat_insights (account_id, tg_chat_id, generated_at, last_message_at, model, data)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (account_id, tg_chat_id) DO UPDATE
+           SET generated_at = EXCLUDED.generated_at,
+               last_message_at = EXCLUDED.last_message_at,
+               model = EXCLUDED.model,
+               data = EXCLUDED.data`,
+        [accountId, args.tg_chat_id, upsertNow, lastMessageAt, args.model, JSON.stringify(args.data)],
+      );
+      return { ok: true, tg_chat_id: args.tg_chat_id, generated_at: upsertNow };
     }
   }
 
@@ -3372,6 +3515,36 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
     ) as { rowCount?: number };
     if ((result.rowCount ?? 0) === 0) return json({ ok: false, error: `Job "${jobName}" not found` }, 404);
     return json({ ok: true, enabled: !!enabled });
+  }
+
+  // ── AI Chat Insights ──────────────────────────────────────────────────────
+
+  const insightMatch = pathname.match(/^\/insights\/(.+)$/);
+  if (method === 'GET' && insightMatch) {
+    try {
+      const chatId = decodeURIComponent(insightMatch[1]);
+      const sql = getSql(env);
+      const rows = await sql(
+        `SELECT tg_chat_id, generated_at, last_message_at, model, insight_type, data
+         FROM chat_insights WHERE account_id = $1 AND tg_chat_id = $2`,
+        [accountId, chatId],
+      ) as Array<Record<string, unknown>>;
+      if (rows.length === 0) return json({ insight: null });
+      const r = rows[0];
+      return json({
+        insight: {
+          tg_chat_id: r.tg_chat_id,
+          generated_at: Number(r.generated_at),
+          last_message_at: Number(r.last_message_at),
+          model: r.model,
+          insight_type: r.insight_type,
+          data: r.data,
+        },
+      });
+    } catch (err) {
+      console.error('[GET /insights] DB error', err);
+      return json({ ok: false, error: 'DB error' }, 500);
+    }
   }
 
   return json({ ok: false, error: 'Not Found' }, 404);
