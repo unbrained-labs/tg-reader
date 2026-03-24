@@ -31,7 +31,7 @@ export function App() {
     return <Login onAuth={() => setAuthed(true)} />
   }
 
-  const accountId = getAuth()?.accountId ?? 'primary'
+  const accountId = getAuth()?.accountId ?? ''
 
   if (selectedChat) {
     return (

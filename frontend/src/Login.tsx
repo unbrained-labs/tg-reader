@@ -4,7 +4,7 @@ import { probeAuth, setAuth, type AuthConfig } from './api'
 export function Login({ onAuth }: { onAuth: () => void }) {
   const [workerUrl, setWorkerUrl] = useState('')
   const [token, setToken] = useState('')
-  const [accountId, setAccountId] = useState('primary')
+  const [accountId, setAccountId] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
@@ -12,7 +12,7 @@ export function Login({ onAuth }: { onAuth: () => void }) {
     e.preventDefault()
     setError('')
     setLoading(true)
-    const cfg: AuthConfig = { workerUrl: workerUrl.trim(), token: token.trim(), accountId: accountId.trim() || 'primary' }
+    const cfg: AuthConfig = { workerUrl: workerUrl.trim(), token: token.trim(), accountId: accountId.trim() }
     try {
       await probeAuth(cfg)
       setAuth(cfg)
@@ -44,9 +44,9 @@ export function Login({ onAuth }: { onAuth: () => void }) {
               value={token} onInput={(e: any) => setToken(e.target.value)} required />
           </div>
           <div class="form-group">
-            <label class="form-label">Account ID <span style="opacity:.5">(optional)</span></label>
-            <input class="form-input" type="text" placeholder="primary"
-              value={accountId} onInput={(e: any) => setAccountId(e.target.value)} />
+            <label class="form-label">Account ID</label>
+            <input class="form-input" type="text" placeholder="username or numeric ID"
+              value={accountId} onInput={(e: any) => setAccountId(e.target.value)} required />
           </div>
           {error && <div class="form-error">&gt; {error}</div>}
           <button class="btn btn-primary" type="submit" disabled={loading} style="width:100%;justify-content:center">
