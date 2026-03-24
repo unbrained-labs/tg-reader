@@ -2604,6 +2604,17 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
     return handleStats(request, env, accountId);
   }
 
+  if (method === 'GET' && pathname === '/accounts') {
+    const sql = getSql(env);
+    const rows = await sql(
+      `SELECT DISTINCT m.account_id, c.username
+       FROM messages m
+       LEFT JOIN contacts c ON c.account_id = m.account_id AND c.tg_user_id = m.account_id
+       ORDER BY m.account_id`,
+    ) as Array<{ account_id: string; username: string | null }>;
+    return json({ accounts: rows });
+  }
+
   if (method === 'GET' && pathname === '/contacts') {
     return handleGetContacts(request, env, accountId);
   }

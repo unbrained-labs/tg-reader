@@ -1,5 +1,5 @@
-import { useState } from 'preact/hooks'
-import { getAuth, clearAuth } from './api'
+import { useState, useEffect } from 'preact/hooks'
+import { getAuth, setAuth, clearAuth, fetchAccounts, type Account } from './api'
 import { type Screen } from './shared'
 import { Login } from './Login'
 import { Sidebar } from './Sidebar'
@@ -16,6 +16,25 @@ export function App() {
   const [authed, setAuthed] = useState(() => !!getAuth())
   const [screen, setScreen] = useState<Screen>('overview')
   const [selectedChat, setSelectedChat] = useState<{ id: string; name: string } | null>(null)
+  const [accounts, setAccounts] = useState<Account[]>([])
+  const [accountId, setAccountId] = useState(() => getAuth()?.accountId ?? '')
+
+  useEffect(() => {
+    if (!authed) return
+    fetchAccounts().then(list => {
+      setAccounts(list)
+      if (!accountId && list.length > 0) switchAccount(list[0].account_id)
+    }).catch(() => {})
+  }, [authed])
+
+  function switchAccount(id: string) {
+    const cfg = getAuth()
+    if (!cfg) return
+    setAuth({ ...cfg, accountId: id })
+    setAccountId(id)
+    setScreen('overview')
+    setSelectedChat(null)
+  }
 
   function onLogout() {
     clearAuth()
@@ -31,19 +50,6 @@ export function App() {
     return <Login onAuth={() => setAuthed(true)} />
   }
 
-  const accountId = getAuth()?.accountId ?? ''
-
-  if (selectedChat) {
-    return (
-      <div class="layout">
-        <Sidebar screen={screen} onNav={onNav} onLogout={onLogout} accountId={accountId} />
-        <main class="main">
-          <ChatView chat={selectedChat} onBack={() => setSelectedChat(null)} />
-        </main>
-      </div>
-    )
-  }
-
   function renderScreen() {
     switch (screen) {
       case 'chats':      return <Chats onSelectChat={(id, name) => setSelectedChat({ id, name })} />
@@ -56,11 +62,15 @@ export function App() {
     }
   }
 
+  const sidebar = <Sidebar screen={screen} onNav={onNav} onLogout={onLogout} accountId={accountId} accounts={accounts} onSwitchAccount={switchAccount} />
+
   return (
     <div class="layout">
-      <Sidebar screen={screen} onNav={onNav} onLogout={onLogout} accountId={accountId} />
+      {sidebar}
       <main class="main">
-        {renderScreen()}
+        {selectedChat
+          ? <ChatView chat={selectedChat} onBack={() => setSelectedChat(null)} />
+          : renderScreen()}
       </main>
     </div>
   )
