@@ -35,7 +35,7 @@ async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
     headers: {
       'Content-Type': 'application/json',
       'X-Ingest-Token': cfg.token,
-      'X-Account-ID': cfg.accountId,
+      ...(cfg.accountId ? { 'X-Account-ID': cfg.accountId } : {}),
       ...opts.headers,
     },
   });
@@ -352,15 +352,16 @@ export function fetchInsight(chatId: string) {
 
 // ── Auth probe ─────────────────────────────────────────────────────────────
 export async function probeAuth(cfg: AuthConfig): Promise<void> {
-  const url = `${cfg.workerUrl.replace(/\/$/, '')}/stats`;
-  const res = await fetch(url, {
-    headers: {
-      'X-Ingest-Token': cfg.token,
-      'X-Account-ID': cfg.accountId,
-    },
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error((body as any).error ?? `HTTP ${res.status}`);
-  }
+  const url = `${cfg.workerUrl.replace(/\/$/, '')}/accounts`;
+  const res = await fetch(url, { headers: { 'X-Ingest-Token': cfg.token } });
+  const body = await res.json().catch(() => ({})) as any;
+  if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+  if (!body.accounts?.length) throw new Error('No accounts found in this worker');
+}
+
+export interface Account { account_id: string; username: string | null }
+
+export async function fetchAccounts(): Promise<Account[]> {
+  const { accounts } = await req<{ accounts: Account[] }>('/accounts');
+  return accounts;
 }
