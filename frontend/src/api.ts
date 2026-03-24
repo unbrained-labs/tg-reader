@@ -359,8 +359,11 @@ export async function probeAuth(cfg: AuthConfig): Promise<void> {
       'X-Account-ID': cfg.accountId,
     },
   });
+  const body = await res.json().catch(() => ({})) as any;
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error((body as any).error ?? `HTTP ${res.status}`);
+    throw new Error(body.error ?? `HTTP ${res.status}`);
+  }
+  if (!body.my_user_id) {
+    throw new Error('Account not found — check your Account ID');
   }
 }
