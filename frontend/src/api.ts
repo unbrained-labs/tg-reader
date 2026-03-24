@@ -35,7 +35,7 @@ async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
     headers: {
       'Content-Type': 'application/json',
       'X-Ingest-Token': cfg.token,
-      'X-Account-ID': cfg.accountId,
+      ...(cfg.accountId ? { 'X-Account-ID': cfg.accountId } : {}),
       ...opts.headers,
     },
   });

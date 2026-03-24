@@ -38,6 +38,7 @@ export function App() {
 
   function onLogout() {
     clearAuth()
+    setAccountId('')
     setAuthed(false)
   }
 
@@ -48,6 +49,10 @@ export function App() {
 
   if (!authed) {
     return <Login onAuth={() => setAuthed(true)} />
+  }
+
+  if (!accountId) {
+    return <div class="page-content"><div class="empty-state"><span class="spinner" /></div></div>
   }
 
   function renderScreen() {
@@ -67,7 +72,7 @@ export function App() {
   return (
     <div class="layout">
       {sidebar}
-      <main class="main">
+      <main class="main" key={accountId}>
         {selectedChat
           ? <ChatView chat={selectedChat} onBack={() => setSelectedChat(null)} />
           : renderScreen()}
