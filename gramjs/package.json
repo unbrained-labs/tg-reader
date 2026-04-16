@@ -2,6 +2,7 @@
   "name": "tg-reader-gramjs",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "auth": "npx ts-node src/auth.ts",
     "listener": "npx ts-node src/listener.ts",
