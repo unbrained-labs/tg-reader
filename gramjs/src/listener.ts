@@ -818,11 +818,17 @@ async function main(): Promise<void> {
   // GramJS's internal ping loop hangs on an unresolved Promise and autoReconnect
   // never fires (April 2026 incident — 9-day silent gap).
   let watchdogLastOkAt = Date.now();
+  let shuttingDown = false;
   const watchdogInterval = setInterval(async () => {
+    if (shuttingDown) return;
     let probeTimer: NodeJS.Timeout | undefined;
+    // Attach a handler so the loser of the race (a late-rejecting invoke)
+    // never becomes an unhandledRejection.
+    const probe = client.invoke(new Api.updates.GetState());
+    probe.catch(() => {});
     try {
       await Promise.race([
-        client.invoke(new Api.updates.GetState()),
+        probe,
         new Promise((_, rej) => { probeTimer = setTimeout(() => rej(new Error('probe timeout')), 30_000); }),
       ]);
       watchdogLastOkAt = Date.now();
@@ -831,6 +837,7 @@ async function main(): Promise<void> {
     } finally {
       if (probeTimer) clearTimeout(probeTimer);
     }
+    if (shuttingDown) return;
     const staleMin = Math.round((Date.now() - watchdogLastOkAt) / 60_000);
     if (staleMin > 20) {
       console.error(`[watchdog] Telegram silent ${staleMin}min — exiting for Fly restart`);
@@ -841,6 +848,7 @@ async function main(): Promise<void> {
   // 6. Graceful shutdown on SIGTERM (Fly sends this before killing the container)
   process.on('SIGTERM', () => {
     console.log('[listener] SIGTERM received, flushing buffer and exiting');
+    shuttingDown = true;
     if (flushTimer) clearTimeout(flushTimer);
     clearInterval(ptsInterval);
     clearInterval(configInterval);
