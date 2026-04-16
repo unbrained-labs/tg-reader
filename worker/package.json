@@ -2,6 +2,7 @@
   "name": "tg-reader-worker",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "dev": "wrangler dev --remote",
     "deploy": "wrangler deploy",
