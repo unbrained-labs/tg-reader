@@ -813,14 +813,48 @@ async function main(): Promise<void> {
   // Poll pending actions (edit/delete/forward) every 30 seconds
   const actionsInterval = setInterval(() => { void pollActions(client); }, 30_000);
 
+  // Watchdog: probe Telegram every 5 min. If the response is stale for >20 min,
+  // force exit so Fly restarts the machine. Guards against a zombie state where
+  // GramJS's internal ping loop hangs on an unresolved Promise and autoReconnect
+  // never fires (April 2026 incident — 9-day silent gap).
+  let watchdogLastOkAt = Date.now();
+  let shuttingDown = false;
+  const watchdogInterval = setInterval(async () => {
+    if (shuttingDown) return;
+    let probeTimer: NodeJS.Timeout | undefined;
+    // Attach a handler so the loser of the race (a late-rejecting invoke)
+    // never becomes an unhandledRejection.
+    const probe = client.invoke(new Api.updates.GetState());
+    probe.catch(() => {});
+    try {
+      await Promise.race([
+        probe,
+        new Promise((_, rej) => { probeTimer = setTimeout(() => rej(new Error('probe timeout')), 30_000); }),
+      ]);
+      watchdogLastOkAt = Date.now();
+    } catch (err) {
+      console.error('[watchdog] probe failed:', err instanceof Error ? err.message : String(err));
+    } finally {
+      if (probeTimer) clearTimeout(probeTimer);
+    }
+    if (shuttingDown) return;
+    const staleMin = Math.round((Date.now() - watchdogLastOkAt) / 60_000);
+    if (staleMin > 20) {
+      console.error(`[watchdog] Telegram silent ${staleMin}min — exiting for Fly restart`);
+      process.exit(1);
+    }
+  }, 5 * 60 * 1000);
+
   // 6. Graceful shutdown on SIGTERM (Fly sends this before killing the container)
   process.on('SIGTERM', () => {
     console.log('[listener] SIGTERM received, flushing buffer and exiting');
+    shuttingDown = true;
     if (flushTimer) clearTimeout(flushTimer);
     clearInterval(ptsInterval);
     clearInterval(configInterval);
     clearInterval(outboxInterval);
     clearInterval(actionsInterval);
+    clearInterval(watchdogInterval);
     // Drain entire buffer (flushBuffer only takes 100 at a time), with a 4s deadline
     const drainAndExit = async () => {
       const deadline = new Promise<void>(resolve => setTimeout(resolve, 4000));
