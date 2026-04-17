@@ -5,20 +5,23 @@
 export const MCP_TOOL_DEFINITIONS = [
   {
     name: 'search',
-    description: 'Full-text search across the complete Telegram message archive (51k+ messages). Results are ranked by recency. Use for any question about past conversations, finding specific messages, amounts, names, or topics. Always use from/to when the user mentions a time period. IMPORTANT: multiple words are ANDed — every word must appear in the message. If a broad search returns 0 results, retry with a single shorter token (e.g. "blackbox" instead of "blackbox network"). For sender-specific searches, use sender_username (resolved via contacts if needed). Paginate with next_before_id + next_before_sent_at from the previous response.',
+    description: 'Full-text search across the complete Telegram message archive. Ranked by recency. Use for any question about past conversations, finding specific messages, amounts, names, or topics. Always use from/to when the user mentions a time period. Multiple words in `query` are ANDed — every word must appear. If a broad search returns 0 results, retry with a single shorter token. Omit `query` entirely to list messages by filters alone (e.g. everything from one sender, or all photos in a chat). For finding a person by name, use `senders` first; for messages from a saved contact, use `sender_username`.',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Search keywords. Multiple words are ANDed — all must appear in the message. Use words likely to appear verbatim in the text.' },
-        chat_id: { type: 'string', description: 'Optional. Filter to one chat (get IDs from the chats tool). Leave empty to search all chats.' },
-        sender_username: { type: 'string', description: 'Optional. Filter to messages from a specific sender by username (without @). Use contacts tool to look up usernames.' },
-        from: { type: 'string', description: 'Optional. Start of date range. ISO 8601 (e.g. "2024-01-01") or Unix epoch seconds. Include when the user mentions a time period.' },
+        query: { type: 'string', description: 'Optional. Full-text keywords; multiple words are ANDed. Omit to list messages by filters alone.' },
+        chat_id: { type: 'string', description: 'Optional. Filter to one chat (get IDs from the chats tool).' },
+        chat_type: { type: 'string', enum: ['user', 'group', 'supergroup', 'channel', 'bot'], description: 'Optional. Restrict to one chat type — e.g. "user" for DMs only.' },
+        sender_username: { type: 'string', description: 'Optional. Exact-match sender username (without @). Use for saved contacts.' },
+        sender_name: { type: 'string', description: 'Optional. Partial match (case-insensitive) across sender username/first_name/last_name. Use when you only know the display name. Pairs well with `senders` for discovery.' },
+        media_type: { type: 'string', description: 'Optional. Restrict to messages containing this media type (e.g. "photo", "video", "voice", "document").' },
+        forwarded_from_name: { type: 'string', description: 'Optional. Partial match on the forwarded-from name — find messages forwarded from a given source.' },
+        from: { type: 'string', description: 'Optional. Start of date range. ISO 8601 or Unix epoch seconds.' },
         to: { type: 'string', description: 'Optional. End of date range. ISO 8601 or Unix epoch seconds. Defaults to tomorrow.' },
         limit: { type: 'number', description: 'Results per page (1–50, default 20).' },
         before_id: { type: 'number', description: 'Pagination: pass next_before_id from the previous response. Must be paired with before_sent_at.' },
         before_sent_at: { type: 'number', description: 'Pagination: pass next_before_sent_at from the previous response. Must be paired with before_id.' },
       },
-      required: ['query'],
     },
   },
   {
@@ -50,23 +53,27 @@ export const MCP_TOOL_DEFINITIONS = [
     },
   },
   {
-    name: 'contacts',
-    description: 'List Telegram contacts with username, name, and message count. Use to find someone\'s tg_user_id or username before searching their messages, or to see who you talk to most. Note: contacts are people saved in your phone — group members without a saved contact may not appear here. Use has_messages: true to filter out phone contacts who never messaged on Telegram.',
+    name: 'address_book',
+    description: 'List your SAVED phone contacts (people explicitly saved in your Telegram address book) with username, name, and message count. Only ~10-15% of people you talk to are here — for finding anyone else (group members, random DMs, unsaved senders), use the `senders` tool instead. Use has_messages: true to filter out phone contacts who never messaged on Telegram.',
     inputSchema: {
       type: 'object',
       properties: {
         search: { type: 'string', description: 'Optional. Filter by name or username (case-insensitive partial match).' },
-        has_messages: { type: 'boolean', description: 'Optional. If true, only return contacts who have at least one message in the archive. Filters out phone contacts with no Telegram message history.' },
+        has_messages: { type: 'boolean', description: 'Optional. If true, only return contacts who have at least one message in the archive.' },
       },
     },
   },
   {
-    name: 'recent',
-    description: 'Get the most recent messages across all chats, sorted newest-first. Use only for "what\'s new" or "latest activity" queries. For any historical lookup, use search instead.',
+    name: 'senders',
+    description: 'Find ANYONE who has ever sent a message in your archive — not just saved contacts. Partial-match (case-insensitive) across username, first name, last name. Results include `in_address_book` flag and `top_chats` showing where that person is most active, so you can disambiguate "which Alex did you mean?" in one call. Prefer this over `address_book` whenever the user asks about a person by name or handle.',
     inputSchema: {
       type: 'object',
       properties: {
-        limit: { type: 'number', description: 'Number of messages (default 20, max 50).' },
+        search: { type: 'string', description: 'Name or handle fragment (case-insensitive). Leave empty to list recent senders across all chats.' },
+        chat_id: { type: 'string', description: 'Optional. Restrict to senders active in this chat — use for "Alex in Keyring" disambiguation.' },
+        limit: { type: 'number', description: 'Results per page (1–50, default 20).' },
+        offset: { type: 'number', description: 'Offset for pagination.' },
+        include_top_chats: { type: 'boolean', description: 'Default true. Include each sender\'s top 3 chats by message count.' },
       },
     },
   },

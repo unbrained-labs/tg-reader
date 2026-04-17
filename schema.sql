@@ -88,22 +88,39 @@ CREATE TABLE IF NOT EXISTS backfill_state (
 );
 
 -- ---------------------------------------------------------------------------
+-- Extensions
+-- ---------------------------------------------------------------------------
+
+-- pg_trgm: trigram-based partial-match (ILIKE '%name%') over sender name columns,
+-- used by the `senders` MCP tool to find non-saved contacts by first/last name.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- ---------------------------------------------------------------------------
 -- Indexes
 -- ---------------------------------------------------------------------------
 
 -- Composite: covers chat timeline queries (most common pattern)
 CREATE INDEX IF NOT EXISTS idx_chat_time ON messages(account_id, tg_chat_id, sent_at DESC);
 
--- Individual: for cross-chat time queries and sender lookups
-CREATE INDEX IF NOT EXISTS idx_sent_at   ON messages(account_id, sent_at);
+-- Cross-chat sender lookups (LATERAL stats aggregation in senders / address_book)
 CREATE INDEX IF NOT EXISTS idx_sender_id ON messages(account_id, sender_id);
 
--- Covers keyset pagination ORDER BY (sent_at, id)
+-- Keyset pagination covering index: ORDER BY (sent_at DESC, id DESC). Also
+-- subsumes the old idx_sent_at(account_id, sent_at) which was redundant with
+-- this one as a prefix.
 CREATE INDEX IF NOT EXISTS idx_account_sent_id ON messages(account_id, sent_at DESC, id DESC);
 
--- Covers thread reconstruction queries (reply chains)
+-- Thread reconstruction (reply chains)
 CREATE INDEX IF NOT EXISTS idx_reply_to ON messages(account_id, tg_chat_id, reply_to_message_id)
   WHERE reply_to_message_id IS NOT NULL;
+
+-- Trigram GIN for ILIKE partial-match on sender_username / first / last. Powers
+-- the `senders` tool and the new `sender_name` filter on `search`.
+CREATE INDEX IF NOT EXISTS idx_messages_sender_trgm ON messages USING GIN (
+  (COALESCE(sender_username,'') || ' ' ||
+   COALESCE(sender_first_name,'') || ' ' ||
+   COALESCE(sender_last_name,'')) gin_trgm_ops
+);
 
 CREATE INDEX IF NOT EXISTS idx_contacts_username ON contacts(account_id, username);
 
