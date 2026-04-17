@@ -56,6 +56,12 @@ export async function authenticateMcp(
   const raw = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1] ?? tokenOverride ?? null;
   if (!raw) return { error: json({ ok: false, error: 'Unauthorized' }, 401) };
 
+  // Log one-off deprecation warning when the token arrived via URL query param.
+  // Keep it metadata-only — never log the token itself.
+  if (!authHeader && tokenOverride) {
+    console.warn('[auth] /mcp token via ?token= query param; prefer Authorization: Bearer header');
+  }
+
   // MASTER_TOKEN path — timing-safe comparison
   if (await timingSafeTokenEqual(raw, env.MASTER_TOKEN)) {
     return { ctx: { token_id: null, role: null } };
