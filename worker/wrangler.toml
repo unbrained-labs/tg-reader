@@ -6,9 +6,6 @@ compatibility_date = "2025-03-01"
 binding = "BACKUP_BUCKET"
 bucket_name = "tg-reader-backup"
 
-[assets]
-directory = "./public"
-
 [ai]
 binding = "AI"
 
