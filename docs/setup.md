@@ -12,10 +12,19 @@
 ### CLIs to install
 
 ```bash
-node --version    # must be 20+
-npm --version     # bundled with Node.js
+node --version       # must be 20+
+npm --version        # bundled with Node.js
+neonctl --version    # npm install -g neonctl
 wrangler --version   # npm install -g wrangler
 flyctl version       # https://fly.io/docs/hands-on/install-flyctl/
+```
+
+Authenticate each CLI once:
+
+```bash
+neonctl auth
+npx wrangler login
+flyctl auth login
 ```
 
 ### Getting your Telegram API_ID / API_HASH
@@ -31,6 +40,39 @@ You must create your own Telegram application to get these credentials. Do not u
 > **Security note:** These credentials bind your session to your app. Never share them, never commit them to source control, and never use credentials from someone else's app. If they are compromised, revoke them on the same page and generate new ones.
 
 ---
+
+## Automated setup (recommended)
+
+One command bootstraps the entire stack — Neon database, Cloudflare Worker, Telegram auth, and Fly.io listener:
+
+```bash
+npm install && npm run setup
+```
+
+The script walks you through seven phases interactively:
+
+| Phase | What it does |
+|-------|-------------|
+| **preflight** | Checks `neonctl`, `wrangler`, `flyctl`, Node ≥ 20 are installed and authed |
+| **telegram-creds** | Prompts for API_ID, API_HASH and your phone number |
+| **telegram-auth** | Runs the GramJS auth flow, saves the session string |
+| **neon** | Creates a Neon project, fetches the connection string, applies `schema.sql` |
+| **worker** | Generates tokens, updates `wrangler.toml`, sets secrets, deploys the Worker |
+| **fly** | Creates the Fly app + volume, sets secrets, deploys the GramJS listener |
+| **mcp** | Mints an agent token and prints the final MCP URL + `claude mcp add` command |
+
+Progress is saved to `.setup-state.json` after each phase — re-run the script at any time to resume from where you left off. To re-run a single phase:
+
+```bash
+npm run setup -- --phase <phase-name>
+```
+
+---
+
+## Manual setup (fallback)
+
+The steps below replicate what the automated script does. Follow these if you prefer manual control or if the script encounters an issue you can't resolve.
+
 
 ## Prerequisites
 

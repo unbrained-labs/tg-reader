@@ -1,0 +1,15 @@
+{
+  "name": "tg-reader-setup",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Interactive first-time setup for TG Reader (tg-reader-setup only — runtime lives in worker/ and gramjs/)",
+  "scripts": {
+    "setup": "npx tsx scripts/setup.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/pg": "^8.18.0",
+    "pg": "^8.20.0",
+    "tsx": "^4.19.2"
+  }
+}
