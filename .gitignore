@@ -7,3 +7,6 @@ dist/
 worker/public/
 .playwright-mcp/
 .claude/
+.setup-state.json
+.setup-session.tmp
+.setup-auth-helper.cjs
