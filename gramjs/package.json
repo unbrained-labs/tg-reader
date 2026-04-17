@@ -8,6 +8,7 @@
     "listener": "npx ts-node src/listener.ts",
     "backfill-seed": "npx ts-node src/backfill-seed.ts",
     "backfill-run": "npx ts-node src/backfill-run.ts",
+    "gap-fill": "npx ts-node src/gap-fill.ts",
     "enrich-senders": "npx ts-node src/enrich-senders.ts",
     "enrich-chat-type": "npx ts-node src/enrich-chat-type.ts"
   },
