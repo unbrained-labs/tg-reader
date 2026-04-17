@@ -258,8 +258,9 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
       msgs.map(m => m.deleted_at ?? null),
     ], { fullResults: true });
   } catch (err) {
-    console.error('[POST /ingest] DB error', err);
-    return json({ ok: false, error: 'DB error' }, 500);
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error('[POST /ingest] DB error', errMsg);
+    return json({ ok: false, error: 'DB error', detail: errMsg }, 500);
   }
 
   const written = result.rowCount ?? 0;
@@ -309,7 +310,17 @@ async function handleSearch(
     ? qTokens.map(t => t + ':*').join(' & ')
     : null;
   const chatId = p.get('chat_id') ?? null;
+  const chatType = p.get('chat_type') ?? null;
   const senderUsername = p.get('sender_username') ?? null;
+  const senderNameRaw = p.get('sender_name');
+  const senderNamePattern = senderNameRaw !== null && senderNameRaw.trim() !== ''
+    ? `%${senderNameRaw.trim().replace(/[%_\\]/g, '\\$&')}%`
+    : null;
+  const mediaType = p.get('media_type') ?? null;
+  const forwardedFromNameRaw = p.get('forwarded_from_name');
+  const forwardedFromNamePattern = forwardedFromNameRaw !== null && forwardedFromNameRaw.trim() !== ''
+    ? `%${forwardedFromNameRaw.trim().replace(/[%_\\]/g, '\\$&')}%`
+    : null;
   const from = parseDate(p.get('from'), 0);
   const to = parseDate(p.get('to'), Math.floor(Date.now() / 1000) + 86400);
   const limit = Math.min(Math.max(parseInt(p.get('limit') ?? '50', 10) || 50, 1), 200);
@@ -323,20 +334,41 @@ async function handleSearch(
     let dataRows: Array<{ id: number; sent_at: number }>;
     let total: number;
 
+    // Shared filter fragment for both FTS and B-tree paths. Uses $BASE_OFFSET+1..+4
+    // for the four optional filters so they slot in after whatever accountId/chatId/
+    // senderUsername/from/to parameters the caller places first.
+    const extraFilterClause = (offset: number, tablePrefix: string) => {
+      const p = (n: number) => `$${offset + n}`;
+      return `
+        AND (${p(1)}::text IS NULL OR ${tablePrefix}chat_type = ${p(1)})
+        AND (${p(2)}::text IS NULL OR
+             (COALESCE(${tablePrefix}sender_username,'') || ' ' ||
+              COALESCE(${tablePrefix}sender_first_name,'') || ' ' ||
+              COALESCE(${tablePrefix}sender_last_name,'')) ILIKE ${p(2)})
+        AND (${p(3)}::text IS NULL OR ${tablePrefix}media_type = ${p(3)})
+        AND (${p(4)}::text IS NULL OR ${tablePrefix}forwarded_from_name ILIKE ${p(4)})
+      `;
+    };
+    const extraFilterBinds: unknown[] = [chatType, senderNamePattern, mediaType, forwardedFromNamePattern];
+
     if (q !== null) {
-      // FTS path: search_vector @@ to_tsquery, sort by recency
-      // Base binds: $1=q, $2=accountId, $3=chatId, $4=senderUsername, $5=from, $6=to
-      const keysetClause = beforeSentAt !== null && beforeId !== null
-        ? `AND (m.sent_at < $7 OR (m.sent_at = $7 AND m.id < $8))`
+      // FTS path: search_vector @@ to_tsquery, sort by recency.
+      // Base binds: $1=q, $2=accountId, $3=chatId, $4=senderUsername, $5=from, $6=to,
+      // $7=chatType, $8=senderNamePattern, $9=mediaType, $10=forwardedFromNamePattern
+      const dataKeysetClause = beforeSentAt !== null && beforeId !== null
+        ? `AND (m.sent_at < $11 OR (m.sent_at = $11 AND m.id < $12))`
         : ``;
-      const baseBinds: unknown[] = [q, accountId, chatId, senderUsername, from, to];
+      const countKeysetClause = beforeSentAt !== null && beforeId !== null
+        ? `AND (sent_at < $11 OR (sent_at = $11 AND id < $12))`
+        : ``;
+      const baseBinds: unknown[] = [q, accountId, chatId, senderUsername, from, to, ...extraFilterBinds];
       const keysetBinds: unknown[] = beforeSentAt !== null && beforeId !== null
         ? [beforeSentAt, beforeId]
         : [];
-      // Scope clause: accountId is $2 in FTS path; starts after base + keyset binds
       const { clause: scopeClause, binds: scopeBinds } = buildReadScopeClause(
         role ?? null, 'm', baseBinds.length + keysetBinds.length + 1, 2,
       );
+      const countScope = buildReadScopeClause(role ?? null, '', baseBinds.length + keysetBinds.length + 1, 2);
       const limitIdx = baseBinds.length + keysetBinds.length + scopeBinds.length + 1;
 
       const DATA_SQL = `
@@ -357,7 +389,8 @@ async function handleSearch(
             OR m.sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $2 AND username = $4))
           AND m.sent_at >= $5
           AND m.sent_at <= $6
-          ${keysetClause}
+          ${extraFilterClause(6, 'm.')}
+          ${dataKeysetClause}
           ${scopeClause}
         ORDER BY m.sent_at DESC, m.id DESC
         LIMIT $${limitIdx}
@@ -365,17 +398,18 @@ async function handleSearch(
 
       const COUNT_SQL = `
         SELECT COUNT(*) AS total
-        FROM messages m
-        WHERE m.search_vector @@ to_tsquery('simple', $1)
-          AND m.account_id = $2
-          AND m.is_deleted = 0
-          AND ($3::text IS NULL OR m.tg_chat_id = $3)
-          AND ($4::text IS NULL OR m.sender_username = $4
-            OR m.sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $2 AND username = $4))
-          AND m.sent_at >= $5
-          AND m.sent_at <= $6
-          ${keysetClause}
-          ${scopeClause}
+        FROM messages
+        WHERE search_vector @@ to_tsquery('simple', $1)
+          AND account_id = $2
+          AND is_deleted = 0
+          AND ($3::text IS NULL OR tg_chat_id = $3)
+          AND ($4::text IS NULL OR sender_username = $4
+            OR sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $2 AND username = $4))
+          AND sent_at >= $5
+          AND sent_at <= $6
+          ${extraFilterClause(6, '')}
+          ${countKeysetClause}
+          ${countScope.clause}
       `.trim();
 
       const allBinds = [...baseBinds, ...keysetBinds, ...scopeBinds];
@@ -386,19 +420,20 @@ async function handleSearch(
       dataRows = dataResult as Array<{ id: number; sent_at: number }>;
       total = parseInt((countResult[0] as { total: string }).total, 10);
     } else {
-      // B-tree path: no query, sort by recency
-      // Base binds: $1=accountId, $2=chatId, $3=senderUsername, $4=from, $5=to
+      // B-tree path: no query, sort by recency.
+      // Base binds: $1=accountId, $2=chatId, $3=senderUsername, $4=from, $5=to,
+      // $6=chatType, $7=senderNamePattern, $8=mediaType, $9=forwardedFromNamePattern
       const keysetClause = beforeSentAt !== null && beforeId !== null
-        ? `AND (sent_at < $6 OR (sent_at = $6 AND id < $7))`
+        ? `AND (sent_at < $10 OR (sent_at = $10 AND id < $11))`
         : ``;
-      const baseBinds: unknown[] = [accountId, chatId, senderUsername, from, to];
+      const baseBinds: unknown[] = [accountId, chatId, senderUsername, from, to, ...extraFilterBinds];
       const keysetBinds: unknown[] = beforeSentAt !== null && beforeId !== null
         ? [beforeSentAt, beforeId]
         : [];
-      // Scope clause: accountId is $1 in B-tree path; starts after base + keyset binds
       const { clause: scopeClause, binds: scopeBinds } = buildReadScopeClause(
-        role ?? null, '', baseBinds.length + keysetBinds.length + 1, 1,
+        role ?? null, 'm', baseBinds.length + keysetBinds.length + 1, 1,
       );
+      const countScope = buildReadScopeClause(role ?? null, '', baseBinds.length + keysetBinds.length + 1, 1);
       const limitIdx = baseBinds.length + keysetBinds.length + scopeBinds.length + 1;
 
       const DATA_SQL = `
@@ -418,6 +453,7 @@ async function handleSearch(
             OR m.sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $1 AND username = $3))
           AND m.sent_at >= $4
           AND m.sent_at <= $5
+          ${extraFilterClause(5, 'm.')}
           ${keysetClause}
           ${scopeClause}
         ORDER BY m.sent_at DESC, m.id DESC
@@ -434,8 +470,9 @@ async function handleSearch(
             OR sender_id IN (SELECT tg_user_id FROM contacts WHERE account_id = $1 AND username = $3))
           AND sent_at >= $4
           AND sent_at <= $5
+          ${extraFilterClause(5, '')}
           ${keysetClause}
-          ${scopeClause}
+          ${countScope.clause}
       `.trim();
 
       const allBinds = [...baseBinds, ...keysetBinds, ...scopeBinds];
@@ -604,6 +641,8 @@ async function handleGetContacts(request: Request, env: Env, accountId: string):
 
   const searchPattern = search !== null ? `%${search.replace(/[%_\\]/g, '\\$&')}%` : null;
 
+  // LATERAL per-contact lookup: with idx_sender_id each contact becomes an
+  // index seek instead of the full 640k-row GROUP BY join we had before.
   const SQL = `
     SELECT
       c.tg_user_id,
@@ -613,14 +652,17 @@ async function handleGetContacts(request: Request, env: Env, accountId: string):
       c.last_name,
       c.is_mutual,
       c.is_bot,
-      COUNT(m.id) AS message_count,
-      MAX(m.sent_at) AS last_seen
+      COALESCE(s.message_count, 0) AS message_count,
+      s.last_seen
     FROM contacts c
-    LEFT JOIN messages m ON m.account_id = c.account_id AND m.sender_id = c.tg_user_id
+    LEFT JOIN LATERAL (
+      SELECT COUNT(*)::bigint AS message_count, MAX(sent_at) AS last_seen
+      FROM messages
+      WHERE account_id = c.account_id AND sender_id = c.tg_user_id
+    ) s ON TRUE
     WHERE c.account_id = $1
       AND ($3::text IS NULL OR c.username ILIKE $3 OR c.first_name ILIKE $3 OR c.last_name ILIKE $3)
-    GROUP BY c.tg_user_id, c.phone, c.username, c.first_name, c.last_name, c.is_mutual, c.is_bot
-    HAVING ($2::boolean IS NOT TRUE OR COUNT(m.id) > 0)
+      AND ($2::boolean IS NOT TRUE OR s.message_count > 0)
     ORDER BY last_seen DESC NULLS LAST
     LIMIT $4 OFFSET $5
   `.trim();
@@ -641,6 +683,146 @@ async function handleGetContacts(request: Request, env: Env, accountId: string):
     })));
   } catch (err) {
     console.error('[GET /contacts] DB error', err);
+    return json({ ok: false, error: 'DB error' }, 500);
+  }
+}
+
+async function handleGetSenders(
+  request: Request,
+  env: Env,
+  accountId: string,
+  role?: RoleRow | null,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const search = url.searchParams.get('search') ?? null;
+  const chatId = url.searchParams.get('chat_id') ?? null;
+  const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '50', 10) || 50, 200);
+  const offset = parseInt(url.searchParams.get('offset') ?? '0', 10) || 0;
+  const includeTopChats = url.searchParams.get('include_top_chats') !== 'false';
+
+  const searchPattern = search !== null ? `%${search.replace(/[%_\\]/g, '\\$&')}%` : null;
+
+  // Aggregate distinct senders from messages (not contacts). Uses trigram
+  // partial match on the concatenated names so non-saved group members show up.
+  //
+  // Note on denormalized names: messages row carries sender_username at ingest
+  // time. If a user renames, older rows keep the old name. We COALESCE against
+  // contacts for the *display* values, but the search pattern runs against the
+  // stored denorm fields so recency is preserved in matches. Acceptable trade-off
+  // until a backfill job catches old rows (see docs/roadmap.md).
+  //
+  // Scope: apply buildReadScopeClause so scoped tokens can only enumerate
+  // senders from chats they are allowed to read — otherwise they could
+  // discover group members and top_chats from blacklisted chats.
+  const baseBinds: unknown[] = [accountId, chatId, searchPattern];
+  const { clause: scopeClause, binds: scopeBinds } = buildReadScopeClause(
+    role ?? null, 'm', baseBinds.length + 1, 1,
+  );
+  const limitIdx = baseBinds.length + scopeBinds.length + 1;
+  const offsetIdx = limitIdx + 1;
+
+  const SQL = `
+    SELECT
+      m.sender_id AS tg_user_id,
+      MAX(COALESCE(c.username,    m.sender_username))    AS username,
+      MAX(COALESCE(c.first_name,  m.sender_first_name))  AS first_name,
+      MAX(COALESCE(c.last_name,   m.sender_last_name))   AS last_name,
+      BOOL_OR(c.tg_user_id IS NOT NULL) AS in_address_book,
+      COUNT(*)::bigint AS message_count,
+      MAX(m.sent_at) AS last_seen
+    FROM messages m
+    LEFT JOIN contacts c ON c.account_id = m.account_id AND c.tg_user_id = m.sender_id
+    WHERE m.account_id = $1
+      AND m.sender_id IS NOT NULL
+      AND m.is_deleted = 0
+      AND ($2::text IS NULL OR m.tg_chat_id = $2)
+      AND ($3::text IS NULL OR
+           (COALESCE(m.sender_username,'') || ' ' ||
+            COALESCE(m.sender_first_name,'') || ' ' ||
+            COALESCE(m.sender_last_name,'')) ILIKE $3)
+      ${scopeClause}
+    GROUP BY m.sender_id
+    ORDER BY last_seen DESC
+    LIMIT $${limitIdx} OFFSET $${offsetIdx}
+  `.trim();
+
+  const sql = getSql(env);
+  try {
+    const rows = await sql(SQL, [...baseBinds, ...scopeBinds, limit, offset]) as Array<{
+      tg_user_id: string;
+      username: string | null;
+      first_name: string | null;
+      last_name: string | null;
+      in_address_book: boolean;
+      message_count: string;
+      last_seen: string | null;
+    }>;
+
+    const base = rows.map(r => ({
+      tg_user_id: r.tg_user_id,
+      username: r.username,
+      first_name: r.first_name,
+      last_name: r.last_name,
+      in_address_book: r.in_address_book,
+      message_count: parseInt(r.message_count, 10),
+      last_seen: r.last_seen !== null ? parseInt(r.last_seen, 10) : null,
+    }));
+
+    // Per-sender top chats: single grouped query scoped to the senders returned.
+    // Same scope clause so we don't leak chat names from blacklisted chats.
+    let topChatsBySender: Map<string, Array<{ tg_chat_id: string; chat_name: string | null; message_count: number }>> = new Map();
+    if (includeTopChats && base.length > 0) {
+      const topBaseBinds: unknown[] = [accountId, base.map(b => b.tg_user_id)];
+      const { clause: topScopeClause, binds: topScopeBinds } = buildReadScopeClause(
+        role ?? null, 'm', topBaseBinds.length + 1, 1,
+      );
+      const TOP_SQL = `
+        WITH per_sender_chat AS (
+          SELECT
+            m.sender_id,
+            m.tg_chat_id,
+            MAX(m.chat_name) AS chat_name,
+            COUNT(*)::bigint AS message_count,
+            ROW_NUMBER() OVER (PARTITION BY m.sender_id ORDER BY COUNT(*) DESC) AS rn
+          FROM messages m
+          WHERE m.account_id = $1
+            AND m.sender_id = ANY($2::text[])
+            AND m.is_deleted = 0
+            ${topScopeClause}
+          GROUP BY m.sender_id, m.tg_chat_id
+        )
+        SELECT sender_id, tg_chat_id, chat_name, message_count
+        FROM per_sender_chat
+        WHERE rn <= 3
+        ORDER BY sender_id, rn
+      `.trim();
+      const topRows = await sql(TOP_SQL, [...topBaseBinds, ...topScopeBinds]) as Array<{
+        sender_id: string;
+        tg_chat_id: string;
+        chat_name: string | null;
+        message_count: string;
+      }>;
+      topChatsBySender = new Map();
+      for (const r of topRows) {
+        const existing = topChatsBySender.get(r.sender_id) ?? [];
+        existing.push({
+          tg_chat_id: r.tg_chat_id,
+          chat_name: r.chat_name,
+          message_count: parseInt(r.message_count, 10),
+        });
+        topChatsBySender.set(r.sender_id, existing);
+      }
+    }
+
+    const result = base.map(b => ({
+      ...b,
+      top_chats: includeTopChats ? (topChatsBySender.get(b.tg_user_id) ?? []) : undefined,
+    }));
+
+    console.log(`[GET /senders] account=${accountId} count=${result.length}`);
+    return json(result);
+  } catch (err) {
+    console.error('[GET /senders] DB error', err);
     return json({ ok: false, error: 'DB error' }, 500);
   }
 }
@@ -1520,9 +1702,13 @@ async function dispatchMcpTool(
 
   if (name === 'search') {
     const params = new URLSearchParams();
-    if (typeof args.query === 'string') params.set('q', args.query);
+    if (typeof args.query === 'string' && args.query.trim() !== '') params.set('q', args.query);
     if (typeof args.chat_id === 'string') params.set('chat_id', args.chat_id);
+    if (typeof args.chat_type === 'string') params.set('chat_type', args.chat_type);
     if (typeof args.sender_username === 'string') params.set('sender_username', args.sender_username);
+    if (typeof args.sender_name === 'string' && args.sender_name.trim() !== '') params.set('sender_name', args.sender_name);
+    if (typeof args.media_type === 'string') params.set('media_type', args.media_type);
+    if (typeof args.forwarded_from_name === 'string' && args.forwarded_from_name.trim() !== '') params.set('forwarded_from_name', args.forwarded_from_name);
     if (args.from !== undefined) params.set('from', String(args.from));
     if (args.to !== undefined) params.set('to', String(args.to));
     const limit = Math.min(typeof args.limit === 'number' ? args.limit : 20, 50);
@@ -1603,7 +1789,10 @@ async function dispatchMcpTool(
     };
   }
 
-  if (name === 'contacts') {
+  if (name === 'address_book' || name === 'contacts') {
+    // 'contacts' kept as a deprecated alias so existing connectors/prompts
+    // keep working. New callers should use 'address_book' — the tools/list
+    // schema only advertises the new name.
     const search = typeof args.search === 'string' && args.search.trim() !== ''
       ? `%${args.search.trim().replace(/[%_\\]/g, '\\$&')}%`
       : null;
@@ -1640,18 +1829,21 @@ async function dispatchMcpTool(
     }));
   }
 
-  if (name === 'recent') {
+  if (name === 'senders') {
     const params = new URLSearchParams();
+    if (typeof args.search === 'string' && args.search.trim() !== '') params.set('search', args.search);
+    if (typeof args.chat_id === 'string') params.set('chat_id', args.chat_id);
     const limit = Math.min(typeof args.limit === 'number' ? args.limit : 20, 50);
     params.set('limit', String(limit));
-    const req = new Request(`${baseUrl}/search?${params.toString()}`);
-    const res = await handleSearch(req, env, accountId, ctx.role);
-    const data = await res.json() as { results?: Array<Record<string, unknown>> };
-    if (Array.isArray(data.results)) {
-      data.results = data.results.map(truncateText);
-    }
-    return data;
+    if (typeof args.offset === 'number') params.set('offset', String(args.offset));
+    if (args.include_top_chats === false) params.set('include_top_chats', 'false');
+    const req = new Request(`${baseUrl}/senders?${params.toString()}`);
+    const res = await handleGetSenders(req, env, accountId, ctx.role);
+    return await res.json();
   }
+
+  // 'recent' tool removed — server instructions have pointed to `digest` for this
+  // purpose for a while; digest(hours=1) covers the "what's new" case better.
 
   if (name === 'stats') {
     const req = new Request(`${baseUrl}/stats`);
@@ -2513,10 +2705,16 @@ IMPORTANT: The archive is complete — never say data is unavailable. Try broade
   }
 
   if (method === 'tools/list') {
+    // Scoped agent tokens (ctx.role !== null) never see admin-only tools.
+    // Hiding them keeps the AI caller's surface clean — it won't reach for
+    // `create_role` et al. only to get a permission_denied response.
+    const tools = ctx.role === null
+      ? MCP_TOOL_DEFINITIONS
+      : MCP_TOOL_DEFINITIONS.filter(t => !MASTER_ONLY_TOOLS.has(t.name));
     return {
       jsonrpc: '2.0',
       id,
-      result: { tools: MCP_TOOL_DEFINITIONS },
+      result: { tools },
     };
   }
 
@@ -2617,6 +2815,10 @@ async function route(request: Request, env: Env, accountId: string): Promise<Res
 
   if (method === 'GET' && pathname === '/contacts') {
     return handleGetContacts(request, env, accountId);
+  }
+
+  if (method === 'GET' && pathname === '/senders') {
+    return handleGetSenders(request, env, accountId);
   }
 
   if (method === 'POST' && pathname === '/contacts') {
