@@ -201,7 +201,7 @@ Regular agent callers get `whoami` only (returns their role + permissions).
 The `account_ids` parameter accepts a single string or array:
 
 ```json
-{ "label": "work-bot", "role": "read-work", "account_id": "7926042351" }
+{ "label": "work-bot", "role": "read-work", "account_id": "<another-account-id>" }
 { "label": "shared", "role": "read-all", "account_ids": ["111", "222"] }
 ```
 

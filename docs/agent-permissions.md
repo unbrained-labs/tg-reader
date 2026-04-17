@@ -126,7 +126,7 @@ If Neon is breached, hashes are exposed but raw tokens are not. SHA-256 is suffi
 Agent tokens are sent via `Authorization: Bearer <token>` header, not query params. Query params appear in Cloudflare logs and URL history. MCP config uses the URL for the endpoint only:
 
 ```
-MCP endpoint: https://tg-reader.ddohne.workers.dev/mcp?account_id=7926042351
+MCP endpoint: https://<your-worker-subdomain>.workers.dev/mcp?account_id=<your-telegram-user-id>
 Authorization: Bearer <raw_token>
 ```
 
@@ -191,7 +191,7 @@ Owner talks to Claude with MASTER_TOKEN
 Claude calls create_role → role created
 
 Owner: "create a token for my work Claude, use work-assistant role,
-        for account 7926042351"
+        for account <another-account-id>"
 Claude calls create_token → raw token returned (shown once)
 
 Owner copies token → sets as Authorization header in work Claude's MCP config
@@ -200,7 +200,7 @@ Owner copies token → sets as Authorization header in work Claude's MCP config
 ### Agent session (scoped agent)
 
 ```
-Work Claude connects to /mcp?account_id=7926042351
+Work Claude connects to /mcp?account_id=<another-account-id>
   Authorization: Bearer <work_token>
 
 Worker:
