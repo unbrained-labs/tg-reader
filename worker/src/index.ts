@@ -196,7 +196,7 @@ async function handleIngest(request: Request, env: Env, accountId: string): Prom
       $2::text[], $3::text[], $4::text[], $5::text[],
       $6::text[], $7::text[], $8::text[], $9::text[],
       $10::text[], $11::text[], $12::text[], $13::text[],
-      $14::bigint[], $15::text[], $16::text[],
+      $14::text[], $15::text[], $16::text[],
       $17::bigint[], $18::bigint[], $19::smallint[], $20::bigint[]
     ) AS v(
       tg_message_id, tg_chat_id, chat_name, chat_type,
@@ -1731,8 +1731,8 @@ async function dispatchMcpTool(
         AND is_deleted = 0
         AND (
           tg_message_id = $3
-          OR tg_message_id = (SELECT reply_to_message_id::text FROM messages WHERE account_id = $1 AND tg_chat_id = $2 AND tg_message_id = $3 LIMIT 1)
-          OR reply_to_message_id = $3::bigint
+          OR tg_message_id = (SELECT reply_to_message_id FROM messages WHERE account_id = $1 AND tg_chat_id = $2 AND tg_message_id = $3 LIMIT 1)
+          OR reply_to_message_id = $3
         )
         ${keysetClause}
         ${scopeClause}

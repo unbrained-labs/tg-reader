@@ -265,7 +265,7 @@ async function backfillDialog(
         text: raw.message || undefined,  // raw.message is the text field in GramJS
         media_type: resolveMediaType(raw.media ?? undefined),
         media_file_id: undefined,
-        reply_to_message_id: raw.replyTo?.replyToMsgId ?? undefined,
+        reply_to_message_id: raw.replyTo?.replyToMsgId != null ? String(raw.replyTo.replyToMsgId) : undefined,
         forwarded_from_id: raw.fwdFrom?.fromId
           ? resolveSenderId(raw.fwdFrom.fromId)
           : undefined,

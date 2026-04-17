@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS messages (
   text                 TEXT,
   media_type           TEXT,                    -- photo, video, document, voice, audio, sticker, etc.
   media_file_id        TEXT,                    -- reference only, no binary stored
-  reply_to_message_id  BIGINT,
+  reply_to_message_id  TEXT,                    -- matches tg_message_id (TEXT); Telegram IDs are 64-bit
   forwarded_from_id    TEXT,
   forwarded_from_name  TEXT,
   sent_at              BIGINT NOT NULL,         -- Unix epoch seconds (Telegram native format)
