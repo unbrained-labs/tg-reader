@@ -207,7 +207,7 @@ function mapMessage(raw: Api.Message): Message {
     text: raw.message || undefined,
     media_type: resolveMediaType(raw.media ?? undefined),
     media_file_id: undefined,
-    reply_to_message_id: raw.replyTo?.replyToMsgId ?? undefined,
+    reply_to_message_id: raw.replyTo?.replyToMsgId != null ? String(raw.replyTo.replyToMsgId) : undefined,
     forwarded_from_id: raw.fwdFrom?.fromId ? resolveSenderId(raw.fwdFrom.fromId) : undefined,
     forwarded_from_name: raw.fwdFrom?.fromName ?? undefined,
     sent_at: raw.date, // already Unix epoch seconds — DO NOT call new Date()
@@ -356,7 +356,7 @@ function buildGapMessage(raw: Api.Message, chats: Api.TypeChat[], users: Api.Typ
     text: raw.message || undefined,
     media_type: resolveMediaType(raw.media ?? undefined),
     media_file_id: undefined,
-    reply_to_message_id: raw.replyTo?.replyToMsgId ?? undefined,
+    reply_to_message_id: raw.replyTo?.replyToMsgId != null ? String(raw.replyTo.replyToMsgId) : undefined,
     forwarded_from_id: raw.fwdFrom?.fromId ? resolveSenderId(raw.fwdFrom.fromId) : undefined,
     forwarded_from_name: raw.fwdFrom?.fromName ?? undefined,
     sent_at: raw.date,

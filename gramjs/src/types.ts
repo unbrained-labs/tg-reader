@@ -14,7 +14,7 @@ export interface Message {
   text?: string;
   media_type?: string;
   media_file_id?: string;
-  reply_to_message_id?: number;
+  reply_to_message_id?: string;
   forwarded_from_id?: string;
   forwarded_from_name?: string;
   sent_at: number;

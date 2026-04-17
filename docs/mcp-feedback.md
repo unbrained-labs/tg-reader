@@ -21,8 +21,10 @@ Tested: 2026-03-13 | Agent: Claude Sonnet 4.6
 - `reply_to_message_id = (SELECT id ...)` — comparing Telegram msg ID against internal row ID
 These will almost never match since the namespaces are different.
 **Fix**: Changed to:
-- `tg_message_id = (SELECT reply_to_message_id::text ...)` — find parent by its Telegram ID
-- `reply_to_message_id = $3::bigint` — find replies where their parent pointer matches the target's Telegram ID
+- `tg_message_id = (SELECT reply_to_message_id ...)` — find parent by its Telegram ID
+- `reply_to_message_id = $3` — find replies where their parent pointer matches the target's Telegram ID
+
+(Both comparisons are now TEXT = TEXT after the reply_to_message_id column was migrated from BIGINT to TEXT — see PR #78.)
 
 ---
 
