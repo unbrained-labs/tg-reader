@@ -25,7 +25,7 @@ In Claude Desktop or claude.ai, add a new MCP server:
 Replace:
 - `<your-subdomain>` — your Cloudflare Workers subdomain
 - `<your-MASTER_TOKEN>` — the `MASTER_TOKEN` secret you set in Wrangler
-- `<your-account-id>` — your Telegram username (e.g. `d4d0ch`) or `primary`
+- `<your-account-id>` — your Telegram username or `primary`
 
 You can find your `account_id` by asking Claude: **"Call the stats tool and tell me my account ID."** It's the value in `my_user_id` if you used your numeric ID, or the username you used during backfill.
 
@@ -53,7 +53,7 @@ For agents that only need to read — no sending:
 
 ```
 Create a role called "reader" with read_mode "all".
-Then create a token with that role, label "Claude read-only", account_id "d4d0ch".
+Then create a token with that role, label "Claude read-only", account_id "<your-username>".
 ```
 
 Claude will create the role, create the token, and return the raw token value. **Copy it immediately** — it's shown only once.

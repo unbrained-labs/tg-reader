@@ -423,14 +423,14 @@ Manage drafts, scheduled, and sent messages. View delivery status.
 │                                           [Save]                │
 │                                                                 │
 │  ── Accounts ──                                                │
-│  Active account: primary (7926042351)                           │
+│  Active account: primary (<your-telegram-user-id>)             │
 │                                                                 │
 │  ── Audit Log Retention ──                                     │
 │  Keep audit entries for: [90] days  (0 = disabled)             │
 │                                           [Save]                │
 │                                                                 │
 │  ── API Info ──                                                │
-│  Worker URL: https://tg-reader.ddohne.workers.dev              │
+│  Worker URL: https://<your-worker-subdomain>.workers.dev       │
 │  MCP endpoint: /mcp                                            │
 │  OpenAPI spec: /openapi.yaml                                   │
 │                                                                 │

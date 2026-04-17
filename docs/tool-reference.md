@@ -4,7 +4,7 @@ Complete reference for all 27 MCP tools exposed at `/mcp`. Connect via:
 
 ```
 Authorization: Bearer <token>
-X-Account-ID: <account_id>   # e.g. d4d0ch, or 'primary'
+X-Account-ID: <account_id>   # e.g. your-username, or 'primary'
 ```
 
 ---

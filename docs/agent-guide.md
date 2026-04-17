@@ -9,7 +9,7 @@ Practical patterns for Claude agents (or any LLM) using tg-reader via MCP.
 ```
 POST https://tg-reader.<subdomain>.workers.dev/mcp
 Authorization: Bearer <token>
-X-Account-ID: d4d0ch   # your account_id
+X-Account-ID: <your-username>   # your account_id
 Content-Type: application/json
 ```
 
@@ -217,7 +217,7 @@ create_role(
   read_mode="whitelist",
   read_labels=["work", "clients"]
 )
-create_token(role="work-reader", label="Claude work assistant", account_id="d4d0ch")
+create_token(role="work-reader", label="Claude work assistant", account_id="<your-username>")
 ```
 
 ### Write-capable agent restricted to DMs

@@ -2,6 +2,13 @@
 
 Personal Telegram message archive. Captures all messages (sent + received) into a searchable database, and lets you send messages via REST API or AI agent.
 
+## ⚠️ Caveats
+
+- This archives **your** full Telegram history into **your own** database. It is not a hosted service — you run and pay for all the infrastructure.
+- Does **not** work with Telegram bot accounts. Requires a real user session (MTProto, not the Bot API).
+- The `GRAMJS_SESSION` string grants full account access. Treat it like a password: store it only in secret managers, never in source control.
+- Bulk-archiving a user session is a gray area under Telegram's Terms of Service. Use at your own risk.
+
 ## Architecture
 
 ```
@@ -70,6 +77,28 @@ Personal Telegram message archive. Captures all messages (sent + received) into 
 | Database | Neon PostgreSQL (serverless) | $0–19/mo |
 | Backups | Cloudflare R2 | ~$0/mo |
 | Dashboard UI *(optional)* | Preact + Vite, served as static assets | free |
+
+## Prerequisites & costs
+
+You will need accounts and CLIs for all of the following before you start:
+
+| Requirement | Free tier? | Notes |
+|-------------|-----------|-------|
+| **Cloudflare account** | Yes (Workers Free) | Workers Paid ($5/mo) required if you use cron triggers, Workers AI, or R2 at any meaningful scale |
+| **Neon PostgreSQL** | Yes (~500 MB) | Free tier is enough to get started; upgrade as your archive grows |
+| **Fly.io account** | No | ~$4/mo for one shared VM running the GramJS listener |
+| **Telegram API credentials** | Free | Visit [my.telegram.org/apps](https://my.telegram.org/apps) to create your own app — see [docs/setup.md](docs/setup.md) |
+| **OpenAI / Anthropic API key** | Optional | Only needed for AI insight features; Cloudflare Workers AI binding works without an external key |
+
+**Rough monthly cost: $0–30/mo depending on usage volume and AI features.** A minimal setup (free Neon tier + Fly shared VM + Cloudflare Workers Paid) runs around $9/mo.
+
+**CLIs to install before following the setup guide:**
+
+```bash
+npm install -g wrangler          # Cloudflare Workers CLI
+brew install flyctl              # Fly.io CLI (or see https://fly.io/docs/hands-on/install-flyctl/)
+# Node.js 20+ is also required
+```
 
 ## Sync modes
 

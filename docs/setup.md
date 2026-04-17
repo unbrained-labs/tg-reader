@@ -1,5 +1,37 @@
 # Setup
 
+## Before you start
+
+### Accounts you need
+
+- [Cloudflare account](https://dash.cloudflare.com) (Workers Paid plan, $5/mo — required for cron triggers and R2 backups)
+- [Neon account](https://neon.tech) (serverless PostgreSQL, $0–19/mo — free tier ~500 MB)
+- [Fly.io account](https://fly.io) (~$4/mo for one shared VM)
+- Telegram API credentials (free — see below)
+
+### CLIs to install
+
+```bash
+node --version    # must be 20+
+npm --version     # bundled with Node.js
+wrangler --version   # npm install -g wrangler
+flyctl version       # https://fly.io/docs/hands-on/install-flyctl/
+```
+
+### Getting your Telegram API_ID / API_HASH
+
+You must create your own Telegram application to get these credentials. Do not use credentials shared by others — Telegram ties sessions to the originating app.
+
+1. Go to [https://my.telegram.org/apps](https://my.telegram.org/apps)
+2. Log in with your Telegram phone number (you will receive a code via SMS or app)
+3. Fill in the **Create new application** form — the name and description can be anything (e.g. "My Archive")
+4. Click **Create application**
+5. Copy the **App api_id** (a number, e.g. `12345678`) and **App api_hash** (a 32-character hex string)
+
+> **Security note:** These credentials bind your session to your app. Never share them, never commit them to source control, and never use credentials from someone else's app. If they are compromised, revoke them on the same page and generate new ones.
+
+---
+
 ## Prerequisites
 
 - [Cloudflare account](https://dash.cloudflare.com) (Workers Paid plan, $5/mo)
@@ -41,7 +73,7 @@ wrangler secret put INGEST_TOKEN   # pick a strong random string — keep it for
 wrangler secret put DATABASE_URL   # paste your Neon connection string
 ```
 
-Note your Worker URL (e.g. `https://tg-reader.<your-subdomain>.workers.dev`).
+Note your Worker URL (e.g. `https://<your-app-name>.<your-subdomain>.workers.dev`).
 
 ---
 
@@ -64,7 +96,7 @@ Follow the prompts (phone number → code → 2FA if enabled). Copy the `GRAMJS_
 ## Step 4 — Fly.io deployment
 
 ```bash
-fly launch --name tg-reader --no-deploy
+fly launch --name <your-app-name> --no-deploy
 fly volumes create tg_state --region ams --size 1
 fly secrets set \
   GRAMJS_SESSION=<session> \
@@ -78,7 +110,7 @@ fly deploy
 Check it's running:
 
 ```bash
-fly logs -a tg-reader
+fly logs -a <your-app-name>
 # should see: [listener] connected to Telegram
 ```
 
@@ -156,6 +188,6 @@ Add these secrets to your GitHub repo (`Settings → Secrets → Actions`):
 | Secret | How to get |
 |--------|-----------|
 | `CLOUDFLARE_API_TOKEN` | Cloudflare → My Profile → API Tokens → Edit Workers template |
-| `FLY_API_TOKEN` | `fly tokens create deploy -a tg-reader` |
+| `FLY_API_TOKEN` | `fly tokens create deploy -a <your-app-name>` |
 
 Every push to `main` will automatically deploy the Worker and the listener.
