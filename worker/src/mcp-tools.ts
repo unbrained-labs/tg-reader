@@ -5,7 +5,7 @@
 export const MCP_TOOL_DEFINITIONS = [
   {
     name: 'search',
-    description: 'Full-text search across the complete Telegram message archive. Ranked by recency. Use for any question about past conversations, finding specific messages, amounts, names, or topics. Always use from/to when the user mentions a time period. Multiple words in `query` are ANDed — every word must appear. If a broad search returns 0 results, retry with a single shorter token. Omit `query` entirely to list messages by filters alone (e.g. everything from one sender, or all photos in a chat). For finding a person by name, use `senders` first; for messages from a saved contact, use `sender_username`.',
+    description: 'Full-text search across the complete Telegram message archive. Ranked by recency (newest first). Use for any question about past conversations, finding specific messages, amounts, names, or topics. Always use from/to when the user mentions a time period. Multiple words in `query` are ANDed — every word must appear. If a broad search returns 0 results, retry with a single shorter token. Omit `query` to list messages by filters alone (e.g. everything from one sender, or all photos in a chat). For finding a person by name, use `senders` first; for messages from a saved contact, use `sender_username`. Response: { messages, page: { has_more, next_cursor, total } }. For more pages, pass `page.next_cursor` back as `cursor`.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -19,8 +19,7 @@ export const MCP_TOOL_DEFINITIONS = [
         from: { type: 'string', description: 'Optional. Start of date range. ISO 8601 or Unix epoch seconds.' },
         to: { type: 'string', description: 'Optional. End of date range. ISO 8601 or Unix epoch seconds. Defaults to tomorrow.' },
         limit: { type: 'number', description: 'Results per page (1–50, default 20).' },
-        before_id: { type: 'number', description: 'Pagination: pass next_before_id from the previous response. Must be paired with before_sent_at.' },
-        before_sent_at: { type: 'number', description: 'Pagination: pass next_before_sent_at from the previous response. Must be paired with before_id.' },
+        cursor: { type: 'string', description: 'Opaque pagination cursor. Pass `page.next_cursor` from the previous response to get the next page.' },
       },
     },
   },
@@ -40,14 +39,13 @@ export const MCP_TOOL_DEFINITIONS = [
   },
   {
     name: 'history',
-    description: 'Get messages from one chat in chronological order (oldest first). Use after chats gives you a chat_id. For finding specific content within a chat, prefer search with chat_id filter instead. Paginate forward by passing next_after_id + next_after_sent_at from the previous response.',
+    description: 'Get messages from one chat in chronological order (oldest first). Use after `chats` gives you a chat_id. For finding specific content within a chat, prefer search with chat_id filter. Response: { messages, page: { has_more, next_cursor } }. Pass `page.next_cursor` back as `cursor` to advance forward in time.',
     inputSchema: {
       type: 'object',
       properties: {
         chat_id: { type: 'string', description: 'Chat ID (string, may be negative for groups/channels). Get from the chats tool.' },
         limit: { type: 'number', description: 'Messages per page (default 20, max 50).' },
-        after_id: { type: 'number', description: 'Pagination: pass next_after_id from the previous response to get the next (newer) page.' },
-        after_sent_at: { type: 'number', description: 'Pagination: pass next_after_sent_at from the previous response. Must be paired with after_id.' },
+        cursor: { type: 'string', description: 'Opaque pagination cursor. Pass `page.next_cursor` from the previous response to advance forward in time.' },
       },
       required: ['chat_id'],
     },
@@ -96,14 +94,14 @@ export const MCP_TOOL_DEFINITIONS = [
   },
   {
     name: 'thread',
-    description: 'Get a message and its reply thread (parent + all direct replies). Use when you want to see the full context of a conversation around a specific message. Paginate with next_after_id from the previous response.',
+    description: 'Get a message and its reply thread (parent + all direct replies). Use when you want the full context of a conversation around a specific message. Response: { chat_id, message_id, messages, page: { has_more, next_cursor } }. Pass `page.next_cursor` back as `cursor` for more replies.',
     inputSchema: {
       type: 'object',
       properties: {
         chat_id: { type: 'string', description: 'Chat ID containing the message.' },
         message_id: { type: 'string', description: 'The tg_message_id of the message to reconstruct the thread around.' },
         limit: { type: 'number', description: 'Max replies to return (default 50, max 200).' },
-        after_id: { type: 'number', description: 'Pagination: pass next_after_id from the previous response.' },
+        cursor: { type: 'string', description: 'Opaque pagination cursor. Pass `page.next_cursor` from the previous response.' },
       },
       required: ['chat_id', 'message_id'],
     },

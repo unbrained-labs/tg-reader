@@ -1,7 +1,7 @@
 import type { NeonQueryFunction } from '@neondatabase/serverless';
 import type { Env, Message, OutboxItem, OutboxRecipient, RoleRow, TokenContext } from './types';
 import { MCP_TOOL_DEFINITIONS } from './mcp-tools';
-import { json, getSql, toISO, hashToken, parseJsonColumn, buildReadScopeClause } from './helpers';
+import { json, getSql, toISO, hashToken, parseJsonColumn, buildReadScopeClause, encodeCursor, decodeCursor } from './helpers';
 import { authenticate, authenticateMcp } from './auth';
 
 
@@ -1713,15 +1713,30 @@ async function dispatchMcpTool(
     if (args.to !== undefined) params.set('to', String(args.to));
     const limit = Math.min(typeof args.limit === 'number' ? args.limit : 20, 50);
     params.set('limit', String(limit));
-    if (typeof args.before_id === 'number') params.set('before_id', String(args.before_id));
-    if (typeof args.before_sent_at === 'number') params.set('before_sent_at', String(args.before_sent_at));
+    const decoded = typeof args.cursor === 'string' ? decodeCursor(args.cursor) : null;
+    if (decoded) {
+      params.set('before_id', String(decoded.id));
+      params.set('before_sent_at', String(decoded.sent_at));
+    }
     const req = new Request(`${baseUrl}/search?${params.toString()}`);
     const res = await handleSearch(req, env, accountId, ctx.role);
-    const data = await res.json() as { results?: Array<Record<string, unknown>> };
-    if (Array.isArray(data.results)) {
-      data.results = data.results.map(truncateText);
-    }
-    return data;
+    const data = await res.json() as {
+      results?: Array<Record<string, unknown>>;
+      total?: number;
+      next_before_id?: number | null;
+      next_before_sent_at?: number | null;
+    };
+    const rawMessages = Array.isArray(data.results) ? data.results.map(truncateText) : [];
+    const nextId = data.next_before_id ?? null;
+    const nextSentAt = data.next_before_sent_at ?? null;
+    return {
+      messages: rawMessages,
+      page: {
+        has_more: nextId !== null && nextSentAt !== null,
+        next_cursor: nextId !== null && nextSentAt !== null ? encodeCursor(nextId, nextSentAt) : null,
+        total: data.total,
+      },
+    };
   }
 
   if (name === 'chats') {
@@ -1737,12 +1752,13 @@ async function dispatchMcpTool(
   }
 
   if (name === 'history') {
-    // W-11: use ASC ordering with after_ keyset cursors so pages advance forward in time.
+    // W-11: ASC ordering with forward keyset cursor; cursor encodes (id, sent_at).
     if (typeof args.chat_id !== 'string') throw new Error('chat_id is required');
     const chatId = args.chat_id;
     const limit = Math.min(typeof args.limit === 'number' ? args.limit : 20, 50);
-    const afterSentAt = typeof args.after_sent_at === 'number' ? args.after_sent_at : null;
-    const afterId = typeof args.after_id === 'number' ? args.after_id : null;
+    const decoded = typeof args.cursor === 'string' ? decodeCursor(args.cursor) : null;
+    const afterSentAt = decoded?.sent_at ?? null;
+    const afterId = decoded?.id ?? null;
 
     const baseBinds: unknown[] = [accountId, chatId]; // $1, $2
     const keysetBinds: unknown[] = afterSentAt !== null && afterId !== null
@@ -1782,10 +1798,11 @@ async function dispatchMcpTool(
     const lastRow = typedRows.length === limit ? typedRows[typedRows.length - 1] : null;
 
     return {
-      results: typedRows.map(truncateText),
-      limit,
-      next_after_id: lastRow?.id ?? null,
-      next_after_sent_at: lastRow?.sent_at ?? null,
+      messages: typedRows.map(truncateText),
+      page: {
+        has_more: lastRow !== null,
+        next_cursor: lastRow !== null ? encodeCursor(lastRow.id, lastRow.sent_at) : null,
+      },
     };
   }
 
@@ -1887,13 +1904,31 @@ async function dispatchMcpTool(
 
     const rows = await getSql(env)(SQL, [accountId, since, labelFilter, ...scopeBinds, perChat]) as Array<Record<string, unknown>>;
 
-    // Group by chat
-    const chats: Record<string, { chat_name: unknown; label: unknown; messages: Array<Record<string, unknown>> }> = {};
+    // Group by chat. Per-chat `messages` + `page` mirrors the canonical listy shape
+    // so callers get a consistent structure. Digest is pre-truncated to per_chat;
+    // if a chat hit that cap there may be more in the window — caller should use
+    // `search(chat_id=..., from=since)` to get the rest.
+    const chats: Record<string, {
+      chat_name: unknown;
+      label: unknown;
+      messages: Array<Record<string, unknown>>;
+      page: { has_more: boolean; next_cursor: null };
+    }> = {};
     for (const row of rows) {
       const cid = row.tg_chat_id as string;
-      if (!chats[cid]) chats[cid] = { chat_name: row.chat_name, label: row.label, messages: [] };
+      if (!chats[cid]) {
+        chats[cid] = {
+          chat_name: row.chat_name,
+          label: row.label,
+          messages: [],
+          page: { has_more: false, next_cursor: null },
+        };
+      }
       const { tg_chat_id: _c, chat_name: _n, label: _l, ...msg } = row;
       chats[cid].messages.push(truncateText(msg));
+    }
+    for (const entry of Object.values(chats)) {
+      entry.page.has_more = entry.messages.length >= perChat;
     }
     return { hours, per_chat: perChat, chats };
   }
@@ -1902,7 +1937,9 @@ async function dispatchMcpTool(
     if (typeof args.chat_id !== 'string') throw new Error('chat_id is required');
     if (typeof args.message_id !== 'string') throw new Error('message_id is required');
     const limit = Math.min(typeof args.limit === 'number' ? args.limit : 50, 200);
-    const afterId = typeof args.after_id === 'number' ? args.after_id : null;
+    // thread uses id-only ordering; cursor still encodes {id, sent_at} for uniform shape.
+    const decoded = typeof args.cursor === 'string' ? decodeCursor(args.cursor) : null;
+    const afterId = decoded?.id ?? null;
 
     // Base: $1=accountId, $2=chatId, $3=messageId; keyset: [$4=afterId] if present
     const baseBinds: unknown[] = [accountId, args.chat_id, args.message_id];
@@ -1932,13 +1969,16 @@ async function dispatchMcpTool(
       LIMIT $${limitIdx}
     `.trim();
 
-    const rows = await getSql(env)(SQL, [...baseBinds, ...keysetBinds, ...scopeBinds, limit]) as Array<Record<string, unknown> & { id: number }>;
+    const rows = await getSql(env)(SQL, [...baseBinds, ...keysetBinds, ...scopeBinds, limit]) as Array<Record<string, unknown> & { id: number; sent_at: number }>;
     const lastRow = rows.length === limit ? rows[rows.length - 1] : null;
     return {
       chat_id: args.chat_id,
       message_id: args.message_id,
       messages: rows.map(truncateText),
-      next_after_id: lastRow?.id ?? null,
+      page: {
+        has_more: lastRow !== null,
+        next_cursor: lastRow !== null ? encodeCursor(lastRow.id, lastRow.sent_at) : null,
+      },
     };
   }
 
@@ -2665,12 +2705,13 @@ TOOL SELECTION — pick the right tool first time:
 SEARCH TIPS:
 - Multiple words are ANDed — use words likely to appear verbatim
 - Always set from/to when the user mentions a time period (ISO 8601 or Unix epoch)
-- Paginate with next_before_id + next_before_sent_at from previous response
+- Omit "query" to list messages by filters alone (e.g., all messages from one sender or chat)
 - If 0 results: try fewer/broader terms, remove date range, check spelling
 
-HISTORY / THREAD PAGINATION:
-- history: next_after_id + next_after_sent_at (advances forward in time)
-- thread: next_after_id (advances through replies)
+PAGINATION (search, history, thread):
+- Response is { messages, page: { has_more, next_cursor, total? } }
+- If page.has_more, call again with cursor: page.next_cursor — the cursor is opaque, don't parse it
+- history/thread cursors advance forward in time; search cursors advance backward (older)
 
 WRITE TOOLS (GramJS executes within 30 seconds):
 - "send" — single chat or mass send with {first_name}/{last_name}/{username} placeholders
