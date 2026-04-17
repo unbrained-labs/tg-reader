@@ -4,7 +4,21 @@ tg-reader exposes an MCP (Model Context Protocol) server that lets Claude and ot
 
 ## Connecting
 
-### claude.ai custom connector
+### Claude Code CLI (recommended)
+
+Header-based auth keeps the token out of URL-based logs:
+
+```bash
+claude mcp add --transport http tg-reader \
+  "https://<worker>/mcp?account_id=<username-or-id>" \
+  --header "Authorization: Bearer <ingest-token>"
+```
+
+Use your Telegram **username** (e.g. `john`) or numeric user ID for `account_id`. The worker resolves usernames automatically via the contacts table self-entry populated on first listener startup.
+
+### claude.ai custom connector (fallback)
+
+The claude.ai connector dialog doesn't accept custom headers, so the token has to live in the URL query string:
 
 1. Go to **Settings → Connectors → Add custom connector**
 2. Enter the URL with your credentials embedded:
@@ -13,11 +27,9 @@ tg-reader exposes an MCP (Model Context Protocol) server that lets Claude and ot
 https://<worker>/mcp?token=<ingest-token>&account_id=<username-or-id>
 ```
 
-Use your Telegram **username** (e.g. `john`) or numeric user ID for `account_id`. The worker resolves usernames automatically via the contacts table self-entry populated on first listener startup.
-
 3. Leave OAuth fields empty. Click **Add**.
 
-The connector works on claude.ai web and mobile. Auth is via URL query params — the claude.ai connector dialog does not support custom headers.
+The query-string token ends up in Cloudflare access logs and URL-based telemetry. If you care about log hygiene, prefer the CLI install above.
 
 ---
 
@@ -224,4 +236,4 @@ Each account has its own connector URL with a different `account_id`. Data is fu
 
 ## Claude Code / API access
 
-For programmatic use outside claude.ai, the MCP endpoint is `POST /mcp` with standard JSON-RPC 2.0 payloads. Auth is via `X-Ingest-Token` header (or `?token=` query param) and `X-Account-ID` header (or `?account_id=` query param).
+For programmatic use outside claude.ai, the MCP endpoint is `POST /mcp` with standard JSON-RPC 2.0 payloads. Auth is via `Authorization: Bearer <token>` (preferred) or `X-Ingest-Token: <token>` header; `?token=` query param is a fallback for clients that can't set headers. `X-Account-ID` identifies the account (or `?account_id=` query param).

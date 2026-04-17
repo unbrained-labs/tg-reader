@@ -86,7 +86,17 @@ Per-chat overrides and labels via `POST /chats/config`.
 
 ## AI / MCP
 
-Connect Claude (or any MCP-compatible agent) directly to your archive:
+Connect Claude (or any MCP-compatible agent) directly to your archive.
+
+**Recommended — CLI with header-based auth** (token stays out of logs and URLs):
+
+```bash
+claude mcp add --transport http tg-reader \
+  "https://<worker>/mcp?account_id=<account-id>" \
+  --header "Authorization: Bearer <ingest-token>"
+```
+
+**claude.ai connector UI** (fallback — the dialog only accepts a URL, so the token goes in the query string and ends up in Cloudflare access logs):
 
 ```
 https://<worker>/mcp?token=<ingest-token>&account_id=<account-id>

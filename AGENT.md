@@ -19,8 +19,11 @@ This is a complete personal Telegram message archive. Every message sent and rec
 The archive is exposed as an MCP server. Connect via:
 
 ```
-POST https://<your-worker>.workers.dev/mcp?token=<token>&account_id=<id>
+POST https://<your-worker>.workers.dev/mcp?account_id=<id>
+Authorization: Bearer <token>
 ```
+
+(Or pass the token as `?token=<token>` in the URL if your client can't set headers — less secure.)
 
 ### Tools
 

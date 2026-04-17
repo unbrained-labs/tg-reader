@@ -205,7 +205,9 @@ Response: { results: [...], total: N, limit: N, next_before_id: N|null, next_bef
 
 ## Auth
 
-Single token (`X-Ingest-Token`) for all endpoints. `X-Account-ID` identifies the account (numeric Telegram user ID). MCP also accepts `?token=` and `?account_id=` query params.
+Single token (`X-Ingest-Token`) for non-MCP endpoints. `X-Account-ID` identifies the account (numeric Telegram user ID).
+
+MCP (`/mcp`) prefers `Authorization: Bearer <token>` and falls back to `?token=` query params for compatibility with clients that don't support custom headers (e.g. the claude.ai connector UI). Bearer is strongly preferred — query-string tokens end up in access logs, shell history, and URL-based telemetry.
 
 Username-to-account-ID resolution: the `contacts` table stores the account owner as a self-entry (`account_id = tg_user_id`). The Worker resolves a username alias by querying `contacts WHERE username = $1 AND account_id = tg_user_id`.
 
