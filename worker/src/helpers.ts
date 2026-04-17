@@ -84,3 +84,32 @@ export function buildReadScopeClause(
   const join = role.read_mode === 'whitelist' ? ' OR ' : ' AND ';
   return { clause: `AND (${parts.join(join)})`, binds };
 }
+
+// ---------------------------------------------------------------------------
+// Cursor encoding for canonical paginated responses (MCP listy tools)
+// ---------------------------------------------------------------------------
+//
+// All listy MCP tools return `{ messages, page: { has_more, next_cursor, total? } }`.
+// Cursors are opaque base64(JSON) blobs — callers should not parse them.
+// Direction (before vs after) is implicit in the tool contract.
+
+export function encodeCursor(id: number, sent_at: number): string {
+  return btoa(JSON.stringify({ id, sent_at }));
+}
+
+export function decodeCursor(cursor: string | null | undefined): { id: number; sent_at: number } | null {
+  if (!cursor) return null;
+  try {
+    const parsed = JSON.parse(atob(cursor)) as unknown;
+    if (
+      typeof parsed === 'object' && parsed !== null &&
+      'id' in parsed && typeof (parsed as { id: unknown }).id === 'number' &&
+      'sent_at' in parsed && typeof (parsed as { sent_at: unknown }).sent_at === 'number'
+    ) {
+      return parsed as { id: number; sent_at: number };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
